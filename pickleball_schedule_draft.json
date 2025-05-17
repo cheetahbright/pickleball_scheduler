@@ -1,0 +1,102 @@
+{
+  "session_date": "2025-05-16",
+  "start_time_str": "2:00 PM",
+  "num_games": 8,
+  "game_interval": 15,
+  "seed_str": "",
+  "players_data": [
+    {
+      "id": "f280c052-7dbb-4809-8c73-3d0ffa3f153e",
+      "name": "Player 1",
+      "avail_str": "",
+      "emoji": "\ud83d\ude00"
+    },
+    {
+      "id": "0671c57e-5efb-4ffa-9c7b-b52f301ae4a3",
+      "name": "Player 2",
+      "avail_str": "",
+      "emoji": "\ud83d\ude00"
+    },
+    {
+      "id": "4413b2c4-c6d3-4b79-9d49-233744c47fe7",
+      "name": "Player 3",
+      "avail_str": "",
+      "emoji": "\ud83d\ude00"
+    },
+    {
+      "id": "322d6faf-3a73-43fd-aff6-f087a9a113b0",
+      "name": "Player 4",
+      "avail_str": "",
+      "emoji": "\ud83d\ude00"
+    },
+    {
+      "id": "24b3b463-2e8d-4a54-8559-c8e79f9c6655",
+      "name": "Player 5",
+      "avail_str": "",
+      "emoji": "\ud83d\ude00"
+    },
+    {
+      "id": "e0096997-f053-40f9-97b4-5245fd1b6fdf",
+      "name": "Player 6",
+      "avail_str": "",
+      "emoji": "\ud83d\ude00"
+    },
+    {
+      "id": "acd8d190-7984-499c-8bd9-8e25b467a8a8",
+      "name": "Player 7",
+      "avail_str": "",
+      "emoji": "\ud83d\ude00"
+    },
+    {
+      "id": "5b6c7765-1ad2-4156-b9c0-64fc044034ff",
+      "name": "Player 8",
+      "avail_str": "",
+      "emoji": "\ud83d\ude00"
+    },
+    {
+      "id": "c516bfc9-f615-408b-b8d2-29ff31ec0ff7",
+      "name": "Player 9",
+      "avail_str": "",
+      "emoji": "\ud83d\ude00"
+    },
+    {
+      "id": "bcfa9850-57c9-4f15-bc5c-2f6016f8e832",
+      "name": "Player 10",
+      "avail_str": "",
+      "emoji": "\ud83d\ude00"
+    }
+  ],
+  "player_emojis": {
+    "Player 1": "\ud83d\ude00",
+    "Player 2": "\ud83d\ude00",
+    "Player 3": "\ud83d\ude00",
+    "Player 4": "\ud83d\ude00",
+    "Player 5": "\ud83d\ude00",
+    "Player 6": "\ud83d\ude00",
+    "Player 7": "\ud83d\ude00",
+    "Player 8": "\ud83d\ude00",
+    "Player 9": "\ud83d\ude00",
+    "Player 10": "\ud83d\ude00"
+  },
+  "dnp_pairs_list": [
+    [
+      "Player 1",
+      "Player 2"
+    ]
+  ],
+  "dno_pairs_list": [
+    [
+      "Player 1",
+      "Player 5"
+    ]
+  ],
+  "avoid_pairs_list": [
+    [
+      "Player 1",
+      "Player 3"
+    ]
+  ],
+  "substitutions_list": [],
+  "track_wins": false,
+  "matchmaking_strategy": "Standard Rotation"
+}
