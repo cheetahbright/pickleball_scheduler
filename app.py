@@ -718,7 +718,8 @@ def load_draft():
         st.session_state.substitutions_list = draft_data.get('substitutions_list',[])
         st.session_state.track_wins = draft_data.get('track_wins', False)
         st.session_state.matchmaking_strategy = draft_data.get('matchmaking_strategy', "Standard Rotation")
-        st.success("Draft loaded!"); st.rerun()
+        st.session_state.draft_loaded_message = True  # <-- Set flag for message after rerun
+        st.rerun()
     except Exception as e: st.error(f"Draft load error: {e}")
 
 def load_history_week_inputs(week_data: Dict[str, Any]):
@@ -817,10 +818,15 @@ def main_streamlit_app():
     initialize_session_state()
     hm = st.session_state.history_manager_instance
 
+    # Show draft loaded message after rerun
+    if st.session_state.get("draft_loaded_message", False):
+        st.success("Draft loaded!")
+        st.session_state.draft_loaded_message = False
+
     # Automatically load draft on first run if available and not yet attempted
     if not st.session_state.draft_load_attempted and DRAFT_FILE.exists():
+        st.session_state.draft_load_attempted = True
         load_draft()
-        st.session_state.draft_load_attempted = True # Mark as attempted
 
     with st.sidebar:
         st.header("⚙️ Session Setup")
@@ -876,7 +882,7 @@ def main_streamlit_app():
             if st.button("Save Current Inputs as Draft", use_container_width=True, key="save_draft_sidebar_btn_main", help="Saves player names, availability, constraints, and session settings."): save_draft()
         with col_dl:
             if st.button("Load Last Saved Draft", use_container_width=True, key="load_draft_sidebar_btn_main", help="Loads the last saved draft if one exists."):
-                st.session_state.draft_load_attempted = True # Mark as attempted so it doesn't auto-load again
+                st.session_state.draft_load_attempted = True
                 load_draft()
 
         st.subheader("History File Location")
