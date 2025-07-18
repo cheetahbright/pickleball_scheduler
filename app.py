@@ -131,7 +131,7 @@ if not is_terminal_mode:
     import streamlit as st
     from streamlit.runtime.scriptrunner import ScriptRunContext
 
-    st.set_page_config(page_title="Pickleball Scheduler Pro+", layout="wide")
+    st.set_page_config(page_title="Pickleball Scheduler Pro+ THIS IS PICKLEBALL V1", layout="wide")
 
     # Initialize session state variables if not present
     if 'players' not in st.session_state:
