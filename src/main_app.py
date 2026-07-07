@@ -16,10 +16,17 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 
-# Keep legacy `main_app` and package-style `src.main_app` imports unified.
-current_module = sys.modules[__name__]
-sys.modules["main_app"] = current_module
-sys.modules["src.main_app"] = current_module
+
+def _register_main_app_aliases() -> None:
+    """Expose only the opposite import alias without clobbering existing modules."""
+    current_module = sys.modules[__name__]
+    if __name__ == "src.main_app":
+        sys.modules.setdefault("main_app", current_module)
+    elif __name__ == "main_app":
+        sys.modules.setdefault("src.main_app", current_module)
+
+
+_register_main_app_aliases()
 
 try:
     from src.algorithms.genetic_scheduler import GeneticPickleballScheduler

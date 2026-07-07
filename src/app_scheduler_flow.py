@@ -5,6 +5,11 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+try:
+    from src.app_managers import normalize_config_constraints
+except ImportError:
+    from app_managers import normalize_config_constraints
+
 
 def parse_players_text(players_text: str) -> list[str]:
     """Normalize textarea input into a clean player list."""
@@ -115,6 +120,59 @@ def resolve_players_text_for_preset(
     return ""
 
 
+def build_constraint_multiselect_defaults(
+    constraint_pairs: list[list[str]],
+    players: list[str],
+    separator: str,
+) -> list[str]:
+    """Format saved constraints into multiselect labels for the current player list."""
+    return [
+        f"{first}{separator}{second}" for first, second in constraint_pairs if first in players and second in players
+    ]
+
+
+def get_constraint_widget_keys(session_state: Any) -> tuple[str, str]:
+    """Return the current multiselect widget keys for constraint inputs."""
+    version = int(session_state.get("_constraint_widget_version", 0))
+    return f"do_not_pair_{version}", f"do_not_oppose_{version}"
+
+
+def sync_constraint_widget_state(
+    session_state: Any,
+    players: list[str],
+    config: Mapping[str, Any],
+) -> None:
+    """Seed constraint widget state from saved config when the UI needs a resync."""
+    should_sync_from_config = bool(session_state.pop("_sync_main_constraints_from_config", False))
+    do_not_pair_key, do_not_oppose_key = get_constraint_widget_keys(session_state)
+    pair_options = [f"{p1} & {p2}" for i, p1 in enumerate(players) for p2 in players[i + 1 :]]
+    oppose_options = [f"{p1} vs {p2}" for i, p1 in enumerate(players) for p2 in players[i + 1 :]]
+
+    current_pair_selection = session_state.get(do_not_pair_key)
+    if (
+        should_sync_from_config
+        or not isinstance(current_pair_selection, list)
+        or any(selection not in pair_options for selection in current_pair_selection)
+    ):
+        session_state[do_not_pair_key] = build_constraint_multiselect_defaults(
+            config["constraints"]["do_not_pair"],
+            players,
+            " & ",
+        )
+
+    current_oppose_selection = session_state.get(do_not_oppose_key)
+    if (
+        should_sync_from_config
+        or not isinstance(current_oppose_selection, list)
+        or any(selection not in oppose_options for selection in current_oppose_selection)
+    ):
+        session_state[do_not_oppose_key] = build_constraint_multiselect_defaults(
+            config["constraints"]["do_not_oppose"],
+            players,
+            " vs ",
+        )
+
+
 def render_enhanced_scheduler_page(
     st_module,
     history_manager_cls,
@@ -184,7 +242,8 @@ def render_main_scheduler_tab(
     schedule_to_csv_fn,
 ):
     """Render the main scheduling interface and schedule generation flow."""
-    config = st_module.session_state.app_config
+    config = normalize_config_constraints(st_module.session_state.app_config)
+    st_module.session_state.app_config = config
     pending_players_text = st_module.session_state.pop("_pending_players_input", None)
     if isinstance(pending_players_text, str):
         st_module.session_state.players_input = pending_players_text
@@ -213,6 +272,8 @@ def render_main_scheduler_tab(
     with col2:
         st_module.markdown("**Quick Actions**")
 
+        if st_module.session_state.pop("_pending_clear_quick_add", False):
+            st_module.session_state["quick_add"] = ""
         new_player = st_module.text_input("Quick add player:", key="quick_add")
         preset_name = st_module.text_input("Preset name:", key="preset_name")
 
@@ -223,14 +284,15 @@ def render_main_scheduler_tab(
                 st_module.session_state.selected_player_preset = "Custom"
                 st_module.session_state.selected_player_preset_initialized = True
                 st_module.session_state._pending_players_input = updated_text
+                st_module.session_state._pending_clear_quick_add = True
                 st_module.rerun()
 
         if st_module.button("💾 Save as Preset") and preset_name.strip():
             preset_players = parse_players_text(players_text)
             if preset_players:
                 config["player_presets"][preset_name.strip()] = preset_players
-                st_module.session_state.config_manager.save_config(config)
-                st_module.success(f"Saved preset: {preset_name.strip()}")
+                if st_module.session_state.config_manager.save_config(config):
+                    st_module.success(f"Saved preset: {preset_name.strip()}")
 
     players = parse_players_text(players_text)
 
@@ -256,20 +318,31 @@ def render_main_scheduler_tab(
     st_module.subheader("🚫 Player Constraints")
 
     col1, col2 = st_module.columns(2)
+    sync_constraint_widget_state(st_module.session_state, players, config)
+    do_not_pair_key, do_not_oppose_key = get_constraint_widget_keys(st_module.session_state)
+    preserve_saved_constraints = bool(st_module.session_state.pop("_preserve_saved_constraints_from_config", False))
+    default_do_not_pair = build_constraint_multiselect_defaults(
+        config["constraints"]["do_not_pair"],
+        players,
+        " & ",
+    )
+    default_do_not_oppose = build_constraint_multiselect_defaults(
+        config["constraints"]["do_not_oppose"],
+        players,
+        " vs ",
+    )
 
     with col1:
         st_module.markdown("**Who should NOT play together:**")
         do_not_pair = st_module.multiselect(
             "Select player pairs that should not be on the same team:",
             options=[f"{p1} & {p2}" for i, p1 in enumerate(players) for p2 in players[i + 1 :]],
-            default=[
-                f"{pair[0]} & {pair[1]}"
-                for pair in config["constraints"]["do_not_pair"]
-                if pair[0] in players and pair[1] in players
-            ],
-            key="do_not_pair",
+            default=default_do_not_pair,
+            key=do_not_pair_key,
         )
 
+        if preserve_saved_constraints and not do_not_pair and default_do_not_pair:
+            do_not_pair = default_do_not_pair
         config["constraints"]["do_not_pair"] = [pair.split(" & ") for pair in do_not_pair]
 
     with col2:
@@ -277,14 +350,12 @@ def render_main_scheduler_tab(
         do_not_oppose = st_module.multiselect(
             "Select player pairs that should not be opponents:",
             options=[f"{p1} vs {p2}" for i, p1 in enumerate(players) for p2 in players[i + 1 :]],
-            default=[
-                f"{pair[0]} vs {pair[1]}"
-                for pair in config["constraints"]["do_not_oppose"]
-                if pair[0] in players and pair[1] in players
-            ],
-            key="do_not_oppose",
+            default=default_do_not_oppose,
+            key=do_not_oppose_key,
         )
 
+        if preserve_saved_constraints and not do_not_oppose and default_do_not_oppose:
+            do_not_oppose = default_do_not_oppose
         config["constraints"]["do_not_oppose"] = [pair.split(" vs ") for pair in do_not_oppose]
 
     total_constraints = len(config["constraints"]["do_not_pair"]) + len(config["constraints"]["do_not_oppose"])
@@ -313,6 +384,20 @@ def render_main_scheduler_tab(
     if total_constraints > 0:
         st_module.info(f"🎯 Active constraints: {total_constraints} total")
 
+    with st_module.expander("🎲 Advanced: reproducible generation"):
+        seed_text = st_module.text_input(
+            "Random seed (optional):",
+            key="generation_seed",
+            help="Reuse the seed shown under a generated schedule to replay that generation run.",
+        )
+    generation_seed = None
+    seed_text = (seed_text or "").strip()
+    if seed_text:
+        try:
+            generation_seed = int(seed_text)
+        except ValueError:
+            st_module.warning("Seed must be a whole number - ignoring it for this run.")
+
     if st_module.button("🎯 Generate Enhanced Schedule", type="primary"):
         with st_module.spinner("Creating optimized schedule..."):
             try:
@@ -338,7 +423,7 @@ def render_main_scheduler_tab(
                         ],
                     )
 
-                result = scheduler.generate_schedule(max_time=max_time)
+                result = scheduler.generate_schedule(max_time=max_time, seed=generation_seed)
 
                 if not (isinstance(result, dict) and "schedule" in result):
                     st_module.error("❌ Could not generate schedule. Try adjusting parameters.")
@@ -357,6 +442,13 @@ def render_main_scheduler_tab(
                     return
 
                 st_module.success("✅ Enhanced schedule generated!")
+
+                result_seed = result.get("seed")
+                if result_seed is not None:
+                    st_module.caption(
+                        f"🎲 Seed: {result_seed} - enter it under '🎲 Advanced: reproducible "
+                        "generation' to replay this generation run."
+                    )
 
                 st_module.session_state.current_schedule = schedule_data
                 st_module.session_state.current_players = players
@@ -377,6 +469,7 @@ def render_main_scheduler_tab(
                     "num_rounds": num_rounds,
                     "max_time": max_time,
                     "constraints": config["constraints"],
+                    "seed": result.get("seed"),
                 }
                 st_module.session_state.history_manager.save_schedule(schedule_data, players, settings)
 
@@ -389,8 +482,12 @@ def render_main_scheduler_tab(
                     schedule_to_csv_fn,
                 )
 
+            except MemoryError:
+                st_module.error("❌ Ran out of memory while generating the schedule. Try fewer players or rounds.")
+            except ValueError as exc:
+                st_module.error(f"❌ Invalid input: {exc}. Check your players and constraints.")
             except Exception as exc:
-                st_module.error(f"❌ Error: {str(exc)}")
+                st_module.error(f"❌ Error ({type(exc).__name__}): {str(exc)}")
 
 
 def _render_metric_summary(st_module, metrics, players):

@@ -6,6 +6,19 @@ from __future__ import annotations
 from datetime import time as time_type
 from typing import Any
 
+try:
+    from src.app_managers import (
+        normalize_config_constraints,
+        normalize_constraint_pairs,
+        serialize_constraint_pairs,
+    )
+except ImportError:
+    from app_managers import (
+        normalize_config_constraints,
+        normalize_constraint_pairs,
+        serialize_constraint_pairs,
+    )
+
 
 def infer_players_from_schedule(schedule_data: list[dict[str, Any]]) -> list[str]:
     """Infer players from serialized schedule data while preserving first-seen order."""
@@ -27,14 +40,17 @@ def infer_players_from_schedule(schedule_data: list[dict[str, Any]]) -> list[str
 
 def load_schedule_and_players_from_history_entry(entry: dict[str, Any], json_module):
     """Load schedule data and restore players from a history entry."""
-    schedule_data = json_module.loads(entry["schedule_data"])
+    try:
+        schedule_data = json_module.loads(entry["schedule_data"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Corrupt schedule data in history entry: {exc}") from exc
     players: list[str] = []
 
     raw_settings = entry.get("settings_data")
     if isinstance(raw_settings, str) and raw_settings:
         try:
             parsed_settings = json_module.loads(raw_settings)
-        except Exception:
+        except (TypeError, ValueError):
             parsed_settings = {}
         if isinstance(parsed_settings, dict):
             stored_players = parsed_settings.get("players", [])
@@ -111,7 +127,7 @@ def render_analytics_tab(st_module, pd_module, schedule_analytics_cls, has_plotl
         return
 
     schedule = st_module.session_state.current_schedule
-    players = st_module.session_state.current_players
+    players = st_module.session_state.get("current_players", [])
 
     if players and schedule:
         num_players = len(players)
@@ -172,7 +188,8 @@ def render_configuration_tab(st_module):
     """Render the configuration and constraints tab."""
     st_module.subheader("⚙️ Configuration")
 
-    config = st_module.session_state.app_config
+    config = normalize_config_constraints(st_module.session_state.app_config)
+    st_module.session_state.app_config = config
 
     st_module.markdown("### 🎚️ Objective Weights")
     st_module.info("Adjust the importance of different scheduling objectives")
@@ -204,21 +221,21 @@ def render_configuration_tab(st_module):
         st_module.markdown("**Do Not Pair Together**")
         do_not_pair = st_module.text_area(
             "Players who should not be paired (format: Player1,Player2):",
-            value="\n".join(config["constraints"].get("do_not_pair", [])),
+            value=serialize_constraint_pairs(config["constraints"].get("do_not_pair", [])),
             height=100,
             key="do_not_pair_input",
         )
-        config["constraints"]["do_not_pair"] = [line.strip() for line in do_not_pair.split("\n") if line.strip()]
+        config["constraints"]["do_not_pair"] = normalize_constraint_pairs(do_not_pair)
 
     with col2:
         st_module.markdown("**Do Not Oppose Each Other**")
         do_not_oppose = st_module.text_area(
-            "Players who should not oppose each other:",
-            value="\n".join(config["constraints"].get("do_not_oppose", [])),
+            "Players who should not oppose each other (format: Player1,Player2):",
+            value=serialize_constraint_pairs(config["constraints"].get("do_not_oppose", [])),
             height=100,
             key="do_not_oppose_input",
         )
-        config["constraints"]["do_not_oppose"] = [line.strip() for line in do_not_oppose.split("\n") if line.strip()]
+        config["constraints"]["do_not_oppose"] = normalize_constraint_pairs(do_not_oppose)
 
     st_module.markdown("### ⏰ Scheduling Preferences")
 
@@ -250,9 +267,34 @@ def render_configuration_tab(st_module):
             config["scheduling"]["end_time"] = selected_end_time.strftime("%H:%M")
 
     if st_module.button("💾 Save Configuration"):
-        st_module.session_state.config_manager.save_config(config)
+        saved = st_module.session_state.config_manager.save_config(config)
         st_module.session_state.app_config = config
-        st_module.success("✅ Configuration saved!")
+        if saved:
+            st_module.session_state._constraint_widget_version = (
+                int(st_module.session_state.get("_constraint_widget_version", 0)) + 1
+            )
+            st_module.session_state._sync_main_constraints_from_config = True
+            st_module.session_state._preserve_saved_constraints_from_config = True
+            st_module.session_state.global_status_message = "✅ Configuration saved!"
+            st_module.rerun()
+
+
+_PRESET_WIDGET_KEY_PREFIX = "preset_"
+# Widget keys that share the "preset_" prefix but belong to other widgets.
+_PRESET_WIDGET_RESERVED_KEYS = {"preset_name"}
+
+
+def _prune_stale_preset_widget_state(session_state, presets) -> None:
+    """Drop preset_* widget keys whose preset no longer exists in config."""
+    stale_keys = [
+        key
+        for key in list(session_state.keys())
+        if key.startswith(_PRESET_WIDGET_KEY_PREFIX)
+        and key not in _PRESET_WIDGET_RESERVED_KEYS
+        and key[len(_PRESET_WIDGET_KEY_PREFIX) :] not in presets
+    ]
+    for key in stale_keys:
+        del session_state[key]
 
 
 def render_player_management_tab(st_module, player_manager_cls):
@@ -285,6 +327,8 @@ def render_player_management_tab(st_module, player_manager_cls):
     config = st_module.session_state.app_config
     presets = config.get("player_presets", {})
 
+    _prune_stale_preset_widget_state(st_module.session_state, presets)
+
     for preset_name, players in presets.items():
         with st_module.expander(f"Preset: {preset_name} ({len(players)} players)"):
             col1, col2 = st_module.columns([3, 1])
@@ -300,19 +344,25 @@ def render_player_management_tab(st_module, player_manager_cls):
             with col2:
                 if st_module.button("🗑️ Delete", key=f"delete_{preset_name}"):
                     del config["player_presets"][preset_name]
-                    st_module.session_state.config_manager.save_config(config)
-                    st_module.rerun()
+                    if st_module.session_state.config_manager.save_config(config):
+                        if st_module.session_state.get("selected_player_preset") == preset_name:
+                            st_module.session_state.selected_player_preset = "Custom"
+                        st_module.rerun()
 
     st_module.markdown("### ➕ Add New Preset")
     col1, col2 = st_module.columns([2, 1])
 
     with col1:
-        new_preset_name = st_module.text_input("New preset name:")
-        new_preset_players = st_module.text_area("Players (one per line):")
+        if st_module.session_state.pop("_pending_clear_new_preset_inputs", False):
+            st_module.session_state["new_preset_name"] = ""
+            st_module.session_state["new_preset_players"] = ""
+        new_preset_name = st_module.text_input("New preset name:", key="new_preset_name")
+        new_preset_players = st_module.text_area("Players (one per line):", key="new_preset_players")
 
     with col2:
         if st_module.button("Add Preset") and new_preset_name and new_preset_players:
             config["player_presets"][new_preset_name] = [p.strip() for p in new_preset_players.split("\n") if p.strip()]
-            st_module.session_state.config_manager.save_config(config)
-            st_module.success(f"✅ Added preset: {new_preset_name}")
-            st_module.rerun()
+            if st_module.session_state.config_manager.save_config(config):
+                st_module.session_state.global_status_message = f"✅ Added preset: {new_preset_name}"
+                st_module.session_state._pending_clear_new_preset_inputs = True
+                st_module.rerun()

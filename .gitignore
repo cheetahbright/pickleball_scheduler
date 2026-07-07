@@ -1,4 +1,21 @@
-# Byte-compiled / optimized / DLL files
+# === VS Code Performance Optimizations (CRITICAL) ===
+# These exclusions are essential for VS Code file watcher performance
+# with the complex pickleball scheduling algorithms and testing framework
+
+# Performance monitoring
+performance_report.json
+vscode_performance_*.log
+
+# Conda environment activation logs
+conda_activation.log
+
+# VS Code Cache and temporary files
+.vscode/settings.json.bak
+.vscode/launch.json.bak
+.vscode/tasks.json.bak
+.vscode/*.log
+
+# Byte-compiled / optimized / DLL files (cache cleared for CI refresh)
 __pycache__/
 *.py[cod]
 *$py.class
@@ -122,11 +139,15 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-local/
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Streamlit secrets (CRITICAL - contains authentication passwords)
+.streamlit/secrets.toml
 
 # Spyder project settings
 .spyderproject
@@ -159,10 +180,82 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Streamlit/deploy artifacts
-.streamlit/secrets.toml
-data/app_config.json
-data/*.db
-data/pickleball_history.json
-data/pickleball_stats.json
-artifacts/
+# CI/CD generated files
+verify.json
+
+# VS Code performance optimization
+.vscode/settings.json.bak
+.vscode/launch.json.bak
+**/.DS_Store
+**/Thumbs.db
+
+# Performance: Large data files
+*.pkl
+*.joblib
+*.npy
+*.h5
+*.parquet
+
+# Performance: Temporary algorithm outputs
+**/temp_schedules/
+**/benchmark_results/
+**/optimization_logs/
+
+# Performance and benchmark artifacts
+perf/
+junit-*.xml
+benchmark-results.json
+
+# Generated output files
+output/
+!output/README.md
+
+# Force CI refresh
+
+# Debug artifacts and screenshots
+debug/*.png
+debug/*.html
+debug/*.py
+debug_*.png
+debug_*.py
+
+# Local UI verification artifacts
+artifacts/ui_smoke/
+
+# Root-level ad-hoc test scripts (we keep organized tests under tests/)
+/test_*.py
+/run_all_gui_tests.py
+/GUI_TEST_CONSOLIDATION_SUMMARY.py
+
+# Local-only archive of retired root diagnostics (never tracked; kept for reference)
+/archive/root_diagnostics/
+
+# Default player names backup files (preserve originals)
+data/default_player_names.backup.json
+/manage_defaults.py
+
+# Mutable local app state under data/
+/data/app_config.json
+/data/schedule_history.db
+/data/weekly_history.db
+/data/bayesian_preferences.json
+/data/saved_player_config.json
+/data/saved_session.json
+/data/schedule_history.json
+/data/scheduler_settings.json
+
+# Local app history/stats artifacts
+/pickleball_history.json
+/pickleball_stats.json
+/data/pickleball_history.json
+/data/pickleball_stats.json
+/artifacts/test_history.json
+/artifacts/test_stats.json
+/artifacts/performance_reports/
+/artifacts/pytest-temp/
+/artifacts/test-temp/
+/artifacts/test-temp-manual/
+/artifacts/test-workdirs/
+/logs/*.json
+/.tmp_testdata/
+/manual_tmp_test/

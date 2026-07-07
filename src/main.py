@@ -344,13 +344,14 @@ def run_tests() -> bool:
 
         _console_print("🧪 Running validation tests...")
 
-        # Run pytest on the tests directory
+        # Run the maintained default pytest lane from the project root.
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", "tests/", "-v"],
+            [sys.executable, "-m", "pytest", "-q"],
             check=False,
             timeout=300,
             capture_output=True,
             text=True,
+            cwd=str(project_root),
         )
 
         if result.returncode == 0:

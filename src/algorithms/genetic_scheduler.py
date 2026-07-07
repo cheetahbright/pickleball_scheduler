@@ -5,10 +5,101 @@ import builtins
 import os
 import random
 import sys
-import time
-from collections import Counter, defaultdict
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, cast
+from collections import defaultdict
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+try:
+    from src.algorithms.scheduler_reporting import (
+        Game,
+        build_scheduler_failure_result,
+        build_scheduler_result,
+        format_schedule,
+        invoke_progress_callback,
+        print_scheduler_final_report,
+        print_scheduler_start_banner,
+        sum_range_metrics,
+    )
+except ImportError:
+    from algorithms.scheduler_reporting import (  # noqa: F401  (Game re-exported for legacy imports)
+        Game,
+        build_scheduler_failure_result,
+        build_scheduler_result,
+        format_schedule,
+        invoke_progress_callback,
+        print_scheduler_final_report,
+        print_scheduler_start_banner,
+        sum_range_metrics,
+    )
+
+try:
+    from src.algorithms.scheduler_metrics import (
+        count_avoidable_duplicate_rounds,
+        count_duplicate_rounds,
+        evaluate_metrics_from_arrangement_stats,
+        evaluate_schedule_metrics,
+        precompute_arrangement_stats,
+        round_signature,
+    )
+except ImportError:
+    from algorithms.scheduler_metrics import (
+        count_avoidable_duplicate_rounds,
+        count_duplicate_rounds,
+        evaluate_metrics_from_arrangement_stats,
+        evaluate_schedule_metrics,
+        precompute_arrangement_stats,
+        round_signature,
+    )
+
+try:
+    from src.algorithms.scheduler_repairs import (
+        apply_targeted_repairs,
+        count_partners,
+        repair_invalid_schedule,
+        repair_opponent_imbalance,
+        repair_partner_imbalance,
+    )
+except ImportError:
+    from algorithms.scheduler_repairs import (
+        apply_targeted_repairs,
+        count_partners,
+        repair_invalid_schedule,
+        repair_opponent_imbalance,
+        repair_partner_imbalance,
+    )
+
+try:
+    from src.algorithms.scheduler_evolution import (
+        compute_general_stop_threshold,
+        compute_perfect_stop_threshold,
+    )
+    from src.algorithms.scheduler_evolution import crossover as _crossover_fn
+    from src.algorithms.scheduler_evolution import elitism as _elitism_fn
+    from src.algorithms.scheduler_evolution import random_individual as _random_individual_fn
+    from src.algorithms.scheduler_evolution import (
+        run_evolution_loop,
+    )
+    from src.algorithms.scheduler_evolution import super_aggressive_mutate as _super_aggressive_mutate_fn
+    from src.algorithms.scheduler_evolution import tournament_select as _tournament_select_fn
+except ImportError:
+    from algorithms.scheduler_evolution import (
+        compute_general_stop_threshold,
+        compute_perfect_stop_threshold,
+    )
+    from algorithms.scheduler_evolution import crossover as _crossover_fn
+    from algorithms.scheduler_evolution import elitism as _elitism_fn
+    from algorithms.scheduler_evolution import random_individual as _random_individual_fn
+    from algorithms.scheduler_evolution import (
+        run_evolution_loop,
+    )
+    from algorithms.scheduler_evolution import super_aggressive_mutate as _super_aggressive_mutate_fn
+    from algorithms.scheduler_evolution import tournament_select as _tournament_select_fn
+
+try:
+    from src.algorithms.arrangement_generator import game_valid as _game_valid_fn
+    from src.algorithms.arrangement_generator import generate_arrangements as _generate_arrangements_fn
+except ImportError:
+    from algorithms.arrangement_generator import game_valid as _game_valid_fn
+    from algorithms.arrangement_generator import generate_arrangements as _generate_arrangements_fn
 
 try:
     from src.utils.feasibility_analyzer import ScheduleFeasibilityAnalyzer
@@ -30,13 +121,6 @@ def _console_print(*args, sep: str = " ", end: str = "\n", file=None, flush=Fals
 
 # The scheduler is often run directly from Windows terminals and diagnostic scripts.
 print = _console_print
-
-
-@dataclass
-class Game:
-    team1: List[str]
-    team2: List[str]
-    court: int
 
 
 GameTuple = Tuple[str, str, str, str]
@@ -203,28 +287,39 @@ class GeneticPickleballScheduler:
                     "to": getattr(p, "available_to", None),
                 }
 
-        # Feasibility for Partner Range-0 (primary constraint)
-        total_slots = self.num_rounds * self.num_courts * 4
-        total_partnerships = (self.num_players * (self.num_players - 1)) // 2
-        partnership_slots = total_slots // 2
+        if ScheduleFeasibilityAnalyzer:
+            feasibility = ScheduleFeasibilityAnalyzer.calculate_theoretical_minimums(
+                self.num_players,
+                self.num_courts,
+                self.num_rounds,
+            )
+        else:
+            total_slots = self.num_rounds * self.num_courts * 4
+            total_partnerships = (self.num_players * (self.num_players - 1)) // 2
+            partnership_slots = total_slots // 2
+            partner_range0_possible = (
+                partnership_slots % total_partnerships == 0 and partnership_slots >= total_partnerships
+            )
+            games_balanced = total_slots % self.num_players == 0
+            courts_balanced = total_slots % (self.num_players * self.num_courts) == 0
+            feasibility = {
+                "min_partner_range": 0 if partner_range0_possible else 1,
+                "total_theoretical_min": 0 if partner_range0_possible and games_balanced and courts_balanced else 1,
+                "range_0_possible": partner_range0_possible and games_balanced and courts_balanced,
+            }
 
-        # Partner Range 0 requires perfect division of partnerships
-        partner_range0_possible = (
-            partnership_slots % total_partnerships == 0 and partnership_slots >= total_partnerships
-        )
-
-        # Overall Range 0 considers games + courts + partners (opponents flexible)
-        games_balanced = total_slots % self.num_players == 0
-        courts_balanced = total_slots % (self.num_players * self.num_courts) == 0
-
-        self.range0_possible = partner_range0_possible and games_balanced and courts_balanced
-        self.partner_range0_possible = partner_range0_possible
-        self.optimal_partner_range = 0 if partner_range0_possible else 1
+        self.feasibility_minimums = feasibility
+        self.range0_possible = bool(feasibility["range_0_possible"])
+        self.partner_range0_possible = int(feasibility["min_partner_range"]) == 0
+        self.optimal_partner_range = int(feasibility["min_partner_range"])
+        self.optimal_total_range = int(feasibility["total_theoretical_min"])
 
         # Precompute arrangement pool (one round templates)
         self.arrangements: List[List[Tuple[str, str, str, str]]] = self._generate_arrangements(max_arrangements=400)
         if not self.arrangements:
             raise ValueError("No valid arrangements generated for these players/courts")
+        self.max_unique_rounds = len({self._round_signature(arrangement) for arrangement in self.arrangements})
+        self.minimum_duplicate_rounds = max(0, self.num_rounds - self.max_unique_rounds)
 
         # Ensure constraint maps have entries for all players (legacy expectation)
         for name in self._names:
@@ -236,6 +331,7 @@ class GeneticPickleballScheduler:
         self._metrics_cache: Dict[Tuple[int, ...], Dict[str, int]] = {}
         self._schedule_cache: Dict[Tuple[int, ...], List[List[Tuple]]] = {}
         self._signature_cache: Dict[Tuple[int, ...], Tuple] = {}
+        self._refresh_arrangement_stats()
 
         # Progress tracking for reduced update frequency
         self._last_progress_time = 0.0
@@ -267,6 +363,25 @@ class GeneticPickleballScheduler:
                 a, b = str(a), str(b)
                 self.do_not_oppose_map[a].add(b)
                 self.do_not_oppose_map[b].add(a)
+        if pair_constraints or oppose_constraints:
+            # The arrangement pool was built before these constraints existed,
+            # so it can still contain forbidden pairings/oppositions. Rebuild it
+            # so hard constraints are excluded from the search space entirely
+            # instead of relying only on the fitness penalty.
+            rebuilt = self._generate_arrangements(max_arrangements=400)
+            if rebuilt:
+                self.arrangements = rebuilt
+                self.max_unique_rounds = len({self._round_signature(arrangement) for arrangement in self.arrangements})
+                self.minimum_duplicate_rounds = max(0, self.num_rounds - self.max_unique_rounds)
+            else:
+                print("⚠️ Constraints leave no valid round arrangements - keeping unconstrained pool with penalties")
+            # Constraint maps changed either way, so per-arrangement violation
+            # summaries and every cached evaluation are stale.
+            self._fitness_cache.clear()
+            self._metrics_cache.clear()
+            self._schedule_cache.clear()
+            self._signature_cache.clear()
+            self._refresh_arrangement_stats()
         if must_pair:
             for a, b in must_pair:
                 a, b = str(a), str(b)
@@ -281,14 +396,28 @@ class GeneticPickleballScheduler:
     def set_substitution_info(self, info: Dict[str, Any] | None) -> None:
         self.substitution_info = info
 
+    def _minimum_runtime_before_general_stop(self) -> float:
+        """Return the minimum runtime before non-perfect early exits are allowed."""
+        return compute_general_stop_threshold(self.num_players, self.num_rounds, self.min_runtime)
+
+    def _minimum_runtime_before_perfect_stop(self) -> float:
+        """Return how long to keep searching after a perfect schedule is found."""
+        return compute_perfect_stop_threshold(self.num_players, self.num_rounds, self.min_runtime, self.max_runtime)
+
     # Main entry
     def generate_schedule(
         self,
         verbose: bool = False,
         max_time: float | None = None,
         progress_callback: Optional[Callable[..., object]] = None,
+        seed: Optional[int] = None,
+        clock: Optional[Callable[[], float]] = None,
     ):
-        """Run GA with Range 0 early termination and optional progress callback."""
+        """Run GA with Range 0 early termination and optional progress callback.
+
+        Pass ``seed`` (and optionally a fake ``clock``) to make a run fully
+        reproducible; by default the seed is time-based for run-to-run variety.
+        """
         import random
         import time
 
@@ -296,299 +425,79 @@ class GeneticPickleballScheduler:
         if progress_callback is None:
             progress_callback = self.progress_callback
 
-        # QUALITY-FOCUSED: For small problems where Range 0 is achievable, ensure minimum runtime
-        if self.num_players <= 8 and self.num_rounds <= 8:
-            ABSOLUTE_MIN_RUNTIME = max(15.0, self.min_runtime)  # At least 15 seconds for quality
-        else:
-            ABSOLUTE_MIN_RUNTIME = self.min_runtime or 5.0
-
-        # Environment check for testing only
-        if os.environ.get("E2E_TEST") in ("1", "true", "True"):
-            ABSOLUTE_MIN_RUNTIME = 0.5
-
         # Update runtime settings
         if max_time is not None and isinstance(max_time, (int, float)):
             self.max_runtime = float(max_time)
         else:
             self.max_runtime = self.max_runtime
 
-        start_time = time.time()
+        absolute_min_runtime = self._minimum_runtime_before_general_stop()
+        perfect_stop_runtime = self._minimum_runtime_before_perfect_stop()
 
-        # CRITICAL FIX: Use RANDOM seed based on time for different results each run!
-        seed = int(time.time() * 1000) % 1000000  # Different seed each run
+        now = clock if clock is not None else time.time
+        start_time = now()
+
+        # Time-based seed by default so unseeded runs stay varied.
+        if seed is None:
+            seed = int(time.time() * 1000) % 1000000
         rng = random.Random(seed)
+        # Expose the run's rng/clock to repair callbacks for reproducibility.
+        self._run_rng = rng
+        self._run_clock = now
 
-        # Log runtime enforcement
-        print(f"🕐 GA Starting with ENFORCED minimum runtime: {ABSOLUTE_MIN_RUNTIME}s")
-        print(f"   Maximum runtime: {self.max_runtime}s")
-        print(f"   Partner Range 0 possible: {self.partner_range0_possible}")
-        print(f"   Optimal partner range: {self.optimal_partner_range}")
-        print(f"   Overall Range 0 possible: {self.range0_possible}")
-        print(f"   Random seed: {seed} (different each run for variety)")
+        print_scheduler_start_banner(
+            print,
+            absolute_min_runtime=absolute_min_runtime,
+            perfect_stop_runtime=perfect_stop_runtime,
+            max_runtime=self.max_runtime,
+            partner_range0_possible=self.partner_range0_possible,
+            optimal_partner_range=self.optimal_partner_range,
+            range0_possible=self.range0_possible,
+            optimal_total_range=self.optimal_total_range,
+            max_unique_rounds=self.max_unique_rounds,
+            minimum_duplicate_rounds=self.minimum_duplicate_rounds,
+            seed=seed,
+        )
 
-        # Initialize tracking
-        best_individual = None
-        best_fitness = float("inf")
-        best_ranges = None
-        generations_run = 0
-        generations_without_improvement = 0
-
-        # Track if we've logged progress recently
-        last_progress_log = 0
-
-        # Initialize population
-        population = [self._random_individual(rng) for _ in range(self.population_size)]
-        current_ranges = {"games": 0, "partners": 0, "opponents": 0, "courts": 0}
-
-        # MAIN EVOLUTION LOOP - GUARANTEED TO RUN FOR MINIMUM TIME
-        while True:
-            elapsed = time.time() - start_time
-
-            # CRITICAL: Check if we can stop
-            can_stop = False
-            stop_reason = None
-
-            # Check for Range 0 achievement
-            if best_individual is not None:
-                schedule = self._decode(best_individual)
-                metrics = self._evaluate_metrics(schedule)
-                current_ranges = {
-                    "games": metrics["games_range"],
-                    "partners": metrics["partners_range"],
-                    "opponents": metrics["opponents_range"],
-                    "courts": metrics["courts_range"],
-                }
-
-                total_range = sum(current_ranges.values())
-
-                # Log progress every 15 seconds (much less frequent)
-                if elapsed - last_progress_log >= 15.0:
-                    print(
-                        f"⏱️ {elapsed:.1f}s - Range {total_range} "
-                        f"(G:{current_ranges['games']} P:{current_ranges['partners']} "
-                        f"O:{current_ranges['opponents']} C:{current_ranges['courts']})"
-                    )
-                    last_progress_log = elapsed
-
-                # Progress callback for real-time Streamlit updates
-                if progress_callback:
-                    progress_data = {
-                        "elapsed_time": elapsed,
-                        "generation": generations_run,
-                        "best_fitness": best_fitness,
-                        "current_ranges": current_ranges,
-                        "total_range": total_range,
-                        "range0_possible": self.range0_possible,
-                        "max_time": self.max_runtime,
-                    }
-                    try:
-                        progress_callback(progress_data)
-                    except Exception as e:
-                        print(f"Progress callback failed: {e}")
-
-                # Check stopping conditions - RUN FOR FULL TIME FOR QUALITY
-                if self.range0_possible and total_range == 0:
-                    # Even with Range 0, continue for quality unless we've run sufficient time
-                    if elapsed >= min(30.0, self.max_runtime * 0.8):
-                        can_stop = True
-                        stop_reason = "PERFECT RANGE 0 ACHIEVED AFTER SUFFICIENT RUNTIME! 🎉"
-                    else:
-                        can_stop = False  # Keep running for quality
-                elif self.range0_possible and total_range > 0:
-                    # Continue trying for Range 0 but respect time limits
-                    if elapsed >= self.max_runtime:
-                        can_stop = True
-                        stop_reason = (
-                            f"Max runtime {self.max_runtime}s reached - "
-                            f"Range 0 not achieved (current: {total_range})"
-                        )
-                elif elapsed >= self.max_runtime:
-                    can_stop = True
-                    stop_reason = f"Max runtime {self.max_runtime}s reached - FORCING STOP"
-                elif elapsed < ABSOLUTE_MIN_RUNTIME:
-                    # Continue until minimum runtime unless Range 0
-                    can_stop = False
-                    # Minimal logging every 5 seconds only
-                    if int(elapsed) % 5 == 0 and elapsed > 0 and int(elapsed) != int(elapsed - 0.1):
-                        print(f"⏳ Optimizing... {ABSOLUTE_MIN_RUNTIME - elapsed:.1f}s remaining")
-                elif generations_run >= self.max_generations and elapsed >= ABSOLUTE_MIN_RUNTIME:
-                    # Only stop for max generations AFTER minimum runtime
-                    can_stop = True
-                    stop_reason = f"Max generations {self.max_generations} reached"
-            else:
-                # First generation
-                if elapsed >= self.max_runtime:
-                    can_stop = True
-                    stop_reason = "Max runtime reached (no valid solution found)"
-
-            # EXIT CONDITION
-            if can_stop:
-                print(f"🏁 Stopping: {stop_reason} after {elapsed:.1f}s and {generations_run} generations")
-                break
-
-            # EVOLUTION STEP
-            # Evaluate current population with optimized batch processing
-            fitness_scores = self._evaluate_population_optimized(population)
-
-            # Track best with convergence and quality-focused improvements
-            fitness_improved = False
-            for ind, fitness in fitness_scores:
-                if fitness < best_fitness:
-                    best_fitness = fitness
-                    best_individual = ind
-                    fitness_improved = True
-
-                    # Only log significant improvements and limit frequency
-                    current_time = time.time()
-                    fitness_improvement = self._last_logged_fitness - fitness
-                    time_since_log = current_time - self._last_progress_time
-
-                    # Log if major improvement OR enough time passed
-                    if fitness_improvement > 1000000 or time_since_log > self._progress_update_interval:
-
-                        schedule = self._decode_cached(ind)
-                        metrics = self._evaluate_metrics_cached(schedule, ind)
-                        best_ranges = {
-                            "games": metrics["games_range"],
-                            "partners": metrics["partners_range"],
-                            "opponents": metrics["opponents_range"],
-                            "courts": metrics["courts_range"],
-                        }
-                        total_range = sum(best_ranges.values())
-
-                        print(f"📈 Gen {generations_run}: Range = {total_range}, Fitness = {fitness:.0f}")
-
-                        self._last_progress_time = current_time
-                        self._last_logged_fitness = fitness
-
-            # Enhanced convergence tracking for quality
-            if fitness_improved:
-                generations_without_improvement = 0
-            else:
-                generations_without_improvement += 1
-
-            # Check for convergence with Range 0 priority
-            if best_individual is not None:
-                schedule = self._decode(best_individual)
-                metrics = self._evaluate_metrics(schedule)
-                total_range = sum(
-                    [
-                        metrics["games_range"],
-                        metrics["partners_range"],
-                        metrics["opponents_range"],
-                        metrics["courts_range"],
-                    ]
-                )
-
-                # Quality-focused convergence logic
-                if total_range == 0:  # Range 0 achieved
-                    if verbose:
-                        print(f"✅ Found optimal solution (Range 0) at generation {generations_run}")
-                    # DON'T STOP - let main loop handle timing constraints
-                    # Only stop if we've run for sufficient time to ensure quality
-                    if elapsed >= min(30.0, self.max_runtime * 0.5) and generations_without_improvement > 30:
-                        if verbose:
-                            print("🏁 Range 0 confirmed stable after sufficient runtime - stopping")
-                        break
-                elif generations_without_improvement >= self.convergence_patience:
-                    if verbose:
-                        print(f"Converged after {generations_without_improvement} generations without improvement")
-                    # CRITICAL: Don't stop unless we've used most of our runtime!
-                    # This ensures we run close to the full minute for quality
-                    if elapsed < self.max_runtime * 0.8:
-                        if verbose:
-                            print(f"Continuing search - only {elapsed:.1f}s of {self.max_runtime}s used...")
-                        # Reset convergence to give more time
-                        generations_without_improvement = self.convergence_patience - 50
-                    else:
-                        print("🏁 Convergence reached - stopping")
-                        break  # Sort by fitness
-            fitness_scores.sort(key=lambda x: x[1])
-
-            # Create next generation
-            new_population = []
-
-            # Elitism - keep best individuals
-            elite_count = max(2, self.population_size // 10)
-            for ind, _ in fitness_scores[:elite_count]:
-                new_population.append(ind)
-
-            # Fill rest with crossover and mutation
-            while len(new_population) < self.population_size:
-                # Tournament selection
-                parent1 = self._tournament_select(population, fitness_scores, rng, k=self.tournament_size)
-                parent2 = self._tournament_select(population, fitness_scores, rng, k=self.tournament_size)
-
-                # Crossover
-                if rng.random() < 0.9:
-                    child1, child2 = self._crossover(parent1, parent2, rng)
-                else:
-                    child1, child2 = parent1, parent2
-
-                # SUPER aggressive mutation for Range 0
-                child1 = self._super_aggressive_mutate(child1, rng)
-                child2 = self._super_aggressive_mutate(child2, rng)
-
-                new_population.extend([child1, child2])
-
-            # Trim to population size
-            population = new_population[: self.population_size]
-
-            # Inject diversity MORE frequently when pursuing Range 0
-            diversity_interval = 15 if self.range0_possible else 30
-            if generations_run % diversity_interval == 0 and generations_run > 0:
-                current_best_range = sum(
-                    [
-                        current_ranges["games"],
-                        current_ranges["partners"],
-                        current_ranges["opponents"],
-                        current_ranges["courts"],
-                    ]
-                )
-                print(
-                    f"💉 Injecting MASSIVE diversity at generation {generations_run} "
-                    f"(current range: {current_best_range})"
-                )
-                # Replace MORE of population when pursuing Range 0
-                replacement_fraction = 0.75 if (self.range0_possible and current_best_range > 0) else 0.5
-                for i in range(int(self.population_size * replacement_fraction)):
-                    idx = rng.randrange(len(population))
-                    population[idx] = self._random_individual(rng)
-
-            generations_run += 1
+        best_individual, best_fitness, generations_run = run_evolution_loop(
+            self,
+            rng=rng,
+            now=now,
+            start_time=start_time,
+            verbose=verbose,
+            progress_callback=progress_callback,
+            absolute_min_runtime=absolute_min_runtime,
+            perfect_stop_runtime=perfect_stop_runtime,
+            printer=print,
+            invoke_progress=invoke_progress_callback,
+        )
 
         # Final results
         if best_individual is None:
             print("❌ No valid solution found!")
-            return []
+            return build_scheduler_failure_result(
+                elapsed_seconds=now() - start_time,
+                generations_run=generations_run,
+                optimal_total_range=self.optimal_total_range,
+                minimum_duplicate_rounds=self.minimum_duplicate_rounds,
+                max_unique_rounds=self.max_unique_rounds,
+            )
 
         final_schedule = self._decode(best_individual)
         final_metrics = self._evaluate_metrics(final_schedule)
+        duplicate_rounds = self._count_duplicate_rounds(final_schedule)
+        avoidable_duplicate_rounds = self._count_avoidable_duplicate_rounds(final_schedule)
 
         # POST-PROCESSOR: Apply targeted repairs if optimal range not achieved
-        current_total_range = sum(
-            [
-                final_metrics["games_range"],
-                final_metrics["partners_range"],
-                final_metrics["opponents_range"],
-                final_metrics["courts_range"],
-            ]
-        )
-        optimal_total_range = self.optimal_partner_range  # Minimum achievable for this player count
+        current_total_range = sum_range_metrics(final_metrics)
+        optimal_total_range = self.optimal_total_range
 
         if current_total_range > optimal_total_range:
             print("\n🔧 POST-PROCESSOR: Attempting targeted repairs...")
             repaired_schedule = self._apply_targeted_repairs(final_schedule, max_time=0.5)
             if repaired_schedule:
                 repair_metrics = self._evaluate_metrics(repaired_schedule)
-                repair_total = sum(
-                    [
-                        repair_metrics["games_range"],
-                        repair_metrics["partners_range"],
-                        repair_metrics["opponents_range"],
-                        repair_metrics["courts_range"],
-                    ]
-                )
+                repair_total = sum_range_metrics(repair_metrics)
                 if repair_total < current_total_range:
                     print("✅ POST-PROCESSOR: Improved from Range " f"{current_total_range} to Range {repair_total}")
                     final_schedule = repaired_schedule
@@ -597,24 +506,20 @@ class GeneticPickleballScheduler:
                 else:
                     print(f"   ⚠️ REPAIR PARTIAL: Reduced to total range {repair_total}")
 
-        print(f"\n📊 FINAL RESULTS after {time.time() - start_time:.1f}s:")
-        print(f"   Games Range: {final_metrics['games_range']}")
-        print(f"   Partners Range: {final_metrics['partners_range']}")
-        print(f"   Opponents Range: {final_metrics['opponents_range']}")
-        print(f"   Courts Range: {final_metrics['courts_range']}")
-        print(f"   Total Range: {current_total_range}")
-
-        # OPTIMALITY ASSESSMENT based on mathematical constraints
-        if self.partner_range0_possible and final_metrics["partners_range"] > 0:
-            print("\n⚠️ WARNING: Partner Range 0 was mathematically possible " "but NOT achieved!")
-            print("   This schedule is SUBOPTIMAL and should have continued optimizing!")
-        elif not self.partner_range0_possible and current_total_range <= optimal_total_range + 1:
-            print("\n✅ OPTIMAL: Achieved mathematically optimal range for " f"{self.num_players} players!")
-            print(f"   Partner Range 0 is impossible - {final_metrics['partners_range']} is optimal")
-        elif current_total_range > optimal_total_range + 1:
-            print("\n⚠️ SUBOPTIMAL: Could be improved further " f"(target Range {optimal_total_range + 1})")
-        else:
-            print("\n🏆 PERFECT: Achieved optimal balance for this player count!")
+        elapsed_seconds = now() - start_time
+        print_scheduler_final_report(
+            print,
+            elapsed_seconds=elapsed_seconds,
+            final_metrics=final_metrics,
+            duplicate_rounds=duplicate_rounds,
+            avoidable_duplicate_rounds=avoidable_duplicate_rounds,
+            minimum_duplicate_rounds=self.minimum_duplicate_rounds,
+            partner_range0_possible=self.partner_range0_possible,
+            optimal_partner_range=self.optimal_partner_range,
+            optimal_total_range=optimal_total_range,
+            num_players=self.num_players,
+            max_unique_rounds=self.max_unique_rounds,
+        )
 
         # Store fitness details
         self.last_fitness_details = {
@@ -626,45 +531,29 @@ class GeneticPickleballScheduler:
         }
 
         # Return dict format expected by multi-algorithm scheduler
-        total_range = sum(
-            [
-                final_metrics["games_range"],
-                final_metrics["partners_range"],
-                final_metrics["opponents_range"],
-                final_metrics["courts_range"],
-            ]
+        result = build_scheduler_result(
+            formatted_schedule=self._format_schedule(final_schedule),
+            best_fitness=best_fitness,
+            generations_run=generations_run,
+            elapsed_seconds=elapsed_seconds,
+            final_metrics=final_metrics,
+            optimal_total_range=self.optimal_total_range,
+            duplicate_rounds=duplicate_rounds,
+            avoidable_duplicate_rounds=avoidable_duplicate_rounds,
+            minimum_duplicate_rounds=self.minimum_duplicate_rounds,
+            max_unique_rounds=self.max_unique_rounds,
+            fitness_details=self.last_fitness_details,
+            seed=seed,
         )
-        success = total_range == 0
-
-        formatted_schedule = self._format_schedule(final_schedule)
-        score = 100 - min(100, total_range * 10)
-        raw_metrics = dict(final_metrics)
-
-        # Enhanced result with feasibility analysis
-        result = {
-            "schedule": formatted_schedule,
-            "success": success,
-            "fitness": best_fitness,
-            "score": score,  # Higher score for lower ranges
-            "fitness_score": score,
-            "generations": generations_run,
-            "time_seconds": time.time() - start_time,
-            "algorithm": "Genetic Algorithm",
-            "total_range": total_range,
-            "games_range": raw_metrics["games_range"],
-            "partners_range": raw_metrics["partners_range"],
-            "opponents_range": raw_metrics["opponents_range"],
-            "courts_range": raw_metrics["courts_range"],
-            "fitness_details": self.last_fitness_details,
-            "raw_metrics": raw_metrics,  # Include raw metrics for debugging
-            "metrics": dict(raw_metrics),  # Backward-compatible alias
-        }
 
         # Quality check for small problems
-        elapsed = time.time() - start_time
+        elapsed = elapsed_seconds
         if self.num_players <= 8 and best_fitness > 0 and elapsed < self.max_runtime:
             if verbose:
-                print(f"⚠️ Suboptimal result (Range {total_range}). Consider increasing runtime or population size.")
+                print(
+                    f"⚠️ Suboptimal result (Range {result['total_range']}). "
+                    "Consider increasing runtime or population size."
+                )
 
         # Add feasibility analysis if available
         if ScheduleFeasibilityAnalyzer:
@@ -734,322 +623,36 @@ class GeneticPickleballScheduler:
 
     def _super_aggressive_mutate(self, ind: Tuple[int, ...], rng: random.Random) -> Tuple[int, ...]:
         """SUPER aggressive mutation for breaking out of local optima with diversity enforcement."""
-        arr_len = len(self.arrangements)
-        out = list(ind)
-
-        # EXTREME mutation rate for Range 0 targeting
-        mut_rate = 0.4  # 40% chance to mutate each gene
-
-        # Multiple mutation strategies
-        strategy = rng.randint(0, 6)  # Added new strategy
-
-        if strategy == 0:
-            # Replace many genes WITH DIVERSITY ENFORCEMENT
-            for i in range(len(out)):
-                if rng.random() < mut_rate:
-                    # Try to avoid duplicates when possible
-                    if arr_len >= len(out):
-                        # We have enough arrangements - try to pick unique
-                        candidates = list(range(arr_len))
-                        # Remove already used indices
-                        used = set(out[j] for j in range(len(out)) if j != i)
-                        available = [x for x in candidates if x not in used]
-                        if available:
-                            out[i] = rng.choice(available)
-                        else:
-                            out[i] = rng.randrange(0, arr_len)
-                    else:
-                        out[i] = rng.randrange(0, arr_len)
-        elif strategy == 1:
-            # Massive swaps
-            num_swaps = rng.randint(2, max(3, len(out) // 2))
-            for _ in range(num_swaps):
-                if len(out) > 1:
-                    i, j = rng.sample(range(len(out)), 2)
-                    out[i], out[j] = out[j], out[i]
-        elif strategy == 2:
-            # Replace entire chunks WITH DIVERSITY
-            if len(out) > 4:
-                start = rng.randrange(len(out) - 2)
-                length = rng.randint(2, min(4, len(out) - start))
-
-                # Generate diverse replacements
-                if arr_len >= length:
-                    used = set(out[j] for j in range(len(out)) if j < start or j >= start + length)
-                    candidates = [x for x in range(arr_len) if x not in used]
-                    if len(candidates) >= length:
-                        replacements = rng.sample(candidates, length)
-                        for i, replacement in enumerate(replacements):
-                            out[start + i] = replacement
-                    else:
-                        for i in range(start, start + length):
-                            out[i] = rng.randrange(0, arr_len)
-                else:
-                    for i in range(start, start + length):
-                        out[i] = rng.randrange(0, arr_len)
-        elif strategy == 3:
-            # Reverse segments
-            if len(out) > 2:
-                start = rng.randrange(len(out) - 1)
-                end = rng.randint(start + 1, len(out))
-                out[start:end] = reversed(out[start:end])
-        elif strategy == 4:
-            # Shuffle a portion
-            if len(out) > 4:
-                start = rng.randrange(len(out) - 3)
-                length = rng.randint(3, min(5, len(out) - start))
-                portion = out[start : start + length]
-                rng.shuffle(portion)
-                out[start : start + length] = portion
-        elif strategy == 5:
-            # Complete randomization of most genes
-            indices = rng.sample(range(len(out)), max(1, int(len(out) * 0.7)))
-            for i in indices:
-                out[i] = rng.randrange(0, arr_len)
-        else:
-            # NEW STRATEGY 6: ENFORCE COMPLETE DIVERSITY
-            if arr_len >= len(out):
-                # We have enough arrangements to make all rounds unique
-                indices = list(range(arr_len))
-                rng.shuffle(indices)
-                out = indices[: len(out)]
-                # print(f"🎯 DIVERSITY MUTATION: Created fully unique individual: {out}")  # Commented out to reduce spam
-            else:
-                # Not enough arrangements - do aggressive mutation
-                for i in range(len(out)):
-                    if rng.random() < 0.6:  # 60% mutation rate
-                        out[i] = rng.randrange(0, arr_len)
-
-        return tuple(out)
+        return _super_aggressive_mutate_fn(ind, rng, len(self.arrangements))
 
     def _random_individual(self, rng) -> Tuple[int, ...]:
         """Create a random individual ensuring maximum diversity."""
-        # CRITICAL FIX: Always enforce unique arrangements when possible
-        if len(self.arrangements) >= self.num_rounds:
-            # We have enough arrangements - ALWAYS use unique ones
-            indices = list(range(len(self.arrangements)))
-            rng.shuffle(indices)
-            selected = indices[: self.num_rounds]
-
-            # VALIDATION: Ensure all indices are different
-            if len(set(selected)) != len(selected):
-                # Fallback: manually ensure uniqueness
-                selected = rng.sample(range(len(self.arrangements)), self.num_rounds)
-
-            return tuple(selected)
-        else:
-            # Not enough unique arrangements - but still try to maximize diversity
-            indices = []
-            available = list(range(len(self.arrangements)))
-            for _ in range(self.num_rounds):
-                if available:
-                    choice = rng.choice(available)
-                    indices.append(choice)
-                    available.remove(choice)  # Remove to avoid immediate reuse
-                else:
-                    # Ran out of unique options, reset and continue
-                    available = list(range(len(self.arrangements)))
-                    choice = rng.choice(available)
-                    indices.append(choice)
-                    available.remove(choice)
-            return tuple(indices)
+        return _random_individual_fn(rng, len(self.arrangements), self.num_rounds)
 
     def _crossover(
         self, parent1: Tuple[int, ...], parent2: Tuple[int, ...], rng
     ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
         """Crossover two parents to create offspring."""
-        if len(parent1) <= 1:
-            return parent1, parent2
-
-        # Multi-point crossover for better mixing
-        num_points = rng.randint(1, min(3, len(parent1) - 1))
-        points = sorted(rng.sample(range(1, len(parent1)), num_points))
-
-        child1, child2 = list(parent1), list(parent2)
-
-        # Alternate segments between parents
-        swap = False
-        start = 0
-        for point in points:
-            if swap:
-                child1[start:point], child2[start:point] = (
-                    child2[start:point],
-                    child1[start:point],
-                )
-            start = point
-            swap = not swap
-
-        # Handle last segment
-        if swap:
-            child1[start:], child2[start:] = child2[start:], child1[start:]
-
-        return tuple(child1), tuple(child2)
+        return _crossover_fn(parent1, parent2, rng)
 
     def _generate_arrangements(self, max_arrangements: int = 400) -> List[List[Tuple[str, str, str, str]]]:
-        """Generate MANY diverse arrangements to enable Range 0."""
-        rng = random.Random(123)  # Keep this deterministic for arrangement generation
-
-        arrangements: List[List[Tuple[str, str, str, str]]] = []
-
-        # Generate many times more attempts to get diversity
-        for attempt in range(max_arrangements * 10):
-            # Create fresh shuffled player list for each attempt
-            player_pool = list(self._names)
-            rng.shuffle(player_pool)
-
-            round_games = []
-            used_in_round = set()  # Track all players used in this round
-            court = 0
-
-            # GUARANTEED UNIQUE: Select 4 unused players for each game
-            player_idx = 0
-            while court < self.num_courts and player_idx < len(player_pool):
-                # Find 4 players that haven't been used in this round
-                game_players = []
-                temp_idx = player_idx
-
-                while len(game_players) < 4 and temp_idx < len(player_pool):
-                    candidate = player_pool[temp_idx]
-                    if candidate not in used_in_round and candidate not in game_players:
-                        game_players.append(candidate)
-                    temp_idx += 1
-
-                # If we couldn't find 4 unused players, try next starting position
-                if len(game_players) < 4:
-                    player_idx += 1
-                    continue
-
-                p1, p2, p3, p4 = game_players
-
-                # CRITICAL: Double-check uniqueness before accepting
-                if len(set([p1, p2, p3, p4])) == 4 and self._game_valid((p1, p2, p3, p4)):
-                    round_games.append((p1, p2, p3, p4))
-                    used_in_round.update([p1, p2, p3, p4])
-                    court += 1
-                    player_idx = temp_idx  # Move past used players
-                else:
-                    player_idx += 1  # Try different starting position
-
-            # Only accept rounds that use exactly the right number of players
-            if len(round_games) == self.num_courts and len(used_in_round) == self.num_courts * 4:
-                # FINAL VALIDATION: Ensure no player appears in multiple games
-                all_round_players = set()
-                has_duplicates = False
-                for game in round_games:
-                    game_set = set(game)
-                    if game_set & all_round_players:
-                        has_duplicates = True
-                        break
-                    all_round_players.update(game_set)
-
-                if not has_duplicates and len(all_round_players) == self.num_courts * 4:
-                    arrangements.append(round_games)
-                else:
-                    # Skip this arrangement due to duplicates
-                    pass
-
-            if len(arrangements) >= max_arrangements:
-                break
-
-        # Generate even more variations by swapping players within games
-        original_count = len(arrangements)
-        for arr in list(arrangements[: original_count // 2]):
-            for _ in range(3):  # Create 3 variations of each
-                var: List[Tuple[str, str, str, str]] = []
-                used_in_var = set()
-
-                for game in arr:
-                    g = list(game)
-                    # Simple safe swaps within teams only (no cross-team swaps)
-                    if rng.random() < 0.5:
-                        g[0], g[1] = g[1], g[0]  # Swap within team 1
-                    if rng.random() < 0.5:
-                        g[2], g[3] = g[3], g[2]  # Swap within team 2
-
-                    game_tuple = cast(GameTuple, tuple(g))
-                    # Ensure no duplicates in this variation
-                    game_players = set(game_tuple)
-                    valid_game = len(game_players) == 4 and not any(p in used_in_var for p in game_players)
-                    if valid_game:
-                        var.append(game_tuple)
-                        used_in_var.update(game_players)
-                    else:
-                        # Keep original game if swap would create duplicates
-                        var.append(game)
-                        used_in_var.update(game)
-
-                # Only add variation if it maintains round validity
-                if len(var) == len(arr) and len(used_in_var) == self.num_courts * 4:
-                    # FINAL VALIDATION: Ensure no player appears in multiple games in variation
-                    all_var_players = set()
-                    has_var_duplicates = False
-                    for game in var:
-                        game_set = set(game)
-                        if game_set & all_var_players:
-                            has_var_duplicates = True
-                            break
-                        all_var_players.update(game_set)
-
-                    if not has_var_duplicates and len(all_var_players) == self.num_courts * 4:
-                        arrangements.append(var)
-
-            if len(arrangements) >= max_arrangements:
-                break
-
-        print(f"✅ Generated {len(arrangements)} unique round arrangements")
-
-        # FINAL FILTER: Remove any arrangements with duplicates
-        valid_arrangements = []
-        for arr in arrangements:
-            is_valid = True
-            # Check each game in the arrangement
-            for game in arr:
-                if len(set(game)) != 4:
-                    is_valid = False
-                    break
-            # Check for duplicates across games in the arrangement
-            all_players = set()
-            for game in arr:
-                game_set = set(game)
-                if game_set & all_players:
-                    is_valid = False
-                    break
-                all_players.update(game_set)
-            if is_valid and len(all_players) == self.num_courts * 4:
-                valid_arrangements.append(arr)
-
-        print(f"✅ Filtered to {len(valid_arrangements)} valid arrangements")
-        return valid_arrangements[:max_arrangements]
+        """Generate the diverse round-arrangement pool (see arrangement_generator)."""
+        return _generate_arrangements_fn(
+            self._names,
+            self.num_courts,
+            do_not_pair_map=self.do_not_pair_map,
+            do_not_oppose_map=self.do_not_oppose_map,
+            max_arrangements=max_arrangements,
+            printer=print,
+        )
 
     def _game_valid(self, game: Tuple[str, str, str, str]) -> bool:
         """Check if a game satisfies all constraints."""
-        p1, p2, p3, p4 = game
-
-        # CRITICAL: Check for duplicate players within the game
-        all_players = [p1, p2, p3, p4]
-        if len(set(all_players)) != 4:
-            return False  # Same player appears multiple times in the game
-
-        # Check do-not-pair constraints
-        if p2 in self.do_not_pair_map[p1] or p1 in self.do_not_pair_map[p2]:
-            return False
-        if p4 in self.do_not_pair_map[p3] or p3 in self.do_not_pair_map[p4]:
-            return False
-
-        # Check do-not-oppose constraints
-        for a in (p1, p2):
-            for b in (p3, p4):
-                if b in self.do_not_oppose_map[a] or a in self.do_not_oppose_map[b]:
-                    return False
-
-        return True
+        return _game_valid_fn(game, self.do_not_pair_map, self.do_not_oppose_map)
 
     def _tournament_select(self, population, fitness_scores, rng, k=7):
         """Tournament selection with configurable tournament size."""
-        tournament_indices = rng.sample(range(len(population)), min(k, len(population)))
-        tournament = [(population[i], fitness_scores[i][1]) for i in tournament_indices]
-        tournament.sort(key=lambda x: x[1])
-        return tournament[0][0]
+        return _tournament_select_fn(population, fitness_scores, rng, k)
 
     def _evaluate_population_optimized(self, population: List[Tuple[int, ...]]) -> List[Tuple[Tuple[int, ...], float]]:
         """Optimized population evaluation with enhanced caching (sequential for better performance)."""
@@ -1066,6 +669,35 @@ class GeneticPickleballScheduler:
 
         return fitness_scores
 
+    def _refresh_arrangement_stats(self) -> None:
+        """Precompute per-arrangement summaries powering the fast fitness path.
+
+        Every metric and violation term is local to a single round, so each
+        pool arrangement can be summarized once; per-individual evaluation then
+        merges the per-round summaries instead of re-walking every game.
+        """
+        self._arrangement_stats = precompute_arrangement_stats(
+            self.arrangements,
+            num_courts=self.num_courts,
+            do_not_pair_map=self.do_not_pair_map,
+            do_not_oppose_map=self.do_not_oppose_map,
+        )
+        self._arrangement_signatures = [round_signature(arrangement) for arrangement in self.arrangements]
+        duplicate_penalties: List[int] = []
+        for arrangement in self.arrangements:
+            penalty = 0
+            round_players: set = set()
+            for game in arrangement:
+                game_players = set(game)
+                if len(game_players) != 4:
+                    penalty += 1000000000
+                overlap = game_players & round_players
+                if overlap:
+                    penalty += 1000000000 * len(overlap)
+                round_players.update(game_players)
+            duplicate_penalties.append(penalty)
+        self._arrangement_duplicate_penalties = duplicate_penalties
+
     def _decode_cached(self, individual: Tuple[int, ...]) -> List[List[Tuple]]:
         """Cached version of schedule decoding."""
         if individual in self._schedule_cache:
@@ -1078,33 +710,40 @@ class GeneticPickleballScheduler:
         return schedule
 
     def _evaluate_metrics_cached(self, schedule: List[List[Tuple]], individual: Tuple[int, ...]) -> Dict[str, int]:
-        """Cached version of metrics evaluation."""
+        """Cached metrics evaluation using precomputed per-arrangement stats."""
+        _ = schedule  # The individual's pool indices fully determine the metrics.
         if individual in self._metrics_cache:
             return self._metrics_cache[individual]
 
-        metrics = self._evaluate_metrics(schedule)
+        metrics = evaluate_metrics_from_arrangement_stats(
+            [self._arrangement_stats[idx] for idx in individual],
+            self._names,
+        )
 
         self._metrics_cache[individual] = metrics
 
         return metrics
 
+    @staticmethod
+    def _round_signature(round_games: List[Tuple[str, str, str, str]] | List[Tuple]) -> Tuple:
+        """Build a canonical signature for a round regardless of game/team ordering."""
+        return round_signature(round_games)
+
+    def _count_duplicate_rounds(self, schedule: List[List[Tuple[str, str, str, str]]]) -> int:
+        """Count repeated round patterns in a schedule."""
+        return count_duplicate_rounds(schedule)
+
+    def _count_avoidable_duplicate_rounds(self, schedule: List[List[Tuple[str, str, str, str]]]) -> int:
+        """Count duplicate rounds beyond the mathematically unavoidable minimum."""
+        return count_avoidable_duplicate_rounds(schedule, self.minimum_duplicate_rounds)
+
     def _get_duplicate_signature_cached(self, individual: Tuple[int, ...], schedule: List[List[Tuple]]) -> Tuple:
-        """Cached version of duplicate round signature calculation."""
+        """Cached duplicate-round signature built from precomputed pool signatures."""
+        _ = schedule  # The individual's pool indices fully determine the signature.
         if individual in self._signature_cache:
             return self._signature_cache[individual]
 
-        # Optimized signature calculation
-        round_signatures = []
-        for round_games in schedule:
-            # Pre-sort games for faster signature creation
-            sorted_games = []
-            for game in round_games:
-                sorted_game = tuple(sorted(game))
-                sorted_games.append(sorted_game)
-            signature = tuple(sorted(sorted_games))
-            round_signatures.append(signature)
-
-        full_signature = tuple(round_signatures)
+        full_signature = tuple(self._arrangement_signatures[idx] for idx in individual)
 
         self._signature_cache[individual] = full_signature
 
@@ -1115,34 +754,22 @@ class GeneticPickleballScheduler:
         if individual in self._fitness_cache:
             return self._fitness_cache[individual]
 
-        # Use cached decode and metrics evaluation
-        schedule = self._decode_cached(individual)
-        metrics = self._evaluate_metrics_cached(schedule, individual)
+        # Metrics, structural penalties, and signatures all derive from the
+        # precomputed per-arrangement summaries - no decode needed here.
+        metrics = self._evaluate_metrics_cached([], individual)
 
-        # CRITICAL: Check for player duplicates within rounds (immediate invalidation)
-        duplicate_penalty = 0
-        for round_games in schedule:
-            round_players = set()
-            for game in round_games:
-                game_players = set(game)
-                # Check for duplicates within this game
-                if len(game_players) != 4:
-                    duplicate_penalty += 1000000000  # 1B penalty for game duplicates
-                # Check for duplicates across games in this round
-                overlap = game_players & round_players
-                if overlap:
-                    duplicate_penalty += 1000000000 * len(overlap)  # 1B per duplicate player
-
-                round_players.update(game_players)
+        # CRITICAL: player-duplicate penalties (precomputed per arrangement)
+        duplicate_penalty = sum(self._arrangement_duplicate_penalties[idx] for idx in individual)
 
         # Use optimized duplicate detection with caching
-        signature = self._get_duplicate_signature_cached(individual, schedule)
+        signature = self._get_duplicate_signature_cached(individual, [])
         unique_rounds = len(set(signature))
         total_rounds = len(signature)
         duplicate_rounds = total_rounds - unique_rounds
+        avoidable_duplicate_rounds = max(0, duplicate_rounds - self.minimum_duplicate_rounds)
 
-        # MASSIVE penalty for duplicate rounds
-        duplicate_penalty += duplicate_rounds * 1000000000  # 1 BILLION per duplicate
+        # MASSIVE penalty only for duplicate rounds beyond what the configuration forces.
+        duplicate_penalty += avoidable_duplicate_rounds * 1000000000  # 1 BILLION per avoidable duplicate
 
         # Lexicographic optimization using LEXICOGRAPHIC_WEIGHTS
         penalty = 0.0
@@ -1184,22 +811,6 @@ class GeneticPickleballScheduler:
     def _decode(self, individual: Tuple[int, ...]) -> List[List[Tuple[str, str, str, str]]]:
         """Decode individual to schedule."""
         schedule = [self.arrangements[idx] for idx in individual]
-
-        # CRITICAL VALIDATION: Check for identical rounds (bug detection)
-        round_signatures = []
-        for round_idx, round_games in enumerate(schedule):
-            # Create a signature for this round
-            signature = tuple(sorted([tuple(sorted(game)) for game in round_games]))
-            round_signatures.append(signature)
-
-        # Check for duplicates
-        unique_signatures = set(round_signatures)
-        if len(unique_signatures) < len(round_signatures):
-            duplicate_count = len(round_signatures) - len(unique_signatures)
-            # Minimal logging to avoid terminal spam
-            if duplicate_count >= 5:  # Only log severe cases
-                print(f"⚠️ {duplicate_count} duplicate rounds detected")
-
         return schedule
 
     def _repair_invalid_schedule(
@@ -1208,354 +819,61 @@ class GeneticPickleballScheduler:
         problematic_round_idx: int,
     ) -> List[List[Tuple[str, str, str, str]]]:
         """Repair an invalid schedule by replacing problematic rounds."""
-        # Try to find a replacement arrangement that doesn't conflict
-        used_players = set()
-        for round_idx, round_games in enumerate(schedule):
-            if round_idx != problematic_round_idx:
-                for game in round_games:
-                    used_players.update(game)
-
-        # Find arrangements that don't use any already-used players
-        available_arrangements = []
-        for i, arrangement in enumerate(self.arrangements):
-            arrangement_players = set()
-            for game in arrangement:
-                arrangement_players.update(game)
-
-            # Check if this arrangement conflicts with used players
-            if not (arrangement_players & used_players):
-                available_arrangements.append((i, arrangement))
-
-        if available_arrangements:
-            # Use the first available arrangement
-            replacement_idx, replacement_arrangement = available_arrangements[0]
-            schedule[problematic_round_idx] = replacement_arrangement
-            print(f"✅ Repaired round {problematic_round_idx + 1} with arrangement {replacement_idx}")
-        else:
-            # If no perfect replacement, try to find one with minimal conflicts
-            print(f"⚠️ No perfect replacement for round {problematic_round_idx + 1}, using fallback")
-            # For now, just return the original and let fitness handle it
-            pass
-
-        return schedule
+        return repair_invalid_schedule(schedule, problematic_round_idx, self.arrangements, print)
 
     def _evaluate_metrics(
         self, schedule: List[List[Tuple[str, str, str, str]]] | List[Dict[str, Any]]
     ) -> Dict[str, int]:
         """Evaluate fairness metrics from schedule in either raw tuple format or formatted dict format."""
-
-        # Handle formatted schedule (from _format_schedule)
-        if schedule and isinstance(schedule[0], dict):
-            # Convert formatted schedule back to tuple format
-            raw_schedule = []
-            for round_data in cast(List[Dict[str, Any]], schedule):
-                round_games = []
-                games = round_data.get("games", [])
-                for game in games:
-                    if hasattr(game, "team1") and hasattr(game, "team2"):
-                        # Game object format
-                        team1 = list(game.team1)
-                        team2 = list(game.team2)
-                        # Combine as p1, p2, p3, p4 where team1=[p1,p2], team2=[p3,p4]
-                        game_tuple = (team1[0], team1[1], team2[0], team2[1])
-                        round_games.append(game_tuple)
-                raw_schedule.append(round_games)
-            schedule = raw_schedule
-
-        """Evaluate schedule metrics."""
-        # Counters
-        games_played: Counter[str] = Counter()
-        partners: Dict[str, Counter[str]] = defaultdict(Counter)
-        opponents: Dict[str, Counter[str]] = defaultdict(Counter)
-        courts: Dict[str, Counter[int]] = defaultdict(Counter)
-        violations = 0
-
-        for r_idx, round_games in enumerate(schedule, start=1):
-            if len(round_games) != self.num_courts:
-                violations += abs(self.num_courts - len(round_games))
-
-            # Track players in this round to detect duplicates across games
-            round_players = set()
-
-            for c_idx, g in enumerate(round_games, start=1):
-                p1, p2, p3, p4 = map(str, g)
-
-                # CRITICAL: Check for duplicate players within the game
-                game_players = [p1, p2, p3, p4]
-                if len(set(game_players)) != 4:
-                    violations += 1000  # Heavy penalty for duplicate players in a game
-
-                # Check for duplicates across games in this round
-                game_player_set = set(game_players)
-                overlap = game_player_set & round_players
-                if overlap:
-                    violations += 1000 * len(overlap)  # Heavy penalty for duplicate players across games
-
-                round_players.update(game_player_set)
-
-                # constraints
-                if p2 in self.do_not_pair_map[p1] or p1 in self.do_not_pair_map[p2]:
-                    violations += 1
-                if p4 in self.do_not_pair_map[p3] or p3 in self.do_not_pair_map[p4]:
-                    violations += 1
-                for a, b in [(p1, p3), (p1, p4), (p2, p3), (p2, p4)]:
-                    if b in self.do_not_oppose_map[a] or a in self.do_not_oppose_map[b]:
-                        violations += 1
-
-                # stats
-                for p in (p1, p2, p3, p4):
-                    games_played[p] += 1
-                    courts[p][c_idx] += 1
-                for a, b in [(p1, p2), (p3, p4)]:
-                    partners[a][b] += 1
-                    partners[b][a] += 1
-                for a in (p1, p2):
-                    for b in (p3, p4):
-                        opponents[a][b] += 1
-                        opponents[b][a] += 1
-
-        def rnge(vals: Iterable[int]) -> int:
-            data = list(vals)
-            if not data:
-                return 0
-            return max(data) - min(data)
-
-        games_range = rnge(games_played[p] for p in self._names)
-        partners_range = rnge(len(partners[p]) for p in self._names)  # Count unique partners, not frequencies
-        opponents_range = rnge(len(opponents[p]) for p in self._names)  # Count unique opponents, not frequencies
-        # FIXED: Count unique courts used per player, not total games per player
-        courts_range = rnge(sum(1 for count in courts[p].values() if count > 0) for p in self._names)
-
-        return {
-            "games_range": games_range,
-            "partners_range": partners_range,
-            "opponents_range": opponents_range,
-            "courts_range": courts_range,
-            "violations": violations,
-        }
-        # Counters
-        games_played: Counter[str] = Counter()
-        partners: Dict[str, Counter[str]] = defaultdict(Counter)
-        opponents: Dict[str, Counter[str]] = defaultdict(Counter)
-        courts: Dict[str, Counter[int]] = defaultdict(Counter)
-        violations = 0
-
-        for r_idx, round_games in enumerate(schedule, start=1):
-            if len(round_games) != self.num_courts:
-                violations += abs(self.num_courts - len(round_games))
-            for c_idx, g in enumerate(round_games, start=1):
-                p1, p2, p3, p4 = map(str, g)
-                # constraints
-                if p2 in self.do_not_pair_map[p1] or p1 in self.do_not_pair_map[p2]:
-                    violations += 1
-                if p4 in self.do_not_pair_map[p3] or p3 in self.do_not_pair_map[p4]:
-                    violations += 1
-                for a, b in [(p1, p3), (p1, p4), (p2, p3), (p2, p4)]:
-                    if b in self.do_not_oppose_map[a] or a in self.do_not_oppose_map[b]:
-                        violations += 1
-
-                # stats
-                for p in (p1, p2, p3, p4):
-                    games_played[p] += 1
-                    courts[p][c_idx] += 1
-                for a, b in [(p1, p2), (p3, p4)]:
-                    partners[a][b] += 1
-                    partners[b][a] += 1
-                for a in (p1, p2):
-                    for b in (p3, p4):
-                        opponents[a][b] += 1
-                        opponents[b][a] += 1
-
-        def rnge(vals: Iterable[int]) -> int:
-            data = list(vals)
-            if not data:
-                return 0
-            return max(data) - min(data)
-
-        games_range = rnge(games_played[p] for p in self._names)
-        partners_range = rnge(len(partners[p]) for p in self._names)  # Count unique partners, not frequencies
-        opponents_range = rnge(len(opponents[p]) for p in self._names)  # Count unique opponents, not frequencies
-        # FIXED: Count unique courts used per player, not total games per player
-        courts_range = rnge(sum(1 for count in courts[p].values() if count > 0) for p in self._names)
-
-        return {
-            "games_range": games_range,
-            "partners_range": partners_range,
-            "opponents_range": opponents_range,
-            "courts_range": courts_range,
-            "violations": violations,
-        }
+        return evaluate_schedule_metrics(
+            schedule,
+            num_courts=self.num_courts,
+            player_names=self._names,
+            do_not_pair_map=self.do_not_pair_map,
+            do_not_oppose_map=self.do_not_oppose_map,
+        )
 
     def _apply_targeted_repairs(
         self, schedule: List[List[Tuple[str, str, str, str]]], max_time: float = 0.5
     ) -> Optional[List[List[Tuple[str, str, str, str]]]]:
         """Apply targeted local repairs to achieve Range 0 when mathematically possible."""
-        start_time = time.time()
-
-        current_schedule = [round_games[:] for round_games in schedule]  # Deep copy
-        current_metrics = self._evaluate_metrics(current_schedule)
-
-        print(
-            "   Starting repair: "
-            f"G:{current_metrics['games_range']} "
-            f"P:{current_metrics['partners_range']} "
-            f"O:{current_metrics['opponents_range']} "
-            f"C:{current_metrics['courts_range']}"
+        return apply_targeted_repairs(
+            schedule,
+            max_time,
+            evaluate_metrics=self._evaluate_metrics,
+            printer=print,
+            partner_repair=self._repair_partner_imbalance,
+            opponent_repair=self._repair_opponent_imbalance,
+            clock=getattr(self, "_run_clock", None),
         )
-
-        # Focus on partner balancing since that's the stuck metric
-        if current_metrics["partners_range"] > 0:
-            current_schedule = self._repair_partner_imbalance(current_schedule, max_time * 0.8)
-            current_metrics = self._evaluate_metrics(current_schedule)
-
-        # Additional repairs if needed
-        if current_metrics["opponents_range"] > 0 and time.time() - start_time < max_time:
-            current_schedule = self._repair_opponent_imbalance(current_schedule, max_time - (time.time() - start_time))
-            current_metrics = self._evaluate_metrics(current_schedule)
-
-        final_total = sum(
-            [
-                current_metrics["games_range"],
-                current_metrics["partners_range"],
-                current_metrics["opponents_range"],
-                current_metrics["courts_range"],
-            ]
-        )
-
-        if final_total == 0:
-            print("   🎉 REPAIR SUCCESS: Achieved Range 0!")
-            return current_schedule
-        else:
-            print(f"   ⚠️ REPAIR PARTIAL: Reduced to total range {final_total}")
-            print(
-                f"      Breakdown - G:{current_metrics['games_range']} "
-                f"P:{current_metrics['partners_range']} "
-                f"O:{current_metrics['opponents_range']} "
-                f"C:{current_metrics['courts_range']}"
-            )
-            return current_schedule
 
     def _repair_partner_imbalance(
         self, schedule: List[List[Tuple[str, str, str, str]]], max_time: float
     ) -> List[List[Tuple[str, str, str, str]]]:
         """Targeted repair for partner imbalance using smart swaps."""
-        start_time = time.time()
-
-        best_schedule = [round_games[:] for round_games in schedule]
-        current_metrics = self._evaluate_metrics(best_schedule)
-
-        # If already balanced, return early
-        if current_metrics["partners_range"] == 0:
-            return best_schedule
-
-        print(f"   🔧 Partner repair starting: range {current_metrics['partners_range']}")
-
-        attempts = 0
-        max_attempts = 200  # More attempts for better results
-        improvements = 0
-
-        while time.time() - start_time < max_time and attempts < max_attempts:
-            attempts += 1
-
-            # Try strategic player repositioning between rounds
-            test_schedule = [round_games[:] for round_games in best_schedule]
-
-            # Pick two different rounds
-            r1_idx = random.randint(0, len(test_schedule) - 1)
-            r2_idx = random.randint(0, len(test_schedule) - 1)
-            if r1_idx == r2_idx or len(test_schedule[r1_idx]) == 0 or len(test_schedule[r2_idx]) == 0:
-                continue
-
-            # Pick games within those rounds
-            g1_idx = random.randint(0, len(test_schedule[r1_idx]) - 1)
-            g2_idx = random.randint(0, len(test_schedule[r2_idx]) - 1)
-
-            game1 = list(test_schedule[r1_idx][g1_idx])
-            game2 = list(test_schedule[r2_idx][g2_idx])
-
-            # Try different types of swaps to improve partner variety
-            swap_strategies = [
-                # Cross-team swaps (swap player from team1 in game1 with player from team1 in game2)
-                [(0, 0), (1, 1)],  # Team1 positions
-                [(2, 2), (3, 3)],  # Team2 positions
-                [(0, 2), (1, 3)],  # Cross-team swaps
-                [(0, 3), (1, 2)],  # Different cross-team swaps
-                # Single player swaps
-                [(0, 1)],
-                [(2, 3)],
-                [(0, 2)],
-                [(1, 3)],
-            ]
-
-            strategy = swap_strategies[attempts % len(swap_strategies)]
-
-            # Apply swaps
-            for pos1, pos2 in strategy:
-                if pos1 < len(game1) and pos2 < len(game2):
-                    game1[pos1], game2[pos2] = game2[pos2], game1[pos1]
-
-            test_schedule[r1_idx][g1_idx] = cast(GameTuple, tuple(game1))
-            test_schedule[r2_idx][g2_idx] = cast(GameTuple, tuple(game2))
-
-            # Evaluate improvement
-            test_metrics = self._evaluate_metrics(test_schedule)
-
-            # Accept if it improves partner balance or doesn't worsen other metrics
-            current_best_metrics = self._evaluate_metrics(best_schedule)
-
-            is_improvement = test_metrics["partners_range"] < current_best_metrics["partners_range"] or (
-                test_metrics["partners_range"] == current_best_metrics["partners_range"]
-                and test_metrics["opponents_range"] <= current_best_metrics["opponents_range"]
-                and test_metrics["games_range"] <= current_best_metrics["games_range"]
-                and test_metrics["courts_range"] <= current_best_metrics["courts_range"]
-            )
-
-            if is_improvement and test_metrics["violations"] == 0:
-                best_schedule = test_schedule
-                improvements += 1
-                print(
-                    f"   🎯 Improvement #{improvements}: "
-                    f"P:{test_metrics['partners_range']} "
-                    f"O:{test_metrics['opponents_range']} "
-                    f"(attempt {attempts})"
-                )
-
-                if test_metrics["partners_range"] == 0:
-                    print(f"   🎉 Partner balance achieved after {attempts} attempts!")
-                    break
-
-        final_metrics = self._evaluate_metrics(best_schedule)
-        final_total = sum(
-            [
-                final_metrics["games_range"],
-                final_metrics["partners_range"],
-                final_metrics["opponents_range"],
-                final_metrics["courts_range"],
-            ]
+        return repair_partner_imbalance(
+            schedule,
+            max_time,
+            evaluate_metrics=self._evaluate_metrics,
+            printer=print,
+            rng=getattr(self, "_run_rng", None),
+            clock=getattr(self, "_run_clock", None),
         )
-        print(f"   🏁 Partner repair complete: {attempts} attempts, " f"{improvements} improvements")
-        print(f"      Partners Range: {final_metrics['partners_range']} | " f"Total Range: {final_total}")
-        print(
-            f"      Breakdown - G:{final_metrics['games_range']} "
-            f"P:{final_metrics['partners_range']} "
-            f"O:{final_metrics['opponents_range']} "
-            f"C:{final_metrics['courts_range']}"
-        )
-
-        return best_schedule
 
     def _repair_opponent_imbalance(
         self, schedule: List[List[Tuple[str, str, str, str]]], max_time: float
     ) -> List[List[Tuple[str, str, str, str]]]:
         """Targeted repair for opponent imbalance using smart swaps."""
-        # Similar logic to partner repair but focused on opponent distributions
-        # For brevity, implement basic version
-        return schedule  # Placeholder - extend if needed
+        return repair_opponent_imbalance(
+            schedule,
+            max_time,
+            evaluate_metrics=self._evaluate_metrics,
+            printer=print,
+        )
 
     def _elitism(self, population: List[Tuple[int, ...]], fitnesses: List[float], k: int) -> List[Tuple[int, ...]]:
         """Select k best individuals for elitism."""
-        idxs = sorted(range(len(population)), key=lambda i: fitnesses[i])[:k]
-        return [population[i] for i in idxs]
+        return _elitism_fn(population, fitnesses, k)
 
     def _tournament(
         self, population: List[Tuple[int, ...]], fitnesses: List[float], rng, k: int = 3
@@ -1567,19 +885,7 @@ class GeneticPickleballScheduler:
 
     def _count_partners(self, schedule: List[List[Tuple[str, str, str, str]]]) -> Dict[str, Dict[str, int]]:
         """Count partner pairings for each player in the schedule."""
-        partner_count = defaultdict(lambda: defaultdict(int))
-
-        for round_games in schedule:
-            for game in round_games:
-                p1, p2, p3, p4 = game
-                # Team 1 partners
-                partner_count[p1][p2] += 1
-                partner_count[p2][p1] += 1
-                # Team 2 partners
-                partner_count[p3][p4] += 1
-                partner_count[p4][p3] += 1
-
-        return dict(partner_count)
+        return count_partners(schedule)
 
     def _smart_mutate(self, ind: Tuple[int, ...], rng) -> Tuple[int, ...]:
         """Smart mutation focusing on partner balance for desktop optimization."""
@@ -1669,31 +975,8 @@ class GeneticPickleballScheduler:
         return tuple(out)
 
     def _format_schedule(self, schedule: List[List[Tuple[str, str, str, str]]]) -> List[Dict[str, Any]]:
-        """Format schedule to legacy format."""
-        rounds: List[Dict[str, Any]] = []
-        seen = set()
-        for r_idx, round_games in enumerate(schedule, start=1):
-            # canonical dedupe signature
-            sig = []
-            for g in round_games:
-                p1, p2, p3, p4 = map(str, g)
-                team1 = tuple(sorted([p1, p2]))
-                team2 = tuple(sorted([p3, p4]))
-                sig.append(tuple(sorted([team1, team2])))
-            key = frozenset(sig)
-            if key in seen and round_games:
-                # Instead of trying to modify the round (which can create duplicates),
-                # just skip adding this duplicate round
-                print(f"⚠️ Skipping duplicate round {r_idx}")
-                continue
-            seen.add(key)
-
-            games: List[Game] = []
-            for c_idx, g in enumerate(round_games, start=1):
-                p1, p2, p3, p4 = map(str, g)
-                games.append(Game([p1, p2], [p3, p4], c_idx))
-            rounds.append({"round": r_idx, "games": games})
-        return rounds
+        """Format schedule to legacy format without silently dropping rounds."""
+        return format_schedule(schedule)
 
     def fitness(self, individual: List[int]) -> float:
         """Legacy fitness method for compatibility."""

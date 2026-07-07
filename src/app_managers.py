@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import sqlite3
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -18,11 +21,113 @@ from src.utils.schedule_analytics_core import (
 )
 
 
+def _resolve_storage_path(env_var: str, filename: str) -> Path:
+    """Resolve a mutable app-state path with optional env overrides."""
+    explicit_path = os.environ.get(env_var)
+    if explicit_path:
+        return Path(explicit_path)
+
+    data_dir = Path(os.environ.get("PICKLEBALL_DATA_DIR", "data"))
+    return data_dir / filename
+
+
+def _resolve_default_names_path() -> Path:
+    """Resolve the tracked default player seed file."""
+    explicit_path = os.environ.get("PICKLEBALL_DEFAULT_NAMES_FILE")
+    if explicit_path:
+        return Path(explicit_path)
+    return Path("data/default_player_names.json")
+
+
+def _parse_constraint_pair(raw_constraint: Any) -> list[str] | None:
+    """Normalize a single stored constraint into a two-player pair."""
+    if isinstance(raw_constraint, (list, tuple)) and len(raw_constraint) >= 2:
+        first, second = raw_constraint[0], raw_constraint[1]
+    elif isinstance(raw_constraint, str):
+        stripped_value = raw_constraint.strip()
+        if not stripped_value:
+            return None
+
+        parts: list[str] | None = None
+        for pattern, flags in (
+            (r"\s+vs\s+", re.IGNORECASE),
+            (r"\s*&\s*", 0),
+            (r"\s*,\s*", 0),
+        ):
+            split_parts = re.split(pattern, stripped_value, maxsplit=1, flags=flags)
+            if len(split_parts) == 2:
+                parts = split_parts
+                break
+
+        if parts is None:
+            return None
+
+        first, second = parts[0], parts[1]
+    else:
+        return None
+
+    normalized_first = str(first).strip()
+    normalized_second = str(second).strip()
+    if not normalized_first or not normalized_second or normalized_first == normalized_second:
+        return None
+
+    return [normalized_first, normalized_second]
+
+
+def normalize_constraint_pairs(raw_constraints: Any) -> list[list[str]]:
+    """Normalize legacy or mixed constraint values into a consistent pair list."""
+    if isinstance(raw_constraints, str):
+        items = raw_constraints.splitlines()
+    elif isinstance(raw_constraints, list):
+        items = raw_constraints
+    elif isinstance(raw_constraints, tuple):
+        items = list(raw_constraints)
+    else:
+        return []
+
+    normalized_pairs: list[list[str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    for raw_constraint in items:
+        parsed_pair = _parse_constraint_pair(raw_constraint)
+        if parsed_pair is None:
+            continue
+
+        pair_key = (parsed_pair[0], parsed_pair[1])
+        if pair_key in seen_pairs:
+            continue
+
+        seen_pairs.add(pair_key)
+        normalized_pairs.append(parsed_pair)
+
+    return normalized_pairs
+
+
+def serialize_constraint_pairs(raw_constraints: Any, separator: str = ", ") -> str:
+    """Render stored constraint pairs for text-area editing."""
+    return "\n".join(f"{first}{separator}{second}" for first, second in normalize_constraint_pairs(raw_constraints))
+
+
+def normalize_config_constraints(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure constraint settings use the pair structure expected by the scheduler UI."""
+    constraints = config.setdefault("constraints", {})
+    constraints["do_not_pair"] = normalize_constraint_pairs(constraints.get("do_not_pair", []))
+    constraints["do_not_oppose"] = normalize_constraint_pairs(constraints.get("do_not_oppose", []))
+    return config
+
+
 class HistoryManager:
     """Manage schedule history and persistence."""
 
-    def __init__(self):
-        self.db_path = Path("data/schedule_history.db")
+    def __init__(self, db_path: str | Path | None = None):
+        self.db_path = (
+            Path(db_path)
+            if db_path is not None
+            else _resolve_storage_path(
+                "PICKLEBALL_HISTORY_DB",
+                "schedule_history.db",
+            )
+        )
         self.ensure_db_exists()
 
     def ensure_db_exists(self):
@@ -188,9 +293,22 @@ class HistoryManager:
 class ConfigurationManager:
     """Manage application configuration and constraints."""
 
-    def __init__(self):
-        self.config_path = Path("data/app_config.json")
-        self.default_names_path = Path("data/default_player_names.json")
+    def __init__(
+        self,
+        config_path: str | Path | None = None,
+        default_names_path: str | Path | None = None,
+    ):
+        self.config_path = (
+            Path(config_path)
+            if config_path is not None
+            else _resolve_storage_path(
+                "PICKLEBALL_APP_CONFIG",
+                "app_config.json",
+            )
+        )
+        self.default_names_path = (
+            Path(default_names_path) if default_names_path is not None else _resolve_default_names_path()
+        )
         self.config_path.parent.mkdir(exist_ok=True)
         self.default_config = {
             "objectives": {
@@ -264,28 +382,31 @@ class ConfigurationManager:
             if self.config_path.exists():
                 with open(self.config_path, encoding="utf-8") as f:
                     config = json.load(f)
-                return self._merge_configs(self.default_config, config)
-            return self.default_config.copy()
+                return normalize_config_constraints(self._merge_configs(self.default_config, config))
+            return normalize_config_constraints(deepcopy(self.default_config))
         except Exception:
-            return self.default_config.copy()
+            return normalize_config_constraints(deepcopy(self.default_config))
 
-    def save_config(self, config: Dict):
-        """Save configuration to file."""
+    def save_config(self, config: Dict) -> bool:
+        """Save configuration to file. Returns True on success, False on failure."""
         try:
+            normalized_config = normalize_config_constraints(deepcopy(config))
             self.config_path.parent.mkdir(exist_ok=True)
             with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2)
+                json.dump(normalized_config, f, indent=2)
+            return True
         except Exception as e:
             st.error(f"Failed to save configuration: {e}")
+            return False
 
     def _merge_configs(self, default: Dict, user: Dict) -> Dict:
         """Merge user configuration with defaults."""
-        result = default.copy()
+        result = deepcopy(default)
         for key, value in user.items():
             if key in result and isinstance(result[key], dict) and isinstance(value, dict):
                 result[key] = self._merge_configs(result[key], value)
             else:
-                result[key] = value
+                result[key] = deepcopy(value)
         return result
 
     def load_default_names(self) -> List[str]:
