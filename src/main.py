@@ -9,7 +9,7 @@ Usage:
     python main.py --enhanced         # Launch legacy enhanced GUI (if available)
     python main.py --cli             # Command line interface
     python main.py --test            # Run validation tests
-    python main.py --help            # Show this help
+    python main.py --help            # Show help and exit
 
 Features:
     • Genetic algorithm optimization
@@ -19,75 +19,62 @@ Features:
 """
 
 import builtins
+import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable
 
-# Directory references used across launch modes
+try:
+    from src._compat import import_module_with_fallback
+except ImportError:
+    from _compat import import_module_with_fallback
+
 project_root = Path(__file__).parent.parent
-src_path = project_root / "src"
-
-
-class _FallbackSecurityError(Exception):
-    """Fallback security error class."""
 
 
 class _FallbackInputSanitizer:
-    """Fallback input sanitizer class."""
+    """Fallback input sanitizer that passes through unchanged."""
 
     @staticmethod
     def sanitize_file_path(path: str, _base_dir: str | None = None) -> str:
-        """Fallback file path sanitization."""
+        """Return path unchanged when security module unavailable."""
         return path
 
 
 def _fallback_setup_logging(level: str = "INFO"):
-    """Fallback logger factory."""
-    import logging
-
+    """Create a basic logger when logging_config module unavailable."""
     logger = logging.getLogger("pickleball_scheduler")
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     return logger
 
 
-def _fallback_log_error_with_context(
-    logger: Any,
-    error: BaseException,
-    message: str,
-    context: dict[str, object] | None = None,
-) -> None:
-    """Fallback logging hook when the structured logger is unavailable."""
-    _ = (logger, error, message, context)
-    return None
+def _fallback_log_error(logger, error, message, context=None):
+    """No-op when logging_config module unavailable."""
 
 
-SecurityError: type[Exception] = _FallbackSecurityError
-InputSanitizer: Any = _FallbackInputSanitizer
-setup_logging: Callable[..., Any] = _fallback_setup_logging
-log_error_with_context: Callable[..., None] = _fallback_log_error_with_context
-logger: Any | None = None
+SecurityError: type[Exception] = Exception
+InputSanitizer = _FallbackInputSanitizer
+setup_logging = _fallback_setup_logging
+log_error_with_context = _fallback_log_error
+logger = None
 
-# Initialize logging and security modules
 try:
-    try:
-        from src.security.input_sanitizer import InputSanitizer, SecurityError
-    except ImportError:
-        from security.input_sanitizer import InputSanitizer, SecurityError
+    _security = import_module_with_fallback("security.input_sanitizer")
+    SecurityError = _security.SecurityError
+    InputSanitizer = _security.InputSanitizer
+except (ImportError, AttributeError):
+    pass
 
-    try:
-        from src.utils.logging_config import log_error_with_context, setup_logging
-    except ImportError:
-        from utils.logging_config import log_error_with_context, setup_logging
-
-    configured_logger = setup_logging(level="INFO")
-    configured_logger.info("Pickleball Scheduler V2 starting", extra={"version": "2.0.0"})
-    logger = configured_logger
-except ImportError as e:
-    # Fallback to print if logging/security setup fails
-    builtins.print(f"Warning: Could not initialize logging/security: {e}")
-    logger = None
+try:
+    _logging = import_module_with_fallback("utils.logging_config")
+    setup_logging = _logging.setup_logging
+    log_error_with_context = _logging.log_error_with_context
+    logger = setup_logging(level="INFO")
+    if logger:
+        logger.info("Pickleball Scheduler V2 starting", extra={"version": "2.0.0"})
+except (ImportError, AttributeError):
+    builtins.print("Warning: Could not initialize logging/security")
 
 
 def _console_print(message: object = "") -> None:
@@ -96,6 +83,17 @@ def _console_print(message: object = "") -> None:
     encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
     safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
     print(safe_text)
+
+
+def _handle_error(
+    error: BaseException, user_msg: str, context: dict | None = None, exit_code: int | None = None
+) -> None:
+    """Print error to console and log with context if logger available."""
+    _console_print(user_msg)
+    if logger:
+        log_error_with_context(logger, error, user_msg, context or {})
+    if exit_code is not None:
+        sys.exit(exit_code)
 
 
 def _resolve_gui_path(enhanced: bool = False) -> tuple[Path, bool]:
@@ -152,64 +150,26 @@ def launch_gui(enhanced: bool = False) -> None:
     _console_print(message)
     _console_print(f"🌐 Opening at: http://localhost:{port}")
 
-    # Launch streamlit with secure subprocess call
     try:
         safe_gui_path = InputSanitizer.sanitize_file_path(str(gui_path), str(project_root))
         if not isinstance(safe_gui_path, str) or not safe_gui_path:
             safe_gui_path = str(gui_path)
 
         subprocess.run(  # noqa: S603
-            [
-                sys.executable,
-                "-m",
-                "streamlit",
-                "run",
-                safe_gui_path,
-                "--server.port",
-                port,
-            ],
+            [sys.executable, "-m", "streamlit", "run", safe_gui_path, "--server.port", port],
             check=True,
             timeout=10,
         )
     except SecurityError as e:
-        error_msg = f"🚫 Security error: {e}"
-        if logger:
-            log_error_with_context(
-                logger,
-                e,
-                "Security error during GUI launch",
-                {"port": port, "gui_path": str(gui_path)},
-            )
-        _console_print(error_msg)
-        sys.exit(1)
+        _handle_error(e, f"🚫 Security error: {e}", {"port": port, "gui_path": str(gui_path)}, 1)
     except subprocess.TimeoutExpired as e:
-        error_msg = "⏰ Streamlit launch timed out"
-        if logger:
-            log_error_with_context(logger, e, "Streamlit launch timeout", {"port": port})
-        _console_print(error_msg)
+        _handle_error(e, "⏰ Streamlit launch timed out", {"port": port})
     except subprocess.CalledProcessError as e:
-        error_msg = f"❌ Failed to launch streamlit: {e}"
-        if logger:
-            log_error_with_context(
-                logger,
-                e,
-                "Failed to launch streamlit",
-                {"port": port, "return_code": e.returncode},
-            )
-        _console_print(error_msg)
-        sys.exit(1)
+        _handle_error(e, f"❌ Failed to launch streamlit: {e}", {"port": port, "return_code": e.returncode}, 1)
     except OSError as e:
-        error_msg = f"❌ Failed to launch GUI: {e}"
-        if logger:
-            log_error_with_context(logger, e, "GUI launch failed", {"port": port})
-        _console_print(error_msg)
-        sys.exit(1)
+        _handle_error(e, f"❌ Failed to launch GUI: {e}", {"port": port}, 1)
     except (RuntimeError, ValueError) as e:
-        error_msg = f"❌ Unexpected error: {e}"
-        if logger:
-            log_error_with_context(logger, e, "Unexpected error during GUI launch", {"port": port})
-        _console_print(error_msg)
-        sys.exit(1)
+        _handle_error(e, f"❌ Unexpected error: {e}", {"port": port}, 1)
 
 
 def launch_cli() -> None:
@@ -219,6 +179,11 @@ def launch_cli() -> None:
         from src.algorithms.genetic_scheduler import GeneticPickleballScheduler
     except ImportError:
         from algorithms.genetic_scheduler import GeneticPickleballScheduler
+
+    try:
+        from src.utils.schedule_shapes import games_in_round
+    except ImportError:
+        from utils.schedule_shapes import games_in_round
 
     try:
         _console_print("🏓 Pickleball Scheduler - Enhanced Command Line Interface")
@@ -304,10 +269,7 @@ def launch_cli() -> None:
 
             for round_num, round_data in enumerate(schedule, 1):
                 _console_print(f"\n🎾 Round {round_num}:")
-                if hasattr(round_data, "get"):
-                    round_games = round_data.get("games", [])
-                else:
-                    round_games = [round_data]
+                round_games = games_in_round(round_data)
 
                 for court, game in enumerate(round_games, 1):
                     team1 = " & ".join(game.team1)
@@ -326,25 +288,18 @@ def launch_cli() -> None:
         _console_print("\n\n👋 Goodbye!")
         if logger:
             logger.info("CLI operation cancelled by user")
-        # Don't call sys.exit for KeyboardInterrupt - handle gracefully
-        return
     except (ImportError, AttributeError, RuntimeError, Exception) as e:
-        error_msg = f"❌ Scheduler failed with error: {e}"
-        _console_print(error_msg)
-        if logger:
-            log_error_with_context(logger, e, error_msg, {"component": "cli_launcher"})
-        sys.exit(1)
+        _handle_error(e, f"❌ Scheduler failed with error: {e}", {"component": "cli_launcher"}, 1)
 
 
 def run_tests() -> bool:
     """Run validation tests using pytest."""
+    if logger:
+        logger.info("Starting validation tests")
+
+    _console_print("🧪 Running validation tests...")
+
     try:
-        if logger:
-            logger.info("Starting validation tests")
-
-        _console_print("🧪 Running validation tests...")
-
-        # Run the maintained default pytest lane from the project root.
         result = subprocess.run(
             [sys.executable, "-m", "pytest", "-q"],
             check=False,
@@ -359,39 +314,32 @@ def run_tests() -> bool:
             if logger:
                 logger.info("All validation tests passed")
             return True
-        else:
-            _console_print(f"❌ Tests failed with return code {result.returncode}")
-            if logger:
-                logger.error(f"Tests failed with return code {result.returncode}")
-            return False
 
-    except subprocess.TimeoutExpired:
-        error_msg = "❌ Tests timed out after 5 minutes"
-        _console_print(error_msg)
+        _console_print(f"❌ Tests failed with return code {result.returncode}")
         if logger:
-            logger.error("Test execution timed out")
+            logger.error(f"Tests failed with return code {result.returncode}")
+        return False
+
+    except subprocess.TimeoutExpired as e:
+        _handle_error(e, "❌ Tests timed out after 5 minutes")
         return False
     except Exception as e:
-        error_msg = f"❌ Error running tests: {e}"
-        _console_print(error_msg)
-        if logger:
-            log_error_with_context(logger, e, "Error running validation tests", {"operation": "run_tests"})
+        _handle_error(e, f"❌ Error running tests: {e}", {"operation": "run_tests"})
         return False
 
 
 def main() -> None:
     """Main entry point with enhanced multi-algorithm support."""
-    try:
-        if logger:
-            logger.info("Main entry point called", extra={"command_args": sys.argv})
+    if logger:
+        logger.info("Main entry point called", extra={"command_args": sys.argv})
 
+    try:
         if len(sys.argv) > 1:
             arg = sys.argv[1]
             if arg == "--cli":
                 launch_cli()
             elif arg == "--test":
-                result = run_tests()
-                sys.exit(0 if result else 1)
+                sys.exit(0 if run_tests() else 1)
             elif arg == "--gui":
                 launch_gui(enhanced=False)
             elif arg == "--enhanced":
@@ -401,67 +349,16 @@ def main() -> None:
                 sys.exit(0)
             else:
                 _console_print(f"Unknown argument: {arg}")
-                _console_print("Available options:")
-                _console_print("  --gui         Launch GUI interface")
-                _console_print("  --enhanced    Launch legacy enhanced GUI interface")
-                _console_print("  --cli         Command line interface")
-                _console_print("  --test        Run validation tests")
-                _console_print("  --help        Show detailed help")
+                _console_print("Available options: --gui, --enhanced, --cli, --test, --help")
                 sys.exit(1)
         else:
-            # Default: launch GUI
-            _console_print("🎾 Pickleball Scheduler V2")
-            _console_print("=" * 30)
-            _console_print("Launching GUI...")
+            _console_print("🎾 Pickleball Scheduler V2\n" + "=" * 30 + "\nLaunching GUI...")
             launch_gui(enhanced=False)
 
     except (ImportError, OSError, RuntimeError) as e:
-        if logger:
-            log_error_with_context(logger, e, "Critical error in main function", {"operation": "main"})
-        else:
-            _console_print(f"❌ Critical error: {e}")
-        sys.exit(1)
+        _handle_error(e, f"❌ Critical error: {e}", {"operation": "main"}, 1)
     except Exception as e:
-        # Handle any other exceptions (like from GUI launch)
-        if logger:
-            log_error_with_context(logger, e, "Error in main function", {"operation": "main"})
-        else:
-            _console_print(f"❌ Error: {e}")
-        # Don't exit for general exceptions, let program continue
-
-
-def show_enhanced_help():
-    """Show enhanced help message with detailed usage information"""
-    help_text = """
-🎾 PICKLEBALL SCHEDULER V2 - Enhanced Help
-=========================================
-
-USAGE:
-    python main.py [OPTION]
-
-OPTIONS:
-    --enhanced    Launch legacy enhanced GUI when available, otherwise use standard GUI
-    --cli         Enhanced command line interface for terminal users
-    --test        Run validation tests and system checks
-    --help        Show this detailed help message
-
-FEATURES:
-    • Genetic Algorithm optimization for fairness
-    • Multi-algorithm comparison and selection
-    • 10-second optimization budget system
-    • Partner/opponent balance tracking
-    • Schedule history and analytics
-    • Configuration management
-
-EXAMPLES:
-    python main.py                    # Launch standard GUI
-    python main.py --enhanced         # Launch enhanced GUI if available
-    python main.py --cli             # Use command line interface
-    python main.py --test            # Run system tests
-
-For more information, see the README.md file.
-    """
-    _console_print(help_text)
+        _handle_error(e, f"❌ Error: {e}", {"operation": "main"})
 
 
 if __name__ == "__main__":

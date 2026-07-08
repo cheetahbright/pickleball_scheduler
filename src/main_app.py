@@ -29,57 +29,49 @@ def _register_main_app_aliases() -> None:
 _register_main_app_aliases()
 
 try:
-    from src.algorithms.genetic_scheduler import GeneticPickleballScheduler
+    from src._compat import import_module_with_fallback
 except ImportError:
-    from algorithms.genetic_scheduler import GeneticPickleballScheduler
+    from _compat import import_module_with_fallback
 
-try:
-    from src.app_managers import ConfigurationManager, HistoryManager, PlayerManager
-except ImportError:
-    from app_managers import ConfigurationManager, HistoryManager, PlayerManager
+GeneticPickleballScheduler = import_module_with_fallback("algorithms.genetic_scheduler").GeneticPickleballScheduler
 
-try:
-    from src.app_schedule_helpers import display_enhanced_schedule as _display_enhanced_schedule
-    from src.app_schedule_helpers import schedule_to_csv as _schedule_to_csv
-    from src.app_schedule_helpers import validate_schedule_integrity as _validate_schedule_integrity
-except ImportError:
-    from app_schedule_helpers import display_enhanced_schedule as _display_enhanced_schedule
-    from app_schedule_helpers import schedule_to_csv as _schedule_to_csv
-    from app_schedule_helpers import validate_schedule_integrity as _validate_schedule_integrity
+_app_managers = import_module_with_fallback("app_managers")
+ConfigurationManager = _app_managers.ConfigurationManager
+HistoryManager = _app_managers.HistoryManager
+PlayerManager = _app_managers.PlayerManager
+SkillRatingManager = _app_managers.SkillRatingManager
 
-try:
-    from src.app_tabs import render_analytics_tab as _analytics_tab
-    from src.app_tabs import render_configuration_tab as _configuration_tab
-    from src.app_tabs import render_history_tab as _history_tab
-    from src.app_tabs import render_player_management_tab as _player_management_tab
-except ImportError:
-    from app_tabs import render_analytics_tab as _analytics_tab
-    from app_tabs import render_configuration_tab as _configuration_tab
-    from app_tabs import render_history_tab as _history_tab
-    from app_tabs import render_player_management_tab as _player_management_tab
+_app_schedule_helpers = import_module_with_fallback("app_schedule_helpers")
+_display_enhanced_schedule = _app_schedule_helpers.display_enhanced_schedule
+_schedule_to_csv = _app_schedule_helpers.schedule_to_csv
+_validate_schedule_integrity = _app_schedule_helpers.validate_schedule_integrity
 
-try:
-    from src.app_scheduler_flow import render_enhanced_scheduler_page as _enhanced_scheduler_page
-    from src.app_scheduler_flow import render_main_scheduler_tab as _main_scheduler_tab
-except ImportError:
-    from app_scheduler_flow import render_enhanced_scheduler_page as _enhanced_scheduler_page
-    from app_scheduler_flow import render_main_scheduler_tab as _main_scheduler_tab
+_app_tabs = import_module_with_fallback("app_tabs")
+_analytics_tab = _app_tabs.render_analytics_tab
+_configuration_tab = _app_tabs.render_configuration_tab
+_history_tab = _app_tabs.render_history_tab
+_player_management_tab = _app_tabs.render_player_management_tab
+_stress_test_tab = _app_tabs.render_stress_test_tab
+_leaderboard_tab = _app_tabs.render_leaderboard_tab
 
-try:
-    from src.app_analytics import calculate_fairness_metrics as _calculate_fairness_metrics
-    from src.app_analytics import create_fairness_visualization as _create_fairness_visualization
-    from src.app_analytics import create_player_stats_chart as _create_player_stats_chart
-    from src.app_analytics import serialize_schedule_for_json as _serialize_schedule_for_json
-except ImportError:
-    from app_analytics import calculate_fairness_metrics as _calculate_fairness_metrics
-    from app_analytics import create_fairness_visualization as _create_fairness_visualization
-    from app_analytics import create_player_stats_chart as _create_player_stats_chart
-    from app_analytics import serialize_schedule_for_json as _serialize_schedule_for_json
+_app_scheduler_flow = import_module_with_fallback("app_scheduler_flow")
+_enhanced_scheduler_page = _app_scheduler_flow.render_enhanced_scheduler_page
+_main_scheduler_tab = _app_scheduler_flow.render_main_scheduler_tab
 
-try:
-    from src.simple_auth import logout, simple_auth
-except ImportError:
-    from simple_auth import logout, simple_auth
+_app_analytics = import_module_with_fallback("app_analytics")
+_build_pairing_matrices = _app_analytics.build_pairing_matrices
+_calculate_fairness_metrics = _app_analytics.calculate_fairness_metrics
+_create_fairness_visualization = _app_analytics.create_fairness_visualization
+_create_pairing_heatmap = _app_analytics.create_pairing_heatmap
+_create_player_stats_chart = _app_analytics.create_player_stats_chart
+_serialize_schedule_for_json = _app_analytics.serialize_schedule_for_json
+
+_simple_auth = import_module_with_fallback("simple_auth")
+logout = _simple_auth.logout
+simple_auth = _simple_auth.simple_auth
+
+setup_logging = import_module_with_fallback("utils.logging_config").setup_logging
+inject_mobile_css = import_module_with_fallback("mobile_styles").inject_mobile_css
 
 # Try to import plotly for visualizations
 go = None
@@ -141,6 +133,16 @@ class ScheduleAnalytics:
         return _create_player_stats_chart(metrics, HAS_PLOTLY, go)
 
     @staticmethod
+    def build_pairing_matrices(schedule: List[Dict], players: List[str]):
+        """Return (partner_counts, opponent_counts) NxN matrices for the given player order."""
+        return _build_pairing_matrices(schedule, players)
+
+    @staticmethod
+    def create_pairing_heatmap(matrix: List[List[int]], players: List[str], title: str):
+        """Create a plotly heatmap for a partner/opponent count matrix."""
+        return _create_pairing_heatmap(matrix, players, title, HAS_PLOTLY, go)
+
+    @staticmethod
     def generate_radar_chart_data(metrics: Dict[str, Any]) -> Dict[str, List[Any]]:
         """Return a simple radar-chart payload for compatibility helpers."""
         categories = [
@@ -186,6 +188,9 @@ def enhanced_scheduler_page():
         history_tab,
         configuration_tab,
         player_management_tab,
+        stress_test_tab_fn=stress_test_tab,
+        leaderboard_tab_fn=leaderboard_tab,
+        skill_manager_cls=SkillRatingManager,
     )
 
 
@@ -223,14 +228,24 @@ def player_management_tab():
     return _player_management_tab(st, PlayerManager)
 
 
+def stress_test_tab():
+    """Stress-test sweep across player/round/constraint combinations"""
+    return _stress_test_tab(st, GeneticPickleballScheduler, validate_schedule_integrity, pd)
+
+
+def leaderboard_tab():
+    """Score entry and all-time win/loss standings"""
+    return _leaderboard_tab(st, pd)
+
+
 def validate_schedule_integrity(schedule, all_players=None):
     """Comprehensive validation of schedule integrity."""
     return _validate_schedule_integrity(schedule, all_players)
 
 
-def display_enhanced_schedule(schedule, all_players=None):
+def display_enhanced_schedule(schedule, all_players=None, round_times=None):
     """Display schedule with enhanced formatting and error checking."""
-    return _display_enhanced_schedule(schedule, st, pd, all_players)
+    return _display_enhanced_schedule(schedule, st, pd, all_players, round_times)
 
 
 def schedule_to_csv(schedule):
@@ -241,8 +256,13 @@ def schedule_to_csv(schedule):
 def main():
     """Main application"""
 
+    # setup_logging is idempotent (no-op if handlers already exist), which
+    # matters because Streamlit re-executes this whole script on every rerun.
+    setup_logging()
+
     # Page config
     st.set_page_config(page_title="Pickleball Scheduler", page_icon="🎾", layout="wide")
+    inject_mobile_css(st)
 
     # Check authentication
     if not simple_auth():
@@ -261,6 +281,7 @@ __all__ = [
     "HistoryManager",
     "PlayerManager",
     "ScheduleAnalytics",
+    "SkillRatingManager",
     "analytics_tab",
     "configuration_tab",
     "display_enhanced_schedule",

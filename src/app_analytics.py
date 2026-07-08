@@ -6,11 +6,14 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 try:
-    from src.utils.schedule_analytics_core import calculate_fairness_metrics as _calculate_fairness_metrics
-    from src.utils.schedule_analytics_core import serialize_schedule_for_json as _serialize_schedule_for_json
+    from src._compat import import_module_with_fallback
 except ImportError:
-    from utils.schedule_analytics_core import calculate_fairness_metrics as _calculate_fairness_metrics
-    from utils.schedule_analytics_core import serialize_schedule_for_json as _serialize_schedule_for_json
+    from _compat import import_module_with_fallback
+
+_schedule_analytics_core = import_module_with_fallback("utils.schedule_analytics_core")
+_build_pairing_matrices = _schedule_analytics_core.build_pairing_matrices
+_calculate_fairness_metrics = _schedule_analytics_core.calculate_fairness_metrics
+_serialize_schedule_for_json = _schedule_analytics_core.serialize_schedule_for_json
 
 
 def serialize_schedule_for_json(schedule):
@@ -61,6 +64,31 @@ def create_fairness_visualization(metrics: Dict[str, Any], has_plotly: bool, go_
         title="Schedule Fairness Analysis",
     )
 
+    return fig
+
+
+def build_pairing_matrices(schedule: List[Dict], players: List[str]):
+    """Return (partner_counts, opponent_counts) NxN matrices using the shared core implementation."""
+    return _build_pairing_matrices(schedule, players)
+
+
+def create_pairing_heatmap(matrix: List[List[int]], players: List[str], title: str, has_plotly: bool, go_module):
+    """Create a plotly heatmap for a partner/opponent count matrix."""
+    if not has_plotly or go_module is None or not players:
+        return None
+
+    fig = go_module.Figure(
+        data=go_module.Heatmap(
+            z=matrix,
+            x=players,
+            y=players,
+            colorscale="Blues",
+            text=matrix,
+            texttemplate="%{text}",
+            hovertemplate="%{y} & %{x}: %{z}<extra></extra>",
+        )
+    )
+    fig.update_layout(title=title, xaxis_title="Player", yaxis_title="Player")
     return fig
 
 

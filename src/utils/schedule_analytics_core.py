@@ -2,6 +2,11 @@
 
 from typing import Any, Dict, List, Optional
 
+try:
+    from src.utils.schedule_shapes import extract_game_teams
+except ImportError:
+    from utils.schedule_shapes import extract_game_teams
+
 
 def serialize_schedule_for_json(schedule):
     """Convert schedule data into a JSON-serializable round/game structure."""
@@ -34,10 +39,11 @@ def serialize_schedule_for_json(schedule):
                 round_games = []
                 for game in round_data.get("games", []):
                     if hasattr(game, "team1"):
+                        team1, team2, court = extract_game_teams(game)
                         game_dict = {
-                            "team1": [str(player) for player in game.team1],
-                            "team2": [str(player) for player in game.team2],
-                            "court": game.court,
+                            "team1": [str(player) for player in team1],
+                            "team2": [str(player) for player in team2],
+                            "court": court,
                         }
                     else:
                         game_dict = game
@@ -50,20 +56,109 @@ def serialize_schedule_for_json(schedule):
                     }
                 )
             else:
+                team1, team2, court = extract_game_teams(round_data)
                 serializable_schedule.append(
                     {
                         "round": len(serializable_schedule) + 1,
                         "games": [
                             {
-                                "team1": [str(player) for player in round_data.team1],
-                                "team2": [str(player) for player in round_data.team2],
-                                "court": round_data.court,
+                                "team1": [str(player) for player in team1],
+                                "team2": [str(player) for player in team2],
+                                "court": court,
                             }
                         ],
                     }
                 )
 
     return serializable_schedule
+
+
+def compute_team_skill_balance(schedule: List[Dict], skills: Dict[str, int]) -> List[Dict[str, Any]]:
+    """Per-game team skill totals and imbalance, for players with a rated skill.
+
+    Unrated players are excluded from their team's sum (not treated as 0 -
+    that would make an unrated team look artificially weaker). A game where
+    every player on both sides is unrated is skipped entirely - there is
+    nothing to report. Does not feed into schedule generation; this is a
+    post-hoc analytics view only (see SkillRatingManager docstring).
+    """
+    rows: List[Dict[str, Any]] = []
+
+    for round_num, round_data in enumerate(schedule, 1):
+        games = round_data.get("games", []) if hasattr(round_data, "get") else [round_data]
+        for game in games:
+            if hasattr(game, "team1"):
+                team1 = [str(p) for p in game.team1]
+                team2 = [str(p) for p in game.team2]
+                court = game.court
+            else:
+                team1 = [str(p) for p in game.get("team1", [])]
+                team2 = [str(p) for p in game.get("team2", [])]
+                court = game.get("court", 1)
+
+            team1_ratings = [skills[p] for p in team1 if p in skills]
+            team2_ratings = [skills[p] for p in team2 if p in skills]
+            if not team1_ratings and not team2_ratings:
+                continue
+
+            team1_total = sum(team1_ratings)
+            team2_total = sum(team2_ratings)
+            rows.append(
+                {
+                    "round_num": round_num,
+                    "court": court,
+                    "team1": team1,
+                    "team2": team2,
+                    "team1_skill_total": team1_total,
+                    "team2_skill_total": team2_total,
+                    "imbalance": abs(team1_total - team2_total),
+                    "fully_rated": len(team1_ratings) == len(team1) and len(team2_ratings) == len(team2),
+                }
+            )
+
+    return rows
+
+
+def build_pairing_matrices(schedule: List[Dict], players: List[str]):
+    """Return (partner_counts, opponent_counts) as NxN matrices in `players` order.
+
+    partner_counts[i][j] is how many times players[i] and players[j] were on
+    the same team; opponent_counts[i][j] is how many times they faced each
+    other. Both matrices are symmetric with a zero diagonal.
+    """
+    index_by_player = {str(player): i for i, player in enumerate(players)}
+    size = len(players)
+    partner_counts = [[0] * size for _ in range(size)]
+    opponent_counts = [[0] * size for _ in range(size)]
+
+    for round_data in schedule:
+        games = round_data.get("games", []) if hasattr(round_data, "get") else []
+        for game in games:
+            if hasattr(game, "team1"):
+                team1 = [str(p) for p in game.team1]
+                team2 = [str(p) for p in game.team2]
+            else:
+                team1 = [str(p) for p in game.get("team1", [])]
+                team2 = [str(p) for p in game.get("team2", [])]
+
+            for team, matrix in ((team1, partner_counts), (team2, partner_counts)):
+                for a in range(len(team)):
+                    for b in range(a + 1, len(team)):
+                        i, j = index_by_player.get(team[a]), index_by_player.get(team[b])
+                        if i is None or j is None:
+                            continue
+                        matrix[i][j] += 1
+                        matrix[j][i] += 1
+
+            for p1 in team1:
+                for p2 in team2:
+                    i, j = index_by_player.get(p1), index_by_player.get(p2)
+                    if i is None or j is None:
+                        continue
+                    opponent_counts[i][j] += 1
+                    opponent_counts[j][i] += 1
+
+    return partner_counts, opponent_counts
 
 
 def calculate_fairness_metrics(
@@ -76,19 +171,12 @@ def calculate_fairness_metrics(
     if not schedule:
         return {}
 
-    player_stats = {}
+    player_stats: Dict[str, Dict[str, Any]] = {}
 
     for round_data in schedule:
         games = round_data.get("games", [])
         for game in games:
-            if hasattr(game, "team1"):
-                team1 = game.team1
-                team2 = game.team2
-                court = game.court
-            else:
-                team1 = game.get("team1", [])
-                team2 = game.get("team2", [])
-                court = game.get("court", 1)
+            team1, team2, court = extract_game_teams(game)
 
             for team in [team1, team2]:
                 for player in team:
@@ -112,10 +200,10 @@ def calculate_fairness_metrics(
                     for opponent in other_team:
                         player_stats[player_name]["opponents"].add(str(opponent))
 
-    games_played = [stats["games_played"] for stats in player_stats.values()]
-    partners_count = [len(stats["partners"]) for stats in player_stats.values()]
-    opponents_count = [len(stats["opponents"]) for stats in player_stats.values()]
-    courts_count = [len(stats["courts_used"]) for stats in player_stats.values()]
+    games_played: list[int] = [stats["games_played"] for stats in player_stats.values()]
+    partners_count: list[int] = [len(stats["partners"]) for stats in player_stats.values()]
+    opponents_count: list[int] = [len(stats["opponents"]) for stats in player_stats.values()]
+    courts_count: list[int] = [len(stats["courts_used"]) for stats in player_stats.values()]
 
     games_range = max(games_played) - min(games_played) if games_played else 0
     partners_range = max(partners_count) - min(partners_count) if partners_count else 0

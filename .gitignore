@@ -243,6 +243,7 @@ data/default_player_names.backup.json
 /data/saved_session.json
 /data/schedule_history.json
 /data/scheduler_settings.json
+/data/player_skills.json
 
 # Local app history/stats artifacts
 /pickleball_history.json

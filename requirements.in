@@ -1,0 +1,20 @@
+# Runtime dependency source of truth for pip-compile.
+#
+# Keep this aligned with the app/runtime surface. Historical diagnostics and
+# development-only tools belong in requirements-dev.txt instead.
+
+streamlit>=1.55.0
+pandas
+numpy
+plotly
+openpyxl
+
+# Security floors for transitive runtime dependencies selected by Streamlit.
+protobuf>=6.33.5
+pillow>=12.2.0
+tornado>=6.5.7
+urllib3>=2.7.0
+requests>=2.33.0
+idna>=3.15
+pyarrow>=23.0.1
+gitpython>=3.1.50
