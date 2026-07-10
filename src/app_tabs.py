@@ -17,6 +17,21 @@ try:
 except ImportError:
     from app_scheduler_flow import set_player_preset
 
+try:
+    from src.widget_state import (
+        apply_deferred_widget_values,
+        defer_widget_value,
+        forget_widget_state,
+        seed_widget_from_source,
+    )
+except ImportError:
+    from widget_state import (
+        apply_deferred_widget_values,
+        defer_widget_value,
+        forget_widget_state,
+        seed_widget_from_source,
+    )
+
 _app_managers = import_module_with_fallback("app_managers")
 normalize_config_constraints = _app_managers.normalize_config_constraints
 normalize_constraint_pairs = _app_managers.normalize_constraint_pairs
@@ -348,9 +363,8 @@ def _clear_configuration_widget_state(session_state) -> None:
     session_state, so after importing a config the weight sliders would keep
     showing the old values - and this tab writes the displayed values
     straight back into the config, silently reverting the import. (The
-    do_not_pair_input/do_not_oppose_input textareas handle this themselves
-    via a seed fingerprint, since they can also go stale outside of import -
-    see the "_do_not_pair_seed" check in render_configuration_tab.)
+    constraint textareas handle this themselves via ``seed_widget_from_source``,
+    since they can also go stale outside of import.)
     """
     stale_keys = [key for key in list(session_state.keys()) if key.startswith("weight_")]
     for state_key in stale_keys:
@@ -394,14 +408,10 @@ def render_configuration_tab(st_module):
         st_module.markdown("**Do Not Pair Together**")
         do_not_pair_text = serialize_constraint_pairs(config["constraints"].get("do_not_pair", []))
         # st.tabs() runs every tab's body on every rerun, not just the visible
-        # one - so once this keyed widget exists, it ignores value= even when
-        # do_not_pair changed elsewhere (Main Scheduler quick-add, a loaded
-        # history entry). Re-seed it when the config-side value has changed
-        # since the last render; otherwise this tab's own write-back below
-        # keeps the seed in lockstep with in-progress typed edits.
-        if st_module.session_state.get("_do_not_pair_seed") != do_not_pair_text:
-            st_module.session_state.do_not_pair_input = do_not_pair_text
-        st_module.session_state._do_not_pair_seed = do_not_pair_text
+        # one - so this keyed widget goes stale whenever do_not_pair changes
+        # elsewhere (Main Scheduler quick-add, a loaded history entry), and the
+        # write-back below would then silently revert that change.
+        seed_widget_from_source(st_module.session_state, "do_not_pair_input", do_not_pair_text)
         do_not_pair = st_module.text_area(
             "Players who should not be paired (format: Player1,Player2):",
             value=do_not_pair_text,
@@ -413,9 +423,7 @@ def render_configuration_tab(st_module):
     with col2:
         st_module.markdown("**Do Not Oppose Each Other**")
         do_not_oppose_text = serialize_constraint_pairs(config["constraints"].get("do_not_oppose", []))
-        if st_module.session_state.get("_do_not_oppose_seed") != do_not_oppose_text:
-            st_module.session_state.do_not_oppose_input = do_not_oppose_text
-        st_module.session_state._do_not_oppose_seed = do_not_oppose_text
+        seed_widget_from_source(st_module.session_state, "do_not_oppose_input", do_not_oppose_text)
         do_not_oppose = st_module.text_area(
             "Players who should not oppose each other (format: Player1,Player2):",
             value=do_not_oppose_text,
@@ -492,29 +500,29 @@ def render_configuration_tab(st_module):
 
 
 _PRESET_WIDGET_KEY_PREFIX = "preset_"
-_PRESET_SEED_KEY_PREFIX = "_preset_seed_"
 # Widget keys that share the "preset_" prefix but belong to other widgets.
 _PRESET_WIDGET_RESERVED_KEYS = {"preset_name"}
 
 
 def _prune_stale_preset_widget_state(session_state, presets) -> None:
-    """Drop preset_* widget and seed keys whose preset no longer exists in config."""
+    """Drop preset_* widget state whose preset no longer exists in config."""
     stale_keys = [
         key
         for key in list(session_state.keys())
-        if (
-            key.startswith(_PRESET_WIDGET_KEY_PREFIX)
-            and key not in _PRESET_WIDGET_RESERVED_KEYS
-            and key[len(_PRESET_WIDGET_KEY_PREFIX) :] not in presets
-        )
-        or (key.startswith(_PRESET_SEED_KEY_PREFIX) and key[len(_PRESET_SEED_KEY_PREFIX) :] not in presets)
+        if key.startswith(_PRESET_WIDGET_KEY_PREFIX)
+        and key not in _PRESET_WIDGET_RESERVED_KEYS
+        and key[len(_PRESET_WIDGET_KEY_PREFIX) :] not in presets
     ]
     for key in stale_keys:
-        del session_state[key]
+        forget_widget_state(session_state, key)
 
 
 def render_player_management_tab(st_module, player_manager_cls):
     """Render the advanced player management tab."""
+    # Values queued by this tab's button handlers on the previous run, applied
+    # before the widgets they target are instantiated.
+    apply_deferred_widget_values(st_module.session_state)
+
     st_module.subheader("👥 Advanced Player Management")
 
     substitution_enabled = st_module.checkbox(
@@ -552,15 +560,10 @@ def render_player_management_tab(st_module, player_manager_cls):
             with col1:
                 preset_text = "\n".join(players)
                 widget_key = f"{_PRESET_WIDGET_KEY_PREFIX}{preset_name}"
-                seed_key = f"{_PRESET_SEED_KEY_PREFIX}{preset_name}"
-                # Keyed widgets ignore value= once the key exists, so if the
-                # preset was overwritten elsewhere (e.g. "Save as Preset" on
-                # the Main Scheduler tab) the textarea would keep showing -
-                # and write back - the old roster. Re-seed it when the
-                # config-side value changed since the last render.
-                if st_module.session_state.get(seed_key) != preset_text and widget_key in st_module.session_state:
-                    st_module.session_state[widget_key] = preset_text
-                st_module.session_state[seed_key] = preset_text
+                # If the preset was overwritten elsewhere (e.g. "Save as Preset"
+                # on the Main Scheduler tab) this textarea would keep showing -
+                # and write back - the old roster.
+                seed_widget_from_source(st_module.session_state, widget_key, preset_text)
                 players_text = st_module.text_area(
                     f"Players in {preset_name}:",
                     value=preset_text,
@@ -584,9 +587,6 @@ def render_player_management_tab(st_module, player_manager_cls):
     col1, col2 = st_module.columns([2, 1])
 
     with col1:
-        if st_module.session_state.pop("_pending_clear_new_preset_inputs", False):
-            st_module.session_state["new_preset_name"] = ""
-            st_module.session_state["new_preset_players"] = ""
         new_preset_name = st_module.text_input("New preset name:", key="new_preset_name")
         new_preset_players = st_module.text_area("Players (one per line):", key="new_preset_players")
 
@@ -595,7 +595,8 @@ def render_player_management_tab(st_module, player_manager_cls):
             config["player_presets"][new_preset_name] = [p.strip() for p in new_preset_players.split("\n") if p.strip()]
             if st_module.session_state.config_manager.save_config(config):
                 st_module.session_state.global_status_message = f"✅ Added preset: {new_preset_name}"
-                st_module.session_state._pending_clear_new_preset_inputs = True
+                defer_widget_value(st_module.session_state, "new_preset_name", "")
+                defer_widget_value(st_module.session_state, "new_preset_players", "")
                 st_module.rerun()
 
     skill_manager = st_module.session_state.get("skill_manager")

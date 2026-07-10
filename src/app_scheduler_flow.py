@@ -12,6 +12,11 @@ try:
 except ImportError:
     from _compat import import_module_with_fallback
 
+try:
+    from src.widget_state import apply_deferred_widget_values, defer_widget_value, seed_widget_from_source
+except ImportError:
+    from widget_state import apply_deferred_widget_values, defer_widget_value, seed_widget_from_source
+
 normalize_config_constraints = import_module_with_fallback("app_managers").normalize_config_constraints
 
 logger = logging.getLogger(__name__)
@@ -21,30 +26,21 @@ logger = logging.getLogger(__name__)
 # the protected default roster in docs/summaries/PLAYER_NAMES_POLICY.md.
 SAMPLE_PLAYER_NAMES = ["Alex", "Blake", "Casey", "Drew", "Emery", "Finley", "Gray", "Harper"]
 
-# Widget key for the preset selectbox in render_main_scheduler_tab.
+# Widget keys owned by render_main_scheduler_tab.
 PLAYER_PRESET_SELECT_KEY = "player_preset_select"
-_PENDING_PLAYER_PRESET_SELECT_KEY = "_pending_player_preset_select"
+PLAYERS_INPUT_KEY = "players_input"
+QUICK_ADD_KEY = "quick_add"
 
 
 def set_player_preset(session_state: Any, preset: str) -> None:
     """Switch the active preset from outside the selectbox widget itself.
 
-    The selectbox is keyed (PLAYER_PRESET_SELECT_KEY) so Streamlit can track
-    the user's actual click reliably across reruns. Anything that changes
-    the preset programmatically (quick-add, quick-remove, sample players,
-    deleting the active preset) must keep that same key in sync, or the
-    keyed widget just re-asserts its own stale value on the next render and
-    silently reverts this change.
-
-    This can only ever be called from code that runs AFTER the selectbox has
-    already been instantiated this script run (a button handler further down
-    the page) - Streamlit raises if session_state[key] is written directly
-    once that widget already exists for this run. So, same as the existing
-    _pending_players_input handling below, stash it and apply it at the top
-    of the next render, before the selectbox runs.
+    Callers are button handlers that run after the selectbox has already been
+    instantiated this run, so the widget key can only be updated via a
+    deferred write - see src/widget_state.py for why.
     """
     session_state.selected_player_preset = preset
-    session_state[_PENDING_PLAYER_PRESET_SELECT_KEY] = preset
+    defer_widget_value(session_state, PLAYER_PRESET_SELECT_KEY, preset)
 
 
 def parse_players_text(players_text: str) -> list[str]:
@@ -467,13 +463,9 @@ def render_main_scheduler_tab(
     """Render the main scheduling interface and schedule generation flow."""
     config = normalize_config_constraints(st_module.session_state.app_config)
     st_module.session_state.app_config = config
-    pending_players_text = st_module.session_state.pop("_pending_players_input", None)
-    if isinstance(pending_players_text, str):
-        st_module.session_state.players_input = pending_players_text
-
-    pending_preset_select = st_module.session_state.pop(_PENDING_PLAYER_PRESET_SELECT_KEY, None)
-    if isinstance(pending_preset_select, str):
-        st_module.session_state[PLAYER_PRESET_SELECT_KEY] = pending_preset_select
+    # Values queued by this page's button handlers on the previous run, applied
+    # here before any of the widgets they target are instantiated.
+    apply_deferred_widget_values(st_module.session_state)
 
     st_module.subheader("👥 Players")
 
@@ -495,20 +487,18 @@ def render_main_scheduler_tab(
         st_module.session_state.selected_player_preset_initialized = True
         default_players = resolve_players_text_for_preset(st_module.session_state, config, preset)
 
-        # Once a widget has a `key`, Streamlit ignores `value=` on every rerun
-        # after the first (session_state[key] takes precedence) - so switching
-        # presets would otherwise leave the textarea showing the old preset's
-        # players. Re-seed it explicitly, but only when the preset selection
-        # itself just changed, so it doesn't clobber in-progress manual edits
-        # under "Custom" on every unrelated rerun.
+        # Re-seed the textarea only when the preset selection itself changed,
+        # so it doesn't clobber in-progress manual edits under "Custom" on
+        # every unrelated rerun. (Keyed on the preset, not on default_players,
+        # because under "Custom" the latter tracks the user's own typing.)
         if preset != previous_preset:
-            st_module.session_state.players_input = default_players
+            st_module.session_state[PLAYERS_INPUT_KEY] = default_players
 
         players_text = st_module.text_area(
             "Player names (one per line):",
             value=default_players,
             height=150,
-            key="players_input",
+            key=PLAYERS_INPUT_KEY,
         )
 
         if preset == "Custom":
@@ -517,9 +507,7 @@ def render_main_scheduler_tab(
     with col2:
         st_module.markdown("**Quick Actions**")
 
-        if st_module.session_state.pop("_pending_clear_quick_add", False):
-            st_module.session_state["quick_add"] = ""
-        new_player = st_module.text_input("Quick add player:", key="quick_add")
+        new_player = st_module.text_input("Quick add player:", key=QUICK_ADD_KEY)
         preset_name = st_module.text_input("Preset name:", key="preset_name")
 
         if st_module.button("➕ Add Player") and new_player:
@@ -528,8 +516,8 @@ def render_main_scheduler_tab(
                 st_module.session_state.custom_players = updated_text
                 set_player_preset(st_module.session_state, "Custom")
                 st_module.session_state.selected_player_preset_initialized = True
-                st_module.session_state._pending_players_input = updated_text
-                st_module.session_state._pending_clear_quick_add = True
+                defer_widget_value(st_module.session_state, PLAYERS_INPUT_KEY, updated_text)
+                defer_widget_value(st_module.session_state, QUICK_ADD_KEY, "")
                 st_module.rerun()
 
         if st_module.button("💾 Save as Preset") and preset_name.strip():
@@ -551,7 +539,7 @@ def render_main_scheduler_tab(
                     st_module.session_state.custom_players = updated_text
                     set_player_preset(st_module.session_state, "Custom")
                     st_module.session_state.selected_player_preset_initialized = True
-                    st_module.session_state._pending_players_input = updated_text
+                    defer_widget_value(st_module.session_state, PLAYERS_INPUT_KEY, updated_text)
                     st_module.rerun()
 
     if not players and not st_module.session_state.get("current_schedule"):
@@ -561,7 +549,7 @@ def render_main_scheduler_tab(
             st_module.session_state.custom_players = sample_players_text
             set_player_preset(st_module.session_state, "Custom")
             st_module.session_state.selected_player_preset_initialized = True
-            st_module.session_state._pending_players_input = sample_players_text
+            defer_widget_value(st_module.session_state, PLAYERS_INPUT_KEY, sample_players_text)
             st_module.rerun()
 
     if len(players) < 4:
@@ -933,15 +921,11 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players)
             value=0,
             key="replan_played_rounds",
         )
-        # Keyed widgets ignore value= once the key exists in session_state, so
-        # without this the textarea would keep showing the roster of whatever
-        # schedule was on screen when it first rendered. Re-seed it whenever
-        # the current schedule's players change (new generation, history load,
-        # completed replan) while preserving in-progress edits otherwise.
+        # Re-seed whenever the current schedule's players change (new
+        # generation, history load, completed replan), preserving in-progress
+        # edits otherwise.
         roster_text = "\n".join(players)
-        if st_module.session_state.get("_replan_players_seed") != roster_text:
-            st_module.session_state.replan_players_input = roster_text
-            st_module.session_state._replan_players_seed = roster_text
+        seed_widget_from_source(st_module.session_state, "replan_players_input", roster_text)
         remaining_players_text = st_module.text_area(
             "Players for the remaining rounds (edit to reflect who's still here):",
             value=roster_text,
