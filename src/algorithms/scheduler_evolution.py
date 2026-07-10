@@ -394,9 +394,12 @@ def run_evolution_loop(
 
         # Check for Range 0 achievement
         if best_individual is not None:
-            schedule = scheduler._decode(best_individual)
-            metrics = scheduler._evaluate_metrics(schedule)
-            avoidable_duplicate_rounds = scheduler._count_avoidable_duplicate_rounds(schedule)
+            schedule = scheduler._decode_cached(best_individual)
+            metrics = scheduler._evaluate_metrics_cached(schedule, best_individual)
+            signature = scheduler._get_duplicate_signature_cached(best_individual, schedule)
+            avoidable_duplicate_rounds = max(
+                0, (len(signature) - len(set(signature))) - scheduler.minimum_duplicate_rounds
+            )
             current_ranges = {
                 "games": metrics["games_range"],
                 "partners": metrics["partners_range"],
@@ -514,9 +517,12 @@ def run_evolution_loop(
 
         # Check for convergence with Range 0 priority
         if best_individual is not None:
-            schedule = scheduler._decode(best_individual)
-            metrics = scheduler._evaluate_metrics(schedule)
-            avoidable_duplicate_rounds = scheduler._count_avoidable_duplicate_rounds(schedule)
+            schedule = scheduler._decode_cached(best_individual)
+            metrics = scheduler._evaluate_metrics_cached(schedule, best_individual)
+            signature = scheduler._get_duplicate_signature_cached(best_individual, schedule)
+            avoidable_duplicate_rounds = max(
+                0, (len(signature) - len(set(signature))) - scheduler.minimum_duplicate_rounds
+            )
             total_range = sum(
                 [
                     metrics["games_range"],
@@ -547,7 +553,7 @@ def run_evolution_loop(
                     generations_without_improvement = scheduler.convergence_patience - 50
                 else:
                     printer("🏁 Convergence reached - stopping")
-                    break  # Sort by fitness
+                    break
         fitness_scores.sort(key=lambda x: x[1])
 
         # Create next generation

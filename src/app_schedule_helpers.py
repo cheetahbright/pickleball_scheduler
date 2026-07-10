@@ -141,16 +141,9 @@ def display_enhanced_schedule(
 
 
 def _extract_game_fields(game):
-    """Return (team1, team2, court) as plain strings/values for either game shape."""
-    if hasattr(game, "team1"):
-        team1 = [str(p) for p in game.team1]
-        team2 = [str(p) for p in game.team2]
-        court = game.court
-    else:
-        team1 = [str(p) for p in game["team1"]]
-        team2 = [str(p) for p in game["team2"]]
-        court = game["court"]
-    return team1, team2, court
+    """Return (team1, team2, court) as plain strings for either game shape."""
+    raw_team1, raw_team2, court = extract_game_teams(game)
+    return [str(p) for p in raw_team1], [str(p) for p in raw_team2], court
 
 
 def list_games_for_scoring(schedule) -> List[dict]:
@@ -221,21 +214,14 @@ def schedule_to_player_text(schedule: Iterable[Any], all_players: Iterable[Any])
         for game in games:
             team1, team2, court = _extract_game_fields(game)
 
-            for player in team1:
-                partner = [p for p in team1 if p != player]
-                partner_text = f" with {partner[0]}" if partner else ""
-                player_lines.setdefault(player, []).append(
-                    f"R{round_num}: Court {court}{partner_text} vs {' & '.join(team2)}"
-                )
-                players_seen_this_round.add(player)
-
-            for player in team2:
-                partner = [p for p in team2 if p != player]
-                partner_text = f" with {partner[0]}" if partner else ""
-                player_lines.setdefault(player, []).append(
-                    f"R{round_num}: Court {court}{partner_text} vs {' & '.join(team1)}"
-                )
-                players_seen_this_round.add(player)
+            for team, opponents in ((team1, team2), (team2, team1)):
+                for player in team:
+                    partner = [p for p in team if p != player]
+                    partner_text = f" with {partner[0]}" if partner else ""
+                    player_lines.setdefault(player, []).append(
+                        f"R{round_num}: Court {court}{partner_text} vs {' & '.join(opponents)}"
+                    )
+                    players_seen_this_round.add(player)
 
         for player in all_players:
             player = str(player)

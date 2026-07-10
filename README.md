@@ -4,11 +4,13 @@
 
 ### 🎾 **Pickleball Scheduler - The Complete Solution**
 
-- **Core Scheduling**: Reliable genetic algorithm for game generation
-- **Advanced Analytics**: Plotly visualizations and fairness metrics  
-- **Configuration Management**: Weight tuning, constraints, player presets
-- **History Tracking**: Database storage and weekly partner analytics
-- **Player Management**: Substitutions, availability, custom presets
+- **Core Scheduling**: Reliable genetic algorithm for game generation, with mid-session replan for late arrivals/early leavers
+- **Advanced Analytics**: Plotly visualizations, fairness metrics, and skill-balance breakdown
+- **Configuration Management**: Weight tuning, constraints, player presets, export/import
+- **History Tracking**: Database storage, weekly partner analytics, soft-delete with undo
+- **Leaderboard & Ratings**: Score entry (with CSV bulk import), all-time win/loss standings, and ELO ratings
+- **Player Management**: Substitutions, availability, custom presets, skill ratings
+- **Mobile-Friendly & Installable**: Responsive layout, dark theme, and PWA support
 - **Professional Quality**: Security, testing, and development standards
 
 **Perfect for**: Individuals, clubs, leagues, tournaments - any pickleball group!
@@ -74,7 +76,8 @@ python -m pytest tests/organized/ui/test_main_ui_smoke.py -q
 - **Smart Court Calculation**: Automatically determines optimal courts
 - **Genetic Algorithm**: Proven scheduling algorithm for fair games
 - **Real-time Generation**: Fast schedule creation with progress feedback
-- **Export Options**: CSV and JSON download formats
+- **Export Options**: CSV, JSON, plain text, and Excel (.xlsx) download formats
+- **Mid-Session Replan**: Regenerate only the not-yet-played rounds if the roster changes mid-session
 
 ### **📊 Analytics**
 
@@ -88,7 +91,14 @@ python -m pytest tests/organized/ui/test_main_ui_smoke.py -q
 - **Schedule Database**: SQLite storage for all generated schedules
 - **Weekly Tracking**: Partner and opponent history analysis
 - **Schedule Replay**: Load and view previous schedules
+- **Soft-Delete with Undo**: Deleted schedules can be restored, not lost
 - **Trend Analysis**: Identify patterns in player pairings
+
+### **🏆 Leaderboard**
+
+- **Score Entry**: Enter scores per game, or bulk-import via CSV
+- **All-Time Standings**: Win/loss/win-rate aggregated across every recorded game
+- **ELO Ratings**: Persistent skill ratings recomputed from recorded score history
 
 ### **⚙️ Configuration**
 
@@ -96,12 +106,14 @@ python -m pytest tests/organized/ui/test_main_ui_smoke.py -q
 - **Player Constraints**: "Do not pair" and "Do not oppose" rules
 - **Custom Presets**: Save and manage player group configurations
 - **Scheduling Preferences**: Default rounds, times, game duration
+- **Export/Import**: Download or upload the full configuration as JSON
 
 ### **👥 Player Management**
 
 - **Player Substitutions**: Handle early/late player scenarios
 - **Availability Constraints**: Time-based player management
 - **Preset Management**: Create, edit, delete custom player groups
+- **Skill Ratings**: 1-5 per-player ratings feeding the Analytics skill-balance view
 - **Input Validation**: Security-hardened player name processing
 
 ## 🔒 **Security & Quality**
@@ -133,11 +145,17 @@ python -m pytest tests/organized/ui/test_main_ui_smoke.py -q
 
 ```
 src/
-├── main_app.py              # Main Streamlit application
+├── main_app.py              # Main Streamlit application facade
 ├── simple_auth.py           # Authentication system
+├── theme_styles.py          # Dark theme CSS
+├── mobile_styles.py         # Mobile-responsive CSS
+├── pwa.py                   # PWA manifest/service-worker injection
+├── rating_elo.py            # Pure ELO math
 ├── algorithms/
 │   ├── genetic_scheduler.py # Core scheduling algorithm
 │   └── constraint_model.py  # Constraint handling
+├── managers/                # HistoryManager, ConfigurationManager,
+│                             # SkillRatingManager, EloRatingManager, PlayerManager
 ├── utils/                   # Analytics, feasibility, and helper utilities
 ├── gui/                     # Compatibility entry points
 └── main.py                  # CLI and launcher
@@ -147,17 +165,19 @@ src/
 
 ```
 data/
-├── schedule_history.db      # SQLite database for schedules
+├── schedule_history.db      # SQLite database for schedules and scores
 ├── app_config.json          # Application configuration
 ├── default_player_names.json # Default player presets
-└── schedule_history.json    # Lightweight history summaries
+├── player_skills.json       # Manually-set 1-5 skill ratings
+└── player_elo.json          # Persistent ELO ratings
 ```
 
 ### **Key Classes**
 
 - **ScheduleAnalytics**: Fairness calculations and visualizations
-- **HistoryManager**: Database operations and persistence
-- **ConfigurationManager**: Settings and constraints management
+- **HistoryManager**: Database operations and persistence (schedules, scores, leaderboard)
+- **ConfigurationManager**: Settings, constraints, and config export/import
+- **SkillRatingManager / EloRatingManager**: Player skill and ELO ratings
 - **PlayerManager**: Advanced player and substitution handling
 
 ## 📊 **What Makes This Different**

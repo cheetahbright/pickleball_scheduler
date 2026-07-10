@@ -53,7 +53,6 @@ except ImportError:
 try:
     from src.algorithms.scheduler_repairs import (
         apply_targeted_repairs,
-        count_partners,
         repair_invalid_schedule,
         repair_opponent_imbalance,
         repair_partner_imbalance,
@@ -61,7 +60,6 @@ try:
 except ImportError:
     from algorithms.scheduler_repairs import (
         apply_targeted_repairs,
-        count_partners,
         repair_invalid_schedule,
         repair_opponent_imbalance,
         repair_partner_imbalance,
@@ -73,7 +71,6 @@ try:
         compute_perfect_stop_threshold,
     )
     from src.algorithms.scheduler_evolution import crossover as _crossover_fn
-    from src.algorithms.scheduler_evolution import elitism as _elitism_fn
     from src.algorithms.scheduler_evolution import random_individual as _random_individual_fn
     from src.algorithms.scheduler_evolution import (
         run_evolution_loop,
@@ -86,7 +83,6 @@ except ImportError:
         compute_perfect_stop_threshold,
     )
     from algorithms.scheduler_evolution import crossover as _crossover_fn
-    from algorithms.scheduler_evolution import elitism as _elitism_fn
     from algorithms.scheduler_evolution import random_individual as _random_individual_fn
     from algorithms.scheduler_evolution import (
         run_evolution_loop,
@@ -172,7 +168,7 @@ class GeneticPickleballScheduler:
         self,
         players: List[Any],
         num_courts: int = 1,
-        num_rounds: Optional[int] = None,  # Always hardcoded to 8 rounds
+        num_rounds: Optional[int] = None,
         *,
         population_size: int = 100,  # Will use DESKTOP_PARAMS for desktop mode
         max_generations: int = 1000,  # Reduced from 2000
@@ -871,168 +867,6 @@ class GeneticPickleballScheduler:
             printer=print,
         )
 
-    def _elitism(self, population: List[Tuple[int, ...]], fitnesses: List[float], k: int) -> List[Tuple[int, ...]]:
-        """Select k best individuals for elitism."""
-        return _elitism_fn(population, fitnesses, k)
-
-    def _tournament(
-        self, population: List[Tuple[int, ...]], fitnesses: List[float], rng, k: int = 3
-    ) -> Tuple[int, ...]:
-        """Tournament selection."""
-        cand = rng.sample(range(len(population)), k=min(k, len(population)))
-        best = min(cand, key=lambda i: fitnesses[i])
-        return population[best]
-
-    def _count_partners(self, schedule: List[List[Tuple[str, str, str, str]]]) -> Dict[str, Dict[str, int]]:
-        """Count partner pairings for each player in the schedule."""
-        return count_partners(schedule)
-
-    def _smart_mutate(self, ind: Tuple[int, ...], rng) -> Tuple[int, ...]:
-        """Smart mutation focusing on partner balance for desktop optimization."""
-        arr_len = len(self.arrangements)
-        out = list(ind)
-
-        # Get current schedule for analysis
-        current_schedule = self._decode(ind)
-        partner_counts = self._count_partners(current_schedule)
-
-        # Calculate partner imbalance
-        max_partnerships = 0
-        min_partnerships = float("inf")
-        for player_partners in partner_counts.values():
-            if player_partners:
-                max_partnerships = max(max_partnerships, max(player_partners.values()))
-                min_partnerships = min(min_partnerships, min(player_partners.values()))
-
-        partner_range = max_partnerships - min_partnerships if min_partnerships != float("inf") else 0
-
-        # Use smart mutation if partner range > 0
-        if partner_range > 0:
-            # Target rounds with high partner imbalance
-            for i in range(len(out)):
-                if rng.random() < self.mutation_rate * 1.5:  # Higher mutation rate for smart targeting
-                    # Try multiple candidates and pick the best for partner balance
-                    best_candidate = out[i]
-                    best_improvement = 0
-
-                    for _ in range(5):  # Test 5 random alternatives
-                        candidate = rng.randrange(0, arr_len)
-                        if candidate != out[i]:
-                            # Test this candidate
-                            test_out = out[:]
-                            test_out[i] = candidate
-                            test_schedule = self._decode(tuple(test_out))
-                            test_partners = self._count_partners(test_schedule)
-
-                            # Calculate improvement in partner balance
-                            test_max = 0
-                            test_min = float("inf")
-                            for player_partners in test_partners.values():
-                                if player_partners:
-                                    test_max = max(test_max, max(player_partners.values()))
-                                    test_min = min(test_min, min(player_partners.values()))
-
-                            test_range = test_max - test_min if test_min != float("inf") else 0
-                            improvement = partner_range - test_range
-
-                            if improvement > best_improvement:
-                                best_improvement = improvement
-                                best_candidate = candidate
-
-                    out[i] = best_candidate
-        else:
-            # Standard mutation when partner balance is already good
-            for i in range(len(out)):
-                if rng.random() < self.mutation_rate:
-                    out[i] = rng.randrange(0, arr_len)
-
-        # Occasional swap mutation for diversity
-        if rng.random() < 0.1 and len(out) > 1:
-            i, j = rng.sample(range(len(out)), 2)
-            out[i], out[j] = out[j], out[i]
-
-        return tuple(out)
-
-    def _mutate(self, ind: Tuple[int, ...], rng) -> Tuple[int, ...]:
-        """Standard mutation with smart mutation option for desktop mode."""
-        # Use smart mutation if desktop parameters are enabled
-        if (
-            hasattr(self, "convergence_patience")
-            and self.convergence_patience == self.DESKTOP_PARAMS["convergence_patience"]
-        ):
-            return self._smart_mutate(ind, rng)
-
-        # Standard mutation for non-desktop mode
-        arr_len = len(self.arrangements)
-        out = list(ind)
-        for i in range(len(out)):
-            if rng.random() < self.mutation_rate:
-                out[i] = rng.randrange(0, arr_len)
-        # occasional swap mutation
-        if rng.random() < 0.1 and len(out) > 1:
-            i, j = rng.sample(range(len(out)), 2)
-            out[i], out[j] = out[j], out[i]
-        return tuple(out)
-
     def _format_schedule(self, schedule: List[List[Tuple[str, str, str, str]]]) -> List[Dict[str, Any]]:
         """Format schedule to legacy format without silently dropping rounds."""
         return format_schedule(schedule)
-
-    def fitness(self, individual: List[int]) -> float:
-        """Legacy fitness method for compatibility."""
-        return self._fitness(tuple(individual))
-
-    def create_random_schedule(self) -> List[List[Tuple[str, str, str, str]]]:
-        """Legacy: Create a random schedule by decoding a random individual."""
-        rng = random.Random()
-        ind = self._random_individual(rng)
-        return self._decode(ind)
-
-    def crossover(self, parent1: List[int], parent2: List[int]) -> Tuple[List[int], List[int]]:
-        """Legacy crossover method."""
-        rng = random.Random()
-        c1, c2 = self._crossover(tuple(parent1), tuple(parent2), rng)
-        return list(c1), list(c2)
-
-    def mutate(self, individual: List[int]) -> List[int]:
-        """Legacy mutate method."""
-        rng = random.Random()
-        return list(self._mutate(tuple(individual), rng))
-
-    def tournament_selection(self, population: List[List[int]], fitnesses: List[float], k: int = 3) -> List[int]:
-        """Legacy tournament selection."""
-        rng = random.Random()
-        pop_tuples = [tuple(ind) for ind in population]
-        selected = self._tournament(pop_tuples, fitnesses, rng, k)
-        return list(selected)
-
-    def evolve_generation(
-        self, population: List[List[int]], fitnesses: List[float]
-    ) -> Tuple[List[List[int]], List[float]]:
-        """Legacy evolve method."""
-        rng = random.Random()
-        pop_tuples = [tuple(ind) for ind in population]
-        new_pop = []
-
-        # Elitism
-        elites = self._elitism(pop_tuples, fitnesses, self.elite_size)
-        new_pop.extend(elites)
-
-        # Fill rest
-        while len(new_pop) < self.population_size:
-            if rng.random() < self.crossover_rate:
-                p1 = self._tournament(pop_tuples, fitnesses, rng)
-                p2 = self._tournament(pop_tuples, fitnesses, rng)
-                c1, c2 = self._crossover(p1, p2, rng)
-                c1 = self._mutate(c1, rng)
-                c2 = self._mutate(c2, rng)
-                new_pop.extend([c1, c2])
-            else:
-                p = self._tournament(pop_tuples, fitnesses, rng)
-                new_pop.append(self._mutate(p, rng))
-
-        new_pop = new_pop[: self.population_size]
-        new_pop_lists = [list(ind) for ind in new_pop]
-        new_fitnesses = [self.fitness(ind) for ind in new_pop_lists]
-
-        return new_pop_lists, new_fitnesses

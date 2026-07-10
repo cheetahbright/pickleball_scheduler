@@ -356,6 +356,7 @@ def render_enhanced_scheduler_page(
     stress_test_tab_fn=None,
     leaderboard_tab_fn=None,
     skill_manager_cls=None,
+    elo_manager_cls=None,
 ):
     """Render the top-level scheduler page with tabs."""
     if "history_manager" not in st_module.session_state:
@@ -364,6 +365,8 @@ def render_enhanced_scheduler_page(
         st_module.session_state.config_manager = config_manager_cls()
     if skill_manager_cls is not None and "skill_manager" not in st_module.session_state:
         st_module.session_state.skill_manager = skill_manager_cls()
+    if elo_manager_cls is not None and "elo_manager" not in st_module.session_state:
+        st_module.session_state.elo_manager = elo_manager_cls()
     if "app_config" not in st_module.session_state:
         CONFIG_REPAIR_MESSAGES_KEY = import_module_with_fallback("app_managers").CONFIG_REPAIR_MESSAGES_KEY
 
@@ -373,12 +376,24 @@ def render_enhanced_scheduler_page(
         for message in repair_messages or []:
             st_module.warning(f"⚠️ {message}")
 
-    col1, col2 = st_module.columns([1, 0.2])
+    ui_config = st_module.session_state.app_config.setdefault("ui", {"theme": "light"})
+
+    col1, col2, col3 = st_module.columns([1, 0.3, 0.2])
     with col1:
         st_module.title("🎾 Pickleball Scheduler")
     with col2:
+        dark_mode = st_module.checkbox("🌙 Dark mode", value=ui_config.get("theme") == "dark")
+        new_theme = "dark" if dark_mode else "light"
+        if new_theme != ui_config.get("theme"):
+            ui_config["theme"] = new_theme
+            st_module.session_state.config_manager.save_config(st_module.session_state.app_config)
+            st_module.rerun()
+    with col3:
         if st_module.button("Logout"):
             logout_fn()
+
+    inject_theme_css = import_module_with_fallback("theme_styles").inject_theme_css
+    inject_theme_css(st_module, ui_config.get("theme", "light"))
 
     st_module.markdown("*Complete scheduling with analytics and history*")
 
@@ -436,11 +451,21 @@ def render_main_scheduler_tab(
     col1, col2 = st_module.columns([2, 1])
 
     with col1:
+        previous_preset = st_module.session_state.get("selected_player_preset")
         preset_options = build_player_preset_options(st_module.session_state, config)
         preset = st_module.selectbox("Choose preset or custom:", preset_options)
         st_module.session_state.selected_player_preset = preset
         st_module.session_state.selected_player_preset_initialized = True
         default_players = resolve_players_text_for_preset(st_module.session_state, config, preset)
+
+        # Once a widget has a `key`, Streamlit ignores `value=` on every rerun
+        # after the first (session_state[key] takes precedence) - so switching
+        # presets would otherwise leave the textarea showing the old preset's
+        # players. Re-seed it explicitly, but only when the preset selection
+        # itself just changed, so it doesn't clobber in-progress manual edits
+        # under "Custom" on every unrelated rerun.
+        if preset != previous_preset:
+            st_module.session_state.players_input = default_players
 
         players_text = st_module.text_area(
             "Player names (one per line):",
@@ -616,10 +641,6 @@ def render_main_scheduler_tab(
     with col3:
         max_time = st_module.number_input("Max generation time (seconds):", min_value=10, max_value=300, value=60)
 
-    total_constraints = len(config["constraints"]["do_not_pair"]) + len(config["constraints"]["do_not_oppose"])
-    if total_constraints > 0:
-        st_module.info(f"🎯 Active constraints: {total_constraints} total")
-
     with st_module.expander("📐 Expected quality for this configuration"):
         for note in build_feasibility_notes(len(players), courts, num_rounds):
             st_module.write(note)
@@ -660,7 +681,7 @@ def render_main_scheduler_tab(
                     total_range = progress_data.get("total_range", "?")
                     _text.text(f"Generation {generation} - best range {total_range} - {elapsed:.0f}s elapsed")
                 except Exception:
-                    pass
+                    logger.debug("Progress callback failed", exc_info=True)
 
             import time as _time
 
@@ -875,9 +896,18 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players)
             value=0,
             key="replan_played_rounds",
         )
+        # Keyed widgets ignore value= once the key exists in session_state, so
+        # without this the textarea would keep showing the roster of whatever
+        # schedule was on screen when it first rendered. Re-seed it whenever
+        # the current schedule's players change (new generation, history load,
+        # completed replan) while preserving in-progress edits otherwise.
+        roster_text = "\n".join(players)
+        if st_module.session_state.get("_replan_players_seed") != roster_text:
+            st_module.session_state.replan_players_input = roster_text
+            st_module.session_state._replan_players_seed = roster_text
         remaining_players_text = st_module.text_area(
             "Players for the remaining rounds (edit to reflect who's still here):",
-            value="\n".join(players),
+            value=roster_text,
             key="replan_players_input",
         )
 
@@ -909,12 +939,20 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players)
 
             st_module.session_state.current_schedule = splice_schedules(locked_rounds, result["schedule"])
             st_module.session_state.current_players = sorted(set(players) | set(remaining_players))
+            # The metrics and seed shown belong to the pre-replan schedule;
+            # after splicing they no longer describe what's on screen.
+            st_module.session_state.current_metrics = {}
+            st_module.session_state.current_seed = None
             st_module.session_state.global_status_message = f"✅ Replanned rounds {played_rounds + 1}-{total_rounds}."
             st_module.rerun()
 
 
 def _render_metric_summary(st_module, metrics, players):
     """Render the top-level fairness summary metrics."""
+    if not metrics:
+        # Schedules loaded from history have no freshly computed metrics -
+        # showing all-zero placeholders would read as a terrible schedule.
+        return
     col1, col2, col3, col4, col5 = st_module.columns(5)
     with col1:
         fairness_score = metrics.get("overall_fairness", 0)

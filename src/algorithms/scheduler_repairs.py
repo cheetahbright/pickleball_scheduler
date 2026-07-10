@@ -124,16 +124,16 @@ def repair_partner_imbalance(
         test_schedule[r2_idx][g2_idx] = cast(GameTuple, tuple(game2))
 
         test_metrics = evaluate_metrics(test_schedule)
-        current_best_metrics = evaluate_metrics(best_schedule)
-        is_improvement = test_metrics["partners_range"] < current_best_metrics["partners_range"] or (
-            test_metrics["partners_range"] == current_best_metrics["partners_range"]
-            and test_metrics["opponents_range"] <= current_best_metrics["opponents_range"]
-            and test_metrics["games_range"] <= current_best_metrics["games_range"]
-            and test_metrics["courts_range"] <= current_best_metrics["courts_range"]
+        is_improvement = test_metrics["partners_range"] < current_metrics["partners_range"] or (
+            test_metrics["partners_range"] == current_metrics["partners_range"]
+            and test_metrics["opponents_range"] <= current_metrics["opponents_range"]
+            and test_metrics["games_range"] <= current_metrics["games_range"]
+            and test_metrics["courts_range"] <= current_metrics["courts_range"]
         )
 
         if is_improvement and test_metrics["violations"] == 0:
             best_schedule = test_schedule
+            current_metrics = test_metrics
             improvements += 1
             printer(
                 f"   🎯 Improvement #{improvements}: "
@@ -145,7 +145,7 @@ def repair_partner_imbalance(
                 printer(f"   🎉 Partner balance achieved after {attempts} attempts!")
                 break
 
-    final_metrics = evaluate_metrics(best_schedule)
+    final_metrics = current_metrics
     final_total = sum_range_metrics(final_metrics)
     printer(f"   🏁 Partner repair complete: {attempts} attempts, {improvements} improvements")
     printer(f"      Partners Range: {final_metrics['partners_range']} | Total Range: {final_total}")

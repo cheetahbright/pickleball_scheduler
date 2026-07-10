@@ -37,6 +37,7 @@ GeneticPickleballScheduler = import_module_with_fallback("algorithms.genetic_sch
 
 _app_managers = import_module_with_fallback("app_managers")
 ConfigurationManager = _app_managers.ConfigurationManager
+EloRatingManager = _app_managers.EloRatingManager
 HistoryManager = _app_managers.HistoryManager
 PlayerManager = _app_managers.PlayerManager
 SkillRatingManager = _app_managers.SkillRatingManager
@@ -72,6 +73,7 @@ simple_auth = _simple_auth.simple_auth
 
 setup_logging = import_module_with_fallback("utils.logging_config").setup_logging
 inject_mobile_css = import_module_with_fallback("mobile_styles").inject_mobile_css
+inject_pwa_manifest = import_module_with_fallback("pwa").inject_pwa_manifest
 
 # Try to import plotly for visualizations
 go = None
@@ -191,6 +193,7 @@ def enhanced_scheduler_page():
         stress_test_tab_fn=stress_test_tab,
         leaderboard_tab_fn=leaderboard_tab,
         skill_manager_cls=SkillRatingManager,
+        elo_manager_cls=EloRatingManager,
     )
 
 
@@ -263,6 +266,7 @@ def main():
     # Page config
     st.set_page_config(page_title="Pickleball Scheduler", page_icon="🎾", layout="wide")
     inject_mobile_css(st)
+    inject_pwa_manifest(st)
 
     # Check authentication
     if not simple_auth():
@@ -278,6 +282,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "ConfigurationManager",
+    "EloRatingManager",
     "HistoryManager",
     "PlayerManager",
     "ScheduleAnalytics",

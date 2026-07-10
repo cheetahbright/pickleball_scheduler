@@ -5,10 +5,20 @@ Provides secure login functionality with session management and rate limiting.
 """
 
 import hashlib
+import hmac
+import logging
+import os
 import time
 from datetime import datetime, timedelta
 
 import streamlit as st
+
+try:
+    from src.simple_auth import TRUE_VALUES
+except ImportError:
+    from simple_auth import TRUE_VALUES
+
+logger = logging.getLogger(__name__)
 
 
 class AuthenticationError(Exception):
@@ -107,10 +117,12 @@ class StreamlitAuth:
         # In test runs, also allow the UI test's known password for compatibility
         # Only active when pytest or E2E_TEST flag is set
         test_password = "JLWCbatjLecmdmygZewih4v*F6"
-        if (os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("E2E_TEST")) and entered_password == test_password:
+        if (os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("E2E_TEST")) and hmac.compare_digest(
+            entered_password.encode("utf-8"), test_password.encode("utf-8")
+        ):
             return True
 
-        return entered_password == secret_password
+        return hmac.compare_digest(entered_password.encode("utf-8"), secret_password.encode("utf-8"))
 
     def login_form(self) -> bool:
         """Display login form and handle authentication.
@@ -200,15 +212,13 @@ class StreamlitAuth:
         """
         # In E2E/CI environments, bypass the login form for stability
         try:
-            import os
-
-            if os.environ.get("E2E_TEST"):
+            if os.environ.get("E2E_TEST", "").lower() in TRUE_VALUES:
                 st.session_state.authenticated = True
                 if not st.session_state.get("auth_timestamp"):
                     st.session_state.auth_timestamp = datetime.now()
                 st.session_state.user_role = st.session_state.get("user_role", "user")
         except Exception:
-            pass
+            logger.debug("E2E_TEST bypass check failed", exc_info=True)
 
         if not self.login_form():
             return False

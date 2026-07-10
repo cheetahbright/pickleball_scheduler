@@ -39,7 +39,7 @@ def save_settings_smart(settings_data, settings_file_path):
                 with open(settings_file, "r", encoding="utf-8") as f:
                     existing_data = json.load(f)
                     existing_ts = existing_data.get("timestamp")
-            except Exception:
+            except (OSError, json.JSONDecodeError):
                 # If the file is unreadable or invalid JSON, proceed without comparing timestamps
                 existing_ts = None
 

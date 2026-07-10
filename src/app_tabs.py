@@ -118,6 +118,16 @@ def render_history_tab(st_module, pd_module, json_module):
                     schedule_data, players = load_schedule_and_players_from_history_entry(target_entry, json_module)
                     st_module.session_state.current_schedule = schedule_data
                     st_module.session_state.current_players = players
+                    # Point score entry at the loaded schedule - otherwise the
+                    # Leaderboard tab would keep attaching scores to whichever
+                    # schedule was generated last.
+                    st_module.session_state.current_schedule_id = target_entry.get("id")
+                    # Reset companion state computed for the previously shown
+                    # schedule so the loaded one doesn't display someone
+                    # else's metrics, seed, or round times.
+                    st_module.session_state.current_metrics = {}
+                    st_module.session_state.current_seed = None
+                    st_module.session_state.current_round_times = None
                     st_module.session_state.global_status_message = "✅ Schedule loaded!"
                     logger.info("History load: rounds=%d players=%d", len(schedule_data), len(players))
                     st_module.rerun()
@@ -317,6 +327,21 @@ def _render_skill_balance(st_module, pd_module, schedule):
         )
 
 
+def _clear_configuration_widget_state(session_state) -> None:
+    """Drop keyed Configuration-tab widget state so widgets re-seed from config.
+
+    Keyed widgets ignore their ``value=`` argument once the key exists in
+    session_state, so after importing a config the constraint textareas and
+    weight sliders would keep showing the old values - and this tab writes
+    the displayed values straight back into the config, silently reverting
+    the import.
+    """
+    stale_keys = ["do_not_pair_input", "do_not_oppose_input"]
+    stale_keys.extend(key for key in list(session_state.keys()) if key.startswith("weight_"))
+    for state_key in stale_keys:
+        session_state.pop(state_key, None)
+
+
 def render_configuration_tab(st_module):
     """Render the configuration and constraints tab."""
     st_module.subheader("⚙️ Configuration")
@@ -432,23 +457,28 @@ def render_configuration_tab(st_module):
             )
             st_module.session_state._sync_main_constraints_from_config = True
             st_module.session_state._preserve_saved_constraints_from_config = True
+            _clear_configuration_widget_state(st_module.session_state)
             st_module.session_state.global_status_message = "✅ Configuration imported!"
             st_module.rerun()
 
 
 _PRESET_WIDGET_KEY_PREFIX = "preset_"
+_PRESET_SEED_KEY_PREFIX = "_preset_seed_"
 # Widget keys that share the "preset_" prefix but belong to other widgets.
 _PRESET_WIDGET_RESERVED_KEYS = {"preset_name"}
 
 
 def _prune_stale_preset_widget_state(session_state, presets) -> None:
-    """Drop preset_* widget keys whose preset no longer exists in config."""
+    """Drop preset_* widget and seed keys whose preset no longer exists in config."""
     stale_keys = [
         key
         for key in list(session_state.keys())
-        if key.startswith(_PRESET_WIDGET_KEY_PREFIX)
-        and key not in _PRESET_WIDGET_RESERVED_KEYS
-        and key[len(_PRESET_WIDGET_KEY_PREFIX) :] not in presets
+        if (
+            key.startswith(_PRESET_WIDGET_KEY_PREFIX)
+            and key not in _PRESET_WIDGET_RESERVED_KEYS
+            and key[len(_PRESET_WIDGET_KEY_PREFIX) :] not in presets
+        )
+        or (key.startswith(_PRESET_SEED_KEY_PREFIX) and key[len(_PRESET_SEED_KEY_PREFIX) :] not in presets)
     ]
     for key in stale_keys:
         del session_state[key]
@@ -486,19 +516,34 @@ def render_player_management_tab(st_module, player_manager_cls):
 
     _prune_stale_preset_widget_state(st_module.session_state, presets)
 
-    for preset_name, players in presets.items():
+    for preset_name, players in list(presets.items()):
         with st_module.expander(f"Preset: {preset_name} ({len(players)} players)"):
             col1, col2 = st_module.columns([3, 1])
 
             with col1:
+                preset_text = "\n".join(players)
+                widget_key = f"{_PRESET_WIDGET_KEY_PREFIX}{preset_name}"
+                seed_key = f"{_PRESET_SEED_KEY_PREFIX}{preset_name}"
+                # Keyed widgets ignore value= once the key exists, so if the
+                # preset was overwritten elsewhere (e.g. "Save as Preset" on
+                # the Main Scheduler tab) the textarea would keep showing -
+                # and write back - the old roster. Re-seed it when the
+                # config-side value changed since the last render.
+                if st_module.session_state.get(seed_key) != preset_text and widget_key in st_module.session_state:
+                    st_module.session_state[widget_key] = preset_text
+                st_module.session_state[seed_key] = preset_text
                 players_text = st_module.text_area(
                     f"Players in {preset_name}:",
-                    value="\n".join(players),
-                    key=f"preset_{preset_name}",
+                    value=preset_text,
+                    key=widget_key,
                 )
                 config["player_presets"][preset_name] = [p.strip() for p in players_text.split("\n") if p.strip()]
 
             with col2:
+                if st_module.button("💾 Save", key=f"save_preset_{preset_name}"):
+                    if st_module.session_state.config_manager.save_config(config):
+                        st_module.session_state.global_status_message = f"✅ Saved preset: {preset_name}"
+                        st_module.rerun()
                 if st_module.button("🗑️ Delete", key=f"delete_{preset_name}"):
                     del config["player_presets"][preset_name]
                     if st_module.session_state.config_manager.save_config(config):
@@ -555,6 +600,18 @@ def render_player_management_tab(st_module, player_manager_cls):
             st_module.info("Generate a schedule first, or add players, to rate their skill.")
 
 
+def _clear_score_widget_state(session_state, schedule_id) -> None:
+    """Drop the keyed score-entry widget state for one schedule.
+
+    Keyed widgets ignore their ``value=`` argument once the key exists in
+    session_state, so after a bulk CSV import the number_inputs would keep
+    showing their pre-import values instead of the imported scores.
+    """
+    prefixes = (f"score_team1_{schedule_id}_", f"score_team2_{schedule_id}_")
+    for state_key in [key for key in list(session_state.keys()) if key.startswith(prefixes)]:
+        del session_state[state_key]
+
+
 def render_leaderboard_tab(st_module, pd_module):
     """Render score entry for the current schedule plus the all-time win/loss leaderboard."""
     st_module.subheader("🏆 Leaderboard")
@@ -590,6 +647,11 @@ def render_leaderboard_tab(st_module, pd_module):
                 for error in result["errors"]:
                     st_module.error(error)
                 if result["applied"]:
+                    # The score number_inputs are keyed widgets, so Streamlit
+                    # would keep showing their pre-import session values and a
+                    # later "Save Scores" would overwrite the imported scores
+                    # with them. Drop the keys so they re-seed from the DB.
+                    _clear_score_widget_state(st_module.session_state, schedule_id)
                     st_module.rerun()
 
         with st_module.expander("📝 Enter scores for the current schedule", expanded=True):
@@ -608,14 +670,14 @@ def render_leaderboard_tab(st_module, pd_module):
                         team1_label,
                         min_value=0,
                         value=existing["team1_score"] if existing and existing["team1_score"] is not None else 0,
-                        key=f"score_team1_{i}",
+                        key=f"score_team1_{schedule_id}_{i}",
                     )
                 with col2:
                     team2_score = st_module.number_input(
                         team2_label,
                         min_value=0,
                         value=existing["team2_score"] if existing and existing["team2_score"] is not None else 0,
-                        key=f"score_team2_{i}",
+                        key=f"score_team2_{schedule_id}_{i}",
                     )
                 score_inputs[i] = (game, team1_score, team2_score)
 
@@ -636,21 +698,31 @@ def render_leaderboard_tab(st_module, pd_module):
         st_module.info("Generate a schedule first to enter scores for it.")
 
     st_module.markdown("### 📊 All-Time Standings")
+
+    elo_manager = st_module.session_state.get("elo_manager")
+    if elo_manager is not None:
+        if st_module.button("🔄 Recompute ELO ratings"):
+            elo_manager.recompute_from_history(history_manager)
+            st_module.rerun()
+
     leaderboard = history_manager.get_leaderboard()
     if not leaderboard:
         st_module.info("No scores recorded yet. Enter scores above to build the leaderboard.")
         return
 
-    leaderboard_data = [
-        {
-            "Player": entry["player"],
-            "Wins": entry["wins"],
-            "Losses": entry["losses"],
-            "Games Played": entry["games_played"],
-            "Win Rate": f"{entry['win_rate'] * 100:.0f}%",
-        }
-        for entry in leaderboard
-    ]
+    elo_ratings = elo_manager.load_ratings() if elo_manager is not None else {}
+
+    leaderboard_data = []
+    for entry in leaderboard:
+        row = {"Player": entry["player"]}
+        if elo_ratings:
+            row["ELO"] = round(elo_ratings.get(entry["player"], 1000))
+        row["Wins"] = entry["wins"]
+        row["Losses"] = entry["losses"]
+        row["Games Played"] = entry["games_played"]
+        row["Win Rate"] = f"{entry['win_rate'] * 100:.0f}%"
+        leaderboard_data.append(row)
+
     df = pd_module.DataFrame(leaderboard_data)
     st_module.dataframe(df, width="stretch")
 
@@ -744,7 +816,7 @@ def render_stress_test_tab(st_module, scheduler_cls, validate_schedule_integrity
         }
         for r in results
     ]
-    st_module.dataframe(pd_module.DataFrame(table_rows), use_container_width=True)
+    st_module.dataframe(pd_module.DataFrame(table_rows), width="stretch")
 
     failing_rows = [r for r in results if r["status"] != "ok"]
     if failing_rows:
