@@ -12,6 +12,11 @@ try:
 except ImportError:
     from _compat import import_module_with_fallback
 
+try:
+    from src.app_scheduler_flow import set_player_preset
+except ImportError:
+    from app_scheduler_flow import set_player_preset
+
 _app_managers = import_module_with_fallback("app_managers")
 normalize_config_constraints = _app_managers.normalize_config_constraints
 normalize_constraint_pairs = _app_managers.normalize_constraint_pairs
@@ -572,7 +577,7 @@ def render_player_management_tab(st_module, player_manager_cls):
                     del config["player_presets"][preset_name]
                     if st_module.session_state.config_manager.save_config(config):
                         if st_module.session_state.get("selected_player_preset") == preset_name:
-                            st_module.session_state.selected_player_preset = "Custom"
+                            set_player_preset(st_module.session_state, "Custom")
                         st_module.rerun()
 
     st_module.markdown("### ➕ Add New Preset")

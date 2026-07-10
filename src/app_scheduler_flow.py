@@ -21,6 +21,31 @@ logger = logging.getLogger(__name__)
 # the protected default roster in docs/summaries/PLAYER_NAMES_POLICY.md.
 SAMPLE_PLAYER_NAMES = ["Alex", "Blake", "Casey", "Drew", "Emery", "Finley", "Gray", "Harper"]
 
+# Widget key for the preset selectbox in render_main_scheduler_tab.
+PLAYER_PRESET_SELECT_KEY = "player_preset_select"
+_PENDING_PLAYER_PRESET_SELECT_KEY = "_pending_player_preset_select"
+
+
+def set_player_preset(session_state: Any, preset: str) -> None:
+    """Switch the active preset from outside the selectbox widget itself.
+
+    The selectbox is keyed (PLAYER_PRESET_SELECT_KEY) so Streamlit can track
+    the user's actual click reliably across reruns. Anything that changes
+    the preset programmatically (quick-add, quick-remove, sample players,
+    deleting the active preset) must keep that same key in sync, or the
+    keyed widget just re-asserts its own stale value on the next render and
+    silently reverts this change.
+
+    This can only ever be called from code that runs AFTER the selectbox has
+    already been instantiated this script run (a button handler further down
+    the page) - Streamlit raises if session_state[key] is written directly
+    once that widget already exists for this run. So, same as the existing
+    _pending_players_input handling below, stash it and apply it at the top
+    of the next render, before the selectbox runs.
+    """
+    session_state.selected_player_preset = preset
+    session_state[_PENDING_PLAYER_PRESET_SELECT_KEY] = preset
+
 
 def parse_players_text(players_text: str) -> list[str]:
     """Normalize textarea input into a clean player list."""
@@ -446,6 +471,10 @@ def render_main_scheduler_tab(
     if isinstance(pending_players_text, str):
         st_module.session_state.players_input = pending_players_text
 
+    pending_preset_select = st_module.session_state.pop(_PENDING_PLAYER_PRESET_SELECT_KEY, None)
+    if isinstance(pending_preset_select, str):
+        st_module.session_state[PLAYER_PRESET_SELECT_KEY] = pending_preset_select
+
     st_module.subheader("👥 Players")
 
     col1, col2 = st_module.columns([2, 1])
@@ -453,7 +482,15 @@ def render_main_scheduler_tab(
     with col1:
         previous_preset = st_module.session_state.get("selected_player_preset")
         preset_options = build_player_preset_options(st_module.session_state, config)
-        preset = st_module.selectbox("Choose preset or custom:", preset_options)
+        # build_player_preset_options reorders its list every render to put the
+        # current selection first, purely for display. Without a stable key,
+        # Streamlit can't reliably tell "the options were just reordered" apart
+        # from "this is a new widget", and falls back to the first entry -
+        # which is *last* render's selection, not what the user just clicked.
+        # A key makes Streamlit track the actual chosen value directly, so a
+        # second (or third...) preset switch keeps taking effect instead of
+        # only the first one after a fresh session.
+        preset = st_module.selectbox("Choose preset or custom:", preset_options, key=PLAYER_PRESET_SELECT_KEY)
         st_module.session_state.selected_player_preset = preset
         st_module.session_state.selected_player_preset_initialized = True
         default_players = resolve_players_text_for_preset(st_module.session_state, config, preset)
@@ -489,7 +526,7 @@ def render_main_scheduler_tab(
             updated_text = add_player_to_text(players_text, new_player)
             if updated_text != players_text:
                 st_module.session_state.custom_players = updated_text
-                st_module.session_state.selected_player_preset = "Custom"
+                set_player_preset(st_module.session_state, "Custom")
                 st_module.session_state.selected_player_preset_initialized = True
                 st_module.session_state._pending_players_input = updated_text
                 st_module.session_state._pending_clear_quick_add = True
@@ -512,7 +549,7 @@ def render_main_scheduler_tab(
                 if st_module.button(f"❌ {player}", key=f"remove_{i}"):
                     updated_text = remove_player_from_text(players_text, player)
                     st_module.session_state.custom_players = updated_text
-                    st_module.session_state.selected_player_preset = "Custom"
+                    set_player_preset(st_module.session_state, "Custom")
                     st_module.session_state.selected_player_preset_initialized = True
                     st_module.session_state._pending_players_input = updated_text
                     st_module.rerun()
@@ -522,7 +559,7 @@ def render_main_scheduler_tab(
         if st_module.button("✨ Try with 8 sample players"):
             sample_players_text = "\n".join(SAMPLE_PLAYER_NAMES)
             st_module.session_state.custom_players = sample_players_text
-            st_module.session_state.selected_player_preset = "Custom"
+            set_player_preset(st_module.session_state, "Custom")
             st_module.session_state.selected_player_preset_initialized = True
             st_module.session_state._pending_players_input = sample_players_text
             st_module.rerun()
