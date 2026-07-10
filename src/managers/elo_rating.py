@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import json
-import logging
 from pathlib import Path
 from typing import Dict
 
@@ -14,13 +12,11 @@ except ImportError:
     from _compat import import_module_with_fallback
 
 try:
-    from src.managers._paths import _resolve_storage_path
+    from src.managers._paths import _resolve_storage_path, load_json_value, save_json
 except ImportError:
-    from managers._paths import _resolve_storage_path
+    from managers._paths import _resolve_storage_path, load_json_value, save_json
 
 _rating_elo = import_module_with_fallback("rating_elo")
-
-logger = logging.getLogger(__name__)
 
 
 class EloRatingManager:
@@ -45,31 +41,16 @@ class EloRatingManager:
 
     def load_ratings(self) -> Dict[str, float]:
         """Return {player_name: rating}. Missing/corrupted file yields an empty dict."""
-        try:
-            if self.ratings_path.exists():
-                with open(self.ratings_path, "r", encoding="utf-8") as f:
-                    ratings = json.load(f)
-                if isinstance(ratings, dict):
-                    return {
-                        str(player): float(rating)
-                        for player, rating in ratings.items()
-                        if isinstance(rating, (int, float)) and not isinstance(rating, bool)
-                    }
-            return {}
-        except Exception:
-            logger.exception("Failed to load ELO ratings")
-            return {}
+        raw = load_json_value(self.ratings_path, dict, {}, "ELO ratings")
+        return {
+            str(player): float(rating)
+            for player, rating in raw.items()
+            if isinstance(rating, (int, float)) and not isinstance(rating, bool)
+        }
 
     def save_ratings(self, ratings: Dict[str, float]) -> bool:
         """Persist the full ratings dict, overwriting whatever was there before."""
-        try:
-            self.ratings_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.ratings_path, "w", encoding="utf-8") as f:
-                json.dump(ratings, f, indent=2)
-            return True
-        except Exception:
-            logger.exception("Failed to save ELO ratings")
-            return False
+        return save_json(self.ratings_path, ratings, "ELO ratings")
 
     def recompute_from_history(self, history_manager) -> Dict[str, float]:
         """Replay every recorded score (oldest first) and persist the result.

@@ -54,6 +54,17 @@ def count_avoidable_duplicate_rounds(
     return max(0, duplicate_rounds - minimum_duplicate_rounds)
 
 
+def avoidable_duplicate_rounds_from_signature(
+    signature: Sequence[object],
+    minimum_duplicate_rounds: int,
+) -> int:
+    """Same arithmetic as count_avoidable_duplicate_rounds, but for a
+    signature sequence already computed per round (e.g. via a cache), rather
+    than a raw schedule that still needs signatures computed from scratch."""
+    duplicate_rounds = len(signature) - len(set(signature))
+    return max(0, duplicate_rounds - minimum_duplicate_rounds)
+
+
 def precompute_arrangement_stats(
     arrangements: Sequence[Sequence[GameTuple]],
     *,

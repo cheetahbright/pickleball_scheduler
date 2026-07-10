@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Dict, List
 
 import streamlit as st
+
+try:
+    from src.managers._paths import load_json_value, save_json
+except ImportError:
+    from managers._paths import load_json_value, save_json
 
 
 def validate_player_names(player_names: List[str]) -> bool:
@@ -81,42 +85,19 @@ class PlayerManager:
 
         return first_half, second_half, sub_round
 
-    @staticmethod
-    def apply_availability_constraints(players: List[str], constraints: Dict) -> List[str]:
-        """Apply availability constraints to a player list."""
-        available_players = []
-        unavailable = constraints.get("unavailable_players", [])
-
-        for player in players:
-            if player not in unavailable:
-                available_players.append(player)
-
-        return available_players
-
     @classmethod
     def load_player_data(cls) -> List[str]:
         """Load persisted player defaults for compatibility with older callers."""
-        try:
-            if cls.player_data_path.exists():
-                with open(cls.player_data_path, "r", encoding="utf-8") as file_handle:
-                    data = json.load(file_handle)
-                if isinstance(data, list):
-                    return [str(player) for player in data if str(player).strip()]
-        except Exception:
-            pass
-        return []
+        data = load_json_value(cls.player_data_path, list, [], "player defaults")
+        return [str(player) for player in data if str(player).strip()]
 
     @classmethod
     def save_player_data(cls, players: List[str]) -> Dict[str, Any]:
         """Persist player defaults and return a small operation summary."""
-        try:
-            cleaned_players = [player.strip() for player in players if player and player.strip()]
-            cls.player_data_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(cls.player_data_path, "w", encoding="utf-8") as file_handle:
-                json.dump(cleaned_players, file_handle, indent=2)
+        cleaned_players = [player.strip() for player in players if player and player.strip()]
+        if save_json(cls.player_data_path, cleaned_players, "player defaults"):
             return {"success": True, "count": len(cleaned_players)}
-        except Exception as exc:
-            return {"success": False, "error": str(exc), "count": 0}
+        return {"success": False, "error": "failed to write player defaults file", "count": 0}
 
     @staticmethod
     def validate_player_list(players: List[str]) -> bool:

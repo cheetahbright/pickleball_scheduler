@@ -110,21 +110,6 @@ class ScheduleAnalytics:
         )
 
     @staticmethod
-    def compute_fairness_metrics(
-        schedule: List[Dict],
-        num_players: Optional[int] = None,
-        num_rounds: Optional[int] = None,
-        num_courts: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Backward-compatible alias for older tests and scripts."""
-        return ScheduleAnalytics.calculate_fairness_metrics(
-            schedule,
-            num_players=num_players,
-            num_rounds=num_rounds,
-            num_courts=num_courts,
-        )
-
-    @staticmethod
     def create_fairness_visualization(metrics: Dict[str, Any]):
         """Create plotly visualization of fairness metrics"""
         return _create_fairness_visualization(metrics, HAS_PLOTLY, go)
@@ -143,39 +128,6 @@ class ScheduleAnalytics:
     def create_pairing_heatmap(matrix: List[List[int]], players: List[str], title: str):
         """Create a plotly heatmap for a partner/opponent count matrix."""
         return _create_pairing_heatmap(matrix, players, title, HAS_PLOTLY, go)
-
-    @staticmethod
-    def generate_radar_chart_data(metrics: Dict[str, Any]) -> Dict[str, List[Any]]:
-        """Return a simple radar-chart payload for compatibility helpers."""
-        categories = [
-            "Games",
-            "Partners",
-            "Opponents",
-            "Courts",
-        ]
-        variance_keys = [
-            ("games_balance", "games_variance"),
-            ("partners_balance", "partners_variance"),
-            ("opponents_balance", "opponents_variance"),
-            ("courts_balance", "courts_variance"),
-        ]
-        values: List[float] = []
-
-        for nested_key, flat_key in variance_keys:
-            variance = 1.0
-            nested_metric = metrics.get(nested_key)
-            if isinstance(nested_metric, dict):
-                raw_variance = nested_metric.get("variance", 1.0)
-                if isinstance(raw_variance, (int, float)):
-                    variance = float(raw_variance)
-            else:
-                raw_variance = metrics.get(flat_key, 1.0)
-                if isinstance(raw_variance, (int, float)):
-                    variance = float(raw_variance)
-
-            values.append(max(0.0, 1.0 - variance))
-
-        return {"categories": categories, "values": values}
 
 
 def enhanced_scheduler_page():

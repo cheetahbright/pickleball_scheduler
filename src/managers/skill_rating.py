@@ -3,17 +3,13 @@
 
 from __future__ import annotations
 
-import json
-import logging
 from pathlib import Path
 from typing import Dict
 
 try:
-    from src.managers._paths import _resolve_storage_path
+    from src.managers._paths import _resolve_storage_path, load_json_value, save_json
 except ImportError:
-    from managers._paths import _resolve_storage_path
-
-logger = logging.getLogger(__name__)
+    from managers._paths import _resolve_storage_path, load_json_value, save_json
 
 
 class SkillRatingManager:
@@ -37,31 +33,16 @@ class SkillRatingManager:
 
     def load_skills(self) -> Dict[str, int]:
         """Return {player_name: rating}. Missing/corrupted file yields an empty dict."""
-        try:
-            if self.skills_path.exists():
-                with open(self.skills_path, "r", encoding="utf-8") as f:
-                    skills = json.load(f)
-                if isinstance(skills, dict):
-                    return {
-                        str(player): rating
-                        for player, rating in skills.items()
-                        if isinstance(rating, int) and self.MIN_RATING <= rating <= self.MAX_RATING
-                    }
-            return {}
-        except Exception:
-            logger.exception("Failed to load player skills")
-            return {}
+        raw = load_json_value(self.skills_path, dict, {}, "player skills")
+        return {
+            str(player): rating
+            for player, rating in raw.items()
+            if isinstance(rating, int) and self.MIN_RATING <= rating <= self.MAX_RATING
+        }
 
     def save_skills(self, skills: Dict[str, int]) -> bool:
         """Persist the full skills dict, overwriting whatever was there before."""
-        try:
-            self.skills_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.skills_path, "w", encoding="utf-8") as f:
-                json.dump(skills, f, indent=2)
-            return True
-        except Exception:
-            logger.exception("Failed to save player skills")
-            return False
+        return save_json(self.skills_path, skills, "player skills")
 
     def set_skill(self, player: str, rating: int) -> bool:
         """Set one player's rating and persist immediately."""

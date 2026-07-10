@@ -6,7 +6,7 @@ Shared by all algorithm implementations for consistency.
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple, runtime_checkable
+from typing import Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple, runtime_checkable
 
 import numpy as np
 
@@ -327,18 +327,6 @@ class ObjectiveCalculator:
 
         return total
 
-    @staticmethod
-    def repair_availability(
-        schedule: List[List[Dict[str, Any]]], problem: SchedulingProblem
-    ) -> List[List[Dict[str, Any]]]:
-        """Compatibility wrapper for older callers/tests."""
-        return ScheduleRepair.repair_availability(schedule, problem)
-
-    @staticmethod
-    def repair_duplicates(schedule: List[List[Dict[str, Any]]]) -> List[List[Dict[str, Any]]]:
-        """Compatibility wrapper for older callers/tests."""
-        return ScheduleRepair.repair_duplicates(schedule)
-
 
 class ScheduleRepair:
     """Shared schedule repair operators."""
@@ -362,54 +350,3 @@ class ScheduleRepair:
             round_signatures.add(round_signature)
 
         return False
-
-    @staticmethod
-    def eliminate_duplicate_rounds(schedule: Sequence[object]) -> List[object]:
-        """AGGRESSIVELY eliminate ALL duplicate rounds - NEVER ALLOW DUPLICATES"""
-        if not schedule:
-            return list(schedule)
-
-        seen_signatures: set[frozenset[Tuple[Tuple[str, ...], Tuple[str, ...]]]] = set()
-        unique_schedule: List[object] = []
-
-        for round_data in schedule:
-            round_games = _extract_round_games(round_data)
-            if not round_games:
-                continue
-
-            round_signature = _build_round_signature(round_games)
-
-            # Only add if not duplicate
-            if round_signature not in seen_signatures:
-                unique_schedule.append(round_data)
-                seen_signatures.add(round_signature)
-
-        return unique_schedule
-
-    @staticmethod
-    def repair_availability(schedule: List[List[Dict]], problem: SchedulingProblem) -> List[List[Dict]]:
-        """Repair availability violations by swapping players."""
-        # Implementation would swap unavailable players with available ones
-        # For now, return as-is (to be implemented)
-        return schedule
-
-    @staticmethod
-    def repair_duplicates(schedule: List[List[Dict]]) -> List[List[Dict]]:
-        """Remove duplicate player assignments in same round."""
-        for round_games in schedule:
-            players_in_round = set()
-            for game in round_games:
-                team1 = game.get("team1", [])
-                team2 = game.get("team2", [])
-
-                # Remove duplicates
-                new_team1 = [p for p in team1 if p not in players_in_round]
-                new_team2 = [p for p in team2 if p not in players_in_round]
-
-                game["team1"] = new_team1
-                game["team2"] = new_team2
-
-                players_in_round.update(new_team1)
-                players_in_round.update(new_team2)
-
-        return schedule

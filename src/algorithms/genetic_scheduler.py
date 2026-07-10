@@ -33,6 +33,7 @@ except ImportError:
 
 try:
     from src.algorithms.scheduler_metrics import (
+        avoidable_duplicate_rounds_from_signature,
         count_avoidable_duplicate_rounds,
         count_duplicate_rounds,
         evaluate_metrics_from_arrangement_stats,
@@ -42,6 +43,7 @@ try:
     )
 except ImportError:
     from algorithms.scheduler_metrics import (
+        avoidable_duplicate_rounds_from_signature,
         count_avoidable_duplicate_rounds,
         count_duplicate_rounds,
         evaluate_metrics_from_arrangement_stats,
@@ -53,14 +55,12 @@ except ImportError:
 try:
     from src.algorithms.scheduler_repairs import (
         apply_targeted_repairs,
-        repair_invalid_schedule,
         repair_opponent_imbalance,
         repair_partner_imbalance,
     )
 except ImportError:
     from algorithms.scheduler_repairs import (
         apply_targeted_repairs,
-        repair_invalid_schedule,
         repair_opponent_imbalance,
         repair_partner_imbalance,
     )
@@ -339,7 +339,6 @@ class GeneticPickleballScheduler:
         if not hasattr(self, "convergence_patience"):
             self.convergence_patience: int = 60
         self.time_budget: float = float(self.max_runtime)
-        self.substitution_info: Dict[str, Any] | None = None
 
     # ---------------- Public API ----------------
     def add_constraints(
@@ -388,9 +387,6 @@ class GeneticPickleballScheduler:
                 a, b = str(a), str(b)
                 self.must_oppose_map[a].add(b)
                 self.must_oppose_map[b].add(a)
-
-    def set_substitution_info(self, info: Dict[str, Any] | None) -> None:
-        self.substitution_info = info
 
     def _minimum_runtime_before_general_stop(self) -> float:
         """Return the minimum runtime before non-perfect early exits are allowed."""
@@ -759,10 +755,7 @@ class GeneticPickleballScheduler:
 
         # Use optimized duplicate detection with caching
         signature = self._get_duplicate_signature_cached(individual, [])
-        unique_rounds = len(set(signature))
-        total_rounds = len(signature)
-        duplicate_rounds = total_rounds - unique_rounds
-        avoidable_duplicate_rounds = max(0, duplicate_rounds - self.minimum_duplicate_rounds)
+        avoidable_duplicate_rounds = avoidable_duplicate_rounds_from_signature(signature, self.minimum_duplicate_rounds)
 
         # MASSIVE penalty only for duplicate rounds beyond what the configuration forces.
         duplicate_penalty += avoidable_duplicate_rounds * 1000000000  # 1 BILLION per avoidable duplicate
@@ -808,14 +801,6 @@ class GeneticPickleballScheduler:
         """Decode individual to schedule."""
         schedule = [self.arrangements[idx] for idx in individual]
         return schedule
-
-    def _repair_invalid_schedule(
-        self,
-        schedule: List[List[Tuple[str, str, str, str]]],
-        problematic_round_idx: int,
-    ) -> List[List[Tuple[str, str, str, str]]]:
-        """Repair an invalid schedule by replacing problematic rounds."""
-        return repair_invalid_schedule(schedule, problematic_round_idx, self.arrangements, print)
 
     def _evaluate_metrics(
         self, schedule: List[List[Tuple[str, str, str, str]]] | List[Dict[str, Any]]

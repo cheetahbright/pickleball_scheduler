@@ -18,6 +18,11 @@ import os
 import random
 from typing import Callable, List, Tuple
 
+try:
+    from src.algorithms.scheduler_metrics import avoidable_duplicate_rounds_from_signature
+except ImportError:
+    from algorithms.scheduler_metrics import avoidable_duplicate_rounds_from_signature
+
 Individual = Tuple[int, ...]
 
 
@@ -397,8 +402,8 @@ def run_evolution_loop(
             schedule = scheduler._decode_cached(best_individual)
             metrics = scheduler._evaluate_metrics_cached(schedule, best_individual)
             signature = scheduler._get_duplicate_signature_cached(best_individual, schedule)
-            avoidable_duplicate_rounds = max(
-                0, (len(signature) - len(set(signature))) - scheduler.minimum_duplicate_rounds
+            avoidable_duplicate_rounds = avoidable_duplicate_rounds_from_signature(
+                signature, scheduler.minimum_duplicate_rounds
             )
             current_ranges = {
                 "games": metrics["games_range"],
@@ -520,8 +525,8 @@ def run_evolution_loop(
             schedule = scheduler._decode_cached(best_individual)
             metrics = scheduler._evaluate_metrics_cached(schedule, best_individual)
             signature = scheduler._get_duplicate_signature_cached(best_individual, schedule)
-            avoidable_duplicate_rounds = max(
-                0, (len(signature) - len(set(signature))) - scheduler.minimum_duplicate_rounds
+            avoidable_duplicate_rounds = avoidable_duplicate_rounds_from_signature(
+                signature, scheduler.minimum_duplicate_rounds
             )
             total_range = sum(
                 [

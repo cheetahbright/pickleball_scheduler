@@ -197,6 +197,26 @@ def render_history_tab(st_module, pd_module, json_module):
                             st_module.session_state.global_status_message = "↩️ Schedule restored."
                             st_module.rerun()
 
+            st_module.markdown("---")
+            st_module.caption("Permanently remove deletions older than this many days. This cannot be undone.")
+            purge_col1, purge_col2 = st_module.columns([2, 1])
+            with purge_col1:
+                purge_days = st_module.number_input(
+                    "Purge deletions older than (days):",
+                    min_value=1,
+                    max_value=365,
+                    value=30,
+                    key="purge_older_than_days",
+                )
+            with purge_col2:
+                st_module.markdown("&nbsp;")
+                if st_module.button("🧹 Purge Now"):
+                    purged_count = history_manager.purge_deleted(older_than_days=purge_days)
+                    st_module.session_state.global_status_message = (
+                        f"🧹 Purged {purged_count} deletion(s) older than {purge_days} days."
+                    )
+                    st_module.rerun()
+
     st_module.markdown("### 🤝 Weekly Partner History")
     partner_history = history_manager.get_weekly_partners()
 
