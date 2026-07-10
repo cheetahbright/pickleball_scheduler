@@ -65,15 +65,24 @@ def load_schedule_and_players_from_history_entry(entry: dict[str, Any], json_mod
     return schedule_data, players
 
 
-def _selected_history_row_index(selection_event) -> int | None:
-    """Extract the selected row index from a st.dataframe selection event, if any."""
+def _selected_history_row_index(selection_event, row_count: int) -> int | None:
+    """Extract the selected row index from a st.dataframe selection event, if any.
+
+    The selection is tied to the dataframe's persistent widget key, while
+    ``recent`` is recomputed fresh every run - a delete (or any action that
+    shrinks the list) can leave a stale positional index pointing past the
+    end of the new list.
+    """
     try:
         rows = selection_event.selection.rows
     except AttributeError:
         return None
     if not rows:
         return None
-    return rows[0]
+    row_index = rows[0]
+    if row_index >= row_count:
+        return None
+    return row_index
 
 
 def render_history_tab(st_module, pd_module, json_module):
@@ -106,7 +115,7 @@ def render_history_tab(st_module, pd_module, json_module):
             selection_mode="single-row",
             key="history_table",
         )
-        selected_index = _selected_history_row_index(selection_event)
+        selected_index = _selected_history_row_index(selection_event, len(recent))
         selected_entry = recent[selected_index] if selected_index is not None else None
 
         col1, col2 = st_module.columns(2)
@@ -328,16 +337,17 @@ def _render_skill_balance(st_module, pd_module, schedule):
 
 
 def _clear_configuration_widget_state(session_state) -> None:
-    """Drop keyed Configuration-tab widget state so widgets re-seed from config.
+    """Drop keyed weight-slider widget state so sliders re-seed from config.
 
     Keyed widgets ignore their ``value=`` argument once the key exists in
-    session_state, so after importing a config the constraint textareas and
-    weight sliders would keep showing the old values - and this tab writes
-    the displayed values straight back into the config, silently reverting
-    the import.
+    session_state, so after importing a config the weight sliders would keep
+    showing the old values - and this tab writes the displayed values
+    straight back into the config, silently reverting the import. (The
+    do_not_pair_input/do_not_oppose_input textareas handle this themselves
+    via a seed fingerprint, since they can also go stale outside of import -
+    see the "_do_not_pair_seed" check in render_configuration_tab.)
     """
-    stale_keys = ["do_not_pair_input", "do_not_oppose_input"]
-    stale_keys.extend(key for key in list(session_state.keys()) if key.startswith("weight_"))
+    stale_keys = [key for key in list(session_state.keys()) if key.startswith("weight_")]
     for state_key in stale_keys:
         session_state.pop(state_key, None)
 
@@ -377,9 +387,19 @@ def render_configuration_tab(st_module):
 
     with col1:
         st_module.markdown("**Do Not Pair Together**")
+        do_not_pair_text = serialize_constraint_pairs(config["constraints"].get("do_not_pair", []))
+        # st.tabs() runs every tab's body on every rerun, not just the visible
+        # one - so once this keyed widget exists, it ignores value= even when
+        # do_not_pair changed elsewhere (Main Scheduler quick-add, a loaded
+        # history entry). Re-seed it when the config-side value has changed
+        # since the last render; otherwise this tab's own write-back below
+        # keeps the seed in lockstep with in-progress typed edits.
+        if st_module.session_state.get("_do_not_pair_seed") != do_not_pair_text:
+            st_module.session_state.do_not_pair_input = do_not_pair_text
+        st_module.session_state._do_not_pair_seed = do_not_pair_text
         do_not_pair = st_module.text_area(
             "Players who should not be paired (format: Player1,Player2):",
-            value=serialize_constraint_pairs(config["constraints"].get("do_not_pair", [])),
+            value=do_not_pair_text,
             height=100,
             key="do_not_pair_input",
         )
@@ -387,9 +407,13 @@ def render_configuration_tab(st_module):
 
     with col2:
         st_module.markdown("**Do Not Oppose Each Other**")
+        do_not_oppose_text = serialize_constraint_pairs(config["constraints"].get("do_not_oppose", []))
+        if st_module.session_state.get("_do_not_oppose_seed") != do_not_oppose_text:
+            st_module.session_state.do_not_oppose_input = do_not_oppose_text
+        st_module.session_state._do_not_oppose_seed = do_not_oppose_text
         do_not_oppose = st_module.text_area(
             "Players who should not oppose each other (format: Player1,Player2):",
-            value=serialize_constraint_pairs(config["constraints"].get("do_not_oppose", [])),
+            value=do_not_oppose_text,
             height=100,
             key="do_not_oppose_input",
         )

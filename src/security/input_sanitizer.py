@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any
 
 
 class SecurityError(ValueError):
@@ -32,19 +30,3 @@ class InputSanitizer:
             return str(resolved_target)
 
         return str(resolved_path.resolve())
-
-
-class SecureJSONLoader:
-    """Compatibility JSON loader with lightweight validation."""
-
-    @staticmethod
-    def safe_load(file_path: str) -> Any:
-        sanitized_path = InputSanitizer.sanitize_file_path(file_path)
-        with open(sanitized_path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
-
-    @staticmethod
-    def safe_loads(content: str) -> Any:
-        if not isinstance(content, str):
-            raise SecurityError("JSON content must be a string")
-        return json.loads(content)
