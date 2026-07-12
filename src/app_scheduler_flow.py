@@ -137,7 +137,12 @@ def build_feasibility_notes(num_players: int, num_courts: int, num_rounds: int) 
         candidate = num_players + delta
         if candidate < 4:
             continue
-        candidate_feasibility = ScheduleFeasibilityAnalyzer.calculate_theoretical_minimums(candidate, None, num_rounds)
+        # Courts are the user's fixed physical resource, not something that
+        # scales with the candidate player count - a suggestion is only
+        # useful if it's achievable with the courts actually available.
+        candidate_feasibility = ScheduleFeasibilityAnalyzer.calculate_theoretical_minimums(
+            candidate, num_courts, num_rounds
+        )
         if candidate_feasibility["range_0_possible"]:
             better_counts.append(candidate)
 
@@ -193,7 +198,10 @@ def constraint_pressure_warnings(
         if second in constrained_counts:
             constrained_counts[second] += 1
 
-    threshold = max(1, (total_players - 1) // 2)
+    # Floor of 2 (not 1) so a single, completely ordinary constraint doesn't
+    # trigger this at the smallest supported group sizes (4-6 players),
+    # where (total_players - 1) // 2 would otherwise degenerate to 1.
+    threshold = max(2, (total_players - 1) // 2)
     for player, count in constrained_counts.items():
         if count >= threshold:
             warnings.append(
@@ -488,15 +496,14 @@ def _handle_generate_schedule_click(
     scheduler_cls,
     schedule_analytics_cls,
     validate_schedule_integrity_fn,
-) -> bool:
-    """Handle the "Generate Enhanced Schedule" button: build the scheduler,
+) -> None:
+    """Handle the "Generate Schedule" button: build the scheduler,
     generate and validate a schedule, and persist it to session_state/history.
 
-    Returns True if the caller should skip rendering the persistent schedule
-    view this run (mirrors this code's original early `return` on a
-    no-schedule or invalid-schedule result); False otherwise, including when
-    generation raises - the caller falls through to the persistent view then,
-    exactly as it did before this was extracted.
+    The caller always falls through to rendering the persistent schedule
+    view afterward, on every outcome (success, no schedule returned, an
+    invalid schedule, or an exception) - a failed attempt must never hide a
+    schedule already on screen from a previous successful generation.
     """
     with st_module.status("Generating schedule...", expanded=True) as status_box:
         progress_bar = st_module.progress(0)
@@ -564,7 +571,7 @@ def _handle_generate_schedule_click(
                 )
                 st_module.error("❌ Could not generate schedule. Try adjusting parameters.")
                 status_box.update(label="❌ Generation failed", state="error")
-                return True
+                return
 
             schedule_data = result["schedule"]
             schedule_errors = validate_schedule_integrity_fn(schedule_data, players)
@@ -582,11 +589,11 @@ def _handle_generate_schedule_click(
                 st_module.error("**🛑 This indicates serious bugs in the scheduling algorithm!**")
                 st_module.info("Please report this bug with the exact player configuration.")
                 status_box.update(label="❌ Invalid schedule generated", state="error")
-                return True
+                return
 
             progress_bar.progress(1.0)
             status_box.update(label="✅ Done", state="complete")
-            st_module.success("✅ Enhanced schedule generated!")
+            st_module.success("✅ Schedule generated!")
 
             metrics = schedule_analytics_cls.calculate_fairness_metrics(
                 schedule_data,
@@ -644,8 +651,6 @@ def _handle_generate_schedule_click(
             logger.exception("Generation end: status=exception elapsed=%.1fs", _time.time() - generation_started_at)
             st_module.error("❌ Schedule generation failed unexpectedly. See the server logs for details.")
             status_box.update(label="❌ Generation error", state="error")
-
-    return False
 
 
 def render_main_scheduler_tab(
@@ -708,24 +713,32 @@ def render_main_scheduler_tab(
         new_player = st_module.text_input("Quick add player:", key=QUICK_ADD_KEY)
         preset_name = st_module.text_input("Preset name:", key="preset_name")
 
-        if st_module.button("➕ Add Player") and new_player:
-            updated_text = add_player_to_text(players_text, new_player)
-            if updated_text != players_text:
-                st_module.session_state.custom_players = updated_text
-                set_player_preset(st_module.session_state, "Custom")
-                st_module.session_state.selected_player_preset_initialized = True
-                defer_widget_value(st_module.session_state, PLAYERS_INPUT_KEY, updated_text)
-                defer_widget_value(st_module.session_state, QUICK_ADD_KEY, "")
-                st_module.rerun()
+        if st_module.button("➕ Add Player"):
+            if not new_player:
+                st_module.warning("⚠️ Type a player name first.")
+            else:
+                updated_text = add_player_to_text(players_text, new_player)
+                if updated_text != players_text:
+                    st_module.session_state.custom_players = updated_text
+                    set_player_preset(st_module.session_state, "Custom")
+                    st_module.session_state.selected_player_preset_initialized = True
+                    defer_widget_value(st_module.session_state, PLAYERS_INPUT_KEY, updated_text)
+                    defer_widget_value(st_module.session_state, QUICK_ADD_KEY, "")
+                    st_module.rerun()
 
-        if st_module.button("💾 Save as Preset") and preset_name.strip():
-            preset_players = parse_players_text(players_text)
-            if preset_players:
-                config["player_presets"][preset_name.strip()] = preset_players
-                if st_module.session_state.config_manager.save_config(config):
-                    st_module.success(f"Saved preset: {preset_name.strip()}")
+        if st_module.button("💾 Save as Preset"):
+            if not preset_name.strip():
+                st_module.warning("⚠️ Type a preset name first.")
+            else:
+                preset_players = parse_players_text(players_text)
+                if not preset_players:
+                    st_module.warning("⚠️ Add at least one player before saving a preset.")
                 else:
-                    st_module.error(f"❌ Failed to save preset: {preset_name.strip()}")
+                    config["player_presets"][preset_name.strip()] = preset_players
+                    if st_module.session_state.config_manager.save_config(config):
+                        st_module.success(f"Saved preset: {preset_name.strip()}")
+                    else:
+                        st_module.error(f"❌ Failed to save preset: {preset_name.strip()}")
 
     players = parse_players_text(players_text)
 
@@ -816,7 +829,15 @@ def render_main_scheduler_tab(
         with quick_col1:
             quick_player_a = st_module.selectbox("Player A", options=players, key="quick_constraint_player_a")
         with quick_col2:
-            quick_player_b = st_module.selectbox("Player B", options=players, key="quick_constraint_player_b")
+            # Default to a different player than Player A's default (index 0)
+            # so the two dropdowns don't start identical, guaranteeing a
+            # "same player twice" rejection on first use.
+            quick_player_b = st_module.selectbox(
+                "Player B",
+                options=players,
+                index=1 if len(players) > 1 else 0,
+                key="quick_constraint_player_b",
+            )
         with quick_col3:
             quick_constraint_type = st_module.selectbox(
                 "Constraint",
@@ -878,8 +899,15 @@ def render_main_scheduler_tab(
             ),
         )
 
-    with st_module.expander("📐 Expected quality for this configuration"):
-        for note in build_feasibility_notes(len(players), courts, num_rounds):
+    feasibility_notes = build_feasibility_notes(len(players), courts, num_rounds)
+    # build_feasibility_notes exists specifically so a user isn't surprised
+    # after waiting up to the full max-time budget for a result that was
+    # never going to reach range 0 - defeats the purpose if the one note
+    # that matters is hidden behind a collapsed, neutrally-labeled expander
+    # by default. Auto-expand only when there's actually a warning to see.
+    has_feasibility_warning = any(note.startswith("⚠️") for note in feasibility_notes)
+    with st_module.expander("📐 Expected quality for this configuration", expanded=has_feasibility_warning):
+        for note in feasibility_notes:
             st_module.write(note)
 
     for warning_text in constraint_pressure_warnings(
@@ -903,8 +931,15 @@ def render_main_scheduler_tab(
         except ValueError:
             st_module.warning("Seed must be a whole number - ignoring it for this run.")
 
-    if st_module.button("🎯 Generate Enhanced Schedule", type="primary"):
-        skip_persistent_render = _handle_generate_schedule_click(
+    if st_module.session_state.get("current_schedule"):
+        st_module.caption(
+            "ℹ️ You already have a schedule below. Generating again replaces it entirely, "
+            "including any rounds already played - use 'Mid-session replan' instead if you just "
+            "want to adjust the remaining rounds."
+        )
+
+    if st_module.button("🎯 Generate Schedule", type="primary"):
+        _handle_generate_schedule_click(
             st_module,
             config,
             players,
@@ -916,8 +951,6 @@ def render_main_scheduler_tab(
             schedule_analytics_cls,
             validate_schedule_integrity_fn,
         )
-        if skip_persistent_render:
-            return
 
     _render_persistent_schedule(
         st_module,
@@ -925,6 +958,7 @@ def render_main_scheduler_tab(
         json_module,
         scheduler_cls,
         schedule_analytics_cls,
+        validate_schedule_integrity_fn,
         display_enhanced_schedule_fn,
         schedule_to_csv_fn,
         config,
@@ -937,6 +971,7 @@ def _render_persistent_schedule(
     json_module,
     scheduler_cls,
     schedule_analytics_cls,
+    validate_schedule_integrity_fn,
     display_enhanced_schedule_fn,
     schedule_to_csv_fn,
     config,
@@ -966,16 +1001,20 @@ def _render_persistent_schedule(
 
     display_enhanced_schedule_fn(schedule_data, players, round_times=round_times)
 
-    _render_download_buttons(
-        st_module,
-        datetime_cls,
-        json_module,
-        schedule_analytics_cls,
-        schedule_data,
-        players,
-        round_times,
-        schedule_to_csv_fn,
-    )
+    # display_enhanced_schedule_fn already showed the critical-error banner
+    # above for an invalid schedule - exports must not offer to download
+    # something the app has just told the user not to use.
+    if not validate_schedule_integrity_fn(schedule_data, players):
+        _render_download_buttons(
+            st_module,
+            datetime_cls,
+            json_module,
+            schedule_analytics_cls,
+            schedule_data,
+            players,
+            round_times,
+            schedule_to_csv_fn,
+        )
 
     _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players, config)
 

@@ -36,44 +36,21 @@ def calculate_fairness_metrics(
     )
 
 
-def create_fairness_visualization(metrics: Dict[str, Any], has_plotly: bool, go_module):
-    """Create the radar-chart fairness visualization."""
-    if not has_plotly or go_module is None or not metrics:
-        return None
-
-    categories = [
-        "Games Range",
-        "Partners Range",
-        "Opponents Range",
-        "Courts Range",
-    ]
-    values = [
-        10 - metrics.get("games_range", 0),
-        10 - metrics.get("partners_range", 0),
-        10 - metrics.get("opponents_range", 0),
-        10 - metrics.get("courts_range", 0),
-    ]
-
-    fig = go_module.Figure(
-        data=go_module.Scatterpolar(r=values, theta=categories, fill="toself", name="Fairness Score")
-    )
-
-    fig.update_layout(
-        polar=dict(radialaxis=dict(visible=True, range=[0, 10])),
-        showlegend=True,
-        title="Schedule Fairness Analysis",
-    )
-
-    return fig
-
-
 def build_pairing_matrices(schedule: List[Dict], players: List[str]):
     """Return (partner_counts, opponent_counts) NxN matrices using the shared core implementation."""
     return _build_pairing_matrices(schedule, players)
 
 
 def create_pairing_heatmap(matrix: List[List[int]], players: List[str], title: str, has_plotly: bool, go_module):
-    """Create a plotly heatmap for a partner/opponent count matrix."""
+    """Create a plotly heatmap for a partner/opponent count matrix.
+
+    Cell-count labels are drawn as per-cell annotations (rather than the
+    Heatmap trace's own text, whose textfont color is a single global value)
+    so each label can switch between white and black based on that cell's
+    own value - a fixed color choice reads fine against the light end of the
+    "Blues" colorscale but goes low-contrast on the darkest, highest-count
+    cells, or vice versa.
+    """
     if not has_plotly or go_module is None or not players:
         return None
 
@@ -83,12 +60,25 @@ def create_pairing_heatmap(matrix: List[List[int]], players: List[str], title: s
             x=players,
             y=players,
             colorscale="Blues",
-            text=matrix,
-            texttemplate="%{text}",
             hovertemplate="%{y} & %{x}: %{z}<extra></extra>",
         )
     )
-    fig.update_layout(title=title, xaxis_title="Player", yaxis_title="Player")
+
+    flat_values = [value for row in matrix for value in row]
+    threshold = (max(flat_values) if flat_values else 0) / 2
+    annotations = [
+        go_module.layout.Annotation(
+            x=players[col],
+            y=players[row],
+            text=str(value),
+            showarrow=False,
+            font={"color": "white" if value > threshold else "black"},
+        )
+        for row, row_values in enumerate(matrix)
+        for col, value in enumerate(row_values)
+    ]
+
+    fig.update_layout(title=title, xaxis_title="Player", yaxis_title="Player", annotations=annotations)
     return fig
 
 

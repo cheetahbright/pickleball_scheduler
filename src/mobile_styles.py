@@ -32,6 +32,19 @@ MOBILE_CSS = f"""
         font-size: 1rem;
     }}
 
+    /* Sliders' default thumb is far smaller than a comfortable 44px tap
+       target - the weight and skill-rating sliders are otherwise unusable
+       with a fingertip. Padding widens the actual hit-area beyond just the
+       visible thumb. */
+    .stSlider {{
+        padding-top: 12px;
+        padding-bottom: 12px;
+    }}
+    .stSlider [role="slider"] {{
+        width: 24px;
+        height: 24px;
+    }}
+
     /* Wide tables/dataframes must scroll horizontally instead of forcing
        the whole page to overflow sideways. */
     .stDataFrame, .stTable {{

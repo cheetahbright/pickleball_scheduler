@@ -169,6 +169,10 @@ def render_history_tab(st_module, pd_module, json_module):
                 if history_manager.delete_schedule(selected_entry["id"]):
                     st_module.session_state.last_deleted_id = selected_entry["id"]
                     st_module.session_state.global_status_message = "🗑️ Schedule deleted."
+                    # The dataframe's row selection is a positional index into
+                    # `recent`, which just shrank - forget it so a stale index
+                    # can't silently point at a different schedule next render.
+                    forget_widget_state(st_module.session_state, "history_table")
                     st_module.rerun()
                 else:
                     st_module.error("Failed to delete schedule.")
@@ -180,6 +184,7 @@ def render_history_tab(st_module, pd_module, json_module):
         if history_manager.restore_schedule(last_deleted_id):
             st_module.session_state.last_deleted_id = None
             st_module.session_state.global_status_message = "↩️ Schedule restored."
+            forget_widget_state(st_module.session_state, "history_table")
             st_module.rerun()
         else:
             st_module.error("Failed to restore schedule.")
@@ -195,6 +200,7 @@ def render_history_tab(st_module, pd_module, json_module):
                     if st_module.button("↩️ Restore", key=f"restore_{entry['id']}"):
                         if history_manager.restore_schedule(entry["id"]):
                             st_module.session_state.global_status_message = "↩️ Schedule restored."
+                            forget_widget_state(st_module.session_state, "history_table")
                             st_module.rerun()
 
             st_module.markdown("---")
@@ -210,17 +216,37 @@ def render_history_tab(st_module, pd_module, json_module):
                 )
             with purge_col2:
                 st_module.markdown("&nbsp;")
-                if st_module.button("🧹 Purge Now"):
-                    purged_count = history_manager.purge_deleted(older_than_days=purge_days)
-                    st_module.session_state.global_status_message = (
-                        f"🧹 Purged {purged_count} deletion(s) older than {purge_days} days."
+                purge_pending = st_module.session_state.get("_purge_confirm_pending", False)
+                if not purge_pending:
+                    if st_module.button("🧹 Purge Now"):
+                        st_module.session_state._purge_confirm_pending = True
+                        st_module.rerun()
+                else:
+                    purgeable_count = history_manager.count_purgeable(older_than_days=purge_days)
+                    st_module.warning(
+                        f"⚠️ This will permanently remove {purgeable_count} deletion(s) older than "
+                        f"{purge_days} days. This cannot be undone."
                     )
-                    st_module.rerun()
+                    confirm_col, cancel_col = st_module.columns(2)
+                    with confirm_col:
+                        if st_module.button("✅ Confirm Purge"):
+                            purged_count = history_manager.purge_deleted(older_than_days=purge_days)
+                            st_module.session_state._purge_confirm_pending = False
+                            st_module.session_state.global_status_message = (
+                                f"🧹 Purged {purged_count} deletion(s) older than {purge_days} days."
+                            )
+                            st_module.rerun()
+                    with cancel_col:
+                        if st_module.button("Cancel"):
+                            st_module.session_state._purge_confirm_pending = False
+                            st_module.rerun()
 
     st_module.markdown("### 🤝 Weekly Partner History")
     partner_history = history_manager.get_weekly_partners()
 
-    if partner_history:
+    if not partner_history:
+        st_module.info("No partner history yet. Generate and play some schedules to build history.")
+    else:
         for week, pairs in sorted(partner_history.items(), reverse=True)[:4]:
             with st_module.expander(f"Week of {week}"):
                 partner_counts: dict[str, set[str]] = {}
@@ -234,8 +260,11 @@ def render_history_tab(st_module, pd_module, json_module):
                     st_module.write(f"**{player}**: {', '.join(sorted(partners))}")
 
 
-def _render_pairing_heatmap(st_module, schedule_analytics_cls, schedule, players):
-    """Render a partner/opponent count heatmap, toggled by the user."""
+def _render_pairing_heatmap(st_module, pd_module, schedule_analytics_cls, schedule, players):
+    """Render a partner/opponent count heatmap, toggled by the user, plus the
+    same matrix as a plain dataframe underneath - a non-visual equivalent
+    that doesn't depend on interpreting a colorscale, available regardless
+    of whether plotly is installed."""
     if not players:
         return
 
@@ -246,6 +275,9 @@ def _render_pairing_heatmap(st_module, schedule_analytics_cls, schedule, players
     heatmap = schedule_analytics_cls.create_pairing_heatmap(matrix, players, f"{view} Heatmap")
     if heatmap:
         st_module.plotly_chart(heatmap, width="stretch")
+
+    df = pd_module.DataFrame(matrix, index=players, columns=players)
+    st_module.dataframe(df, width="stretch")
 
 
 def _render_pairing_matrix_fallback(st_module, pd_module, schedule_analytics_cls, schedule, players):
@@ -307,7 +339,7 @@ def render_analytics_tab(st_module, pd_module, schedule_analytics_cls, has_plotl
                 st_module.plotly_chart(player_chart, width="stretch")
 
         with col2:
-            _render_pairing_heatmap(st_module, schedule_analytics_cls, schedule, players)
+            _render_pairing_heatmap(st_module, pd_module, schedule_analytics_cls, schedule, players)
     else:
         st_module.info("📊 Install plotly for interactive fairness charts: `pip install plotly`")
         _render_pairing_matrix_fallback(st_module, pd_module, schedule_analytics_cls, schedule, players)
@@ -503,13 +535,24 @@ def render_configuration_tab(st_module):
         mime="application/json",
     )
     uploaded = st_module.file_uploader("⬆️ Upload config", type=["json"], key="config_upload")
-    if uploaded is not None:
+    # file_uploader keeps returning the same UploadedFile on every rerun for
+    # as long as it stays selected in the widget - without this guard, any
+    # unrelated button click elsewhere on the page would re-run the import
+    # (and re-save) indefinitely. file_id changes only on a genuinely new
+    # upload, so this fires exactly once per distinct file.
+    if uploaded is not None and st_module.session_state.get("_last_config_upload_id") != uploaded.file_id:
+        st_module.session_state._last_config_upload_id = uploaded.file_id
         imported, messages = import_config_json(
             uploaded.getvalue(), st_module.session_state.config_manager.default_config
         )
         for message in messages:
             st_module.warning(message)
-        if st_module.session_state.config_manager.save_config(imported):
+        if messages:
+            # A repaired-with-defaults or totally-unparseable result is not
+            # the config the user meant to import - don't save it or claim
+            # success, so they can fix the file and re-upload instead.
+            st_module.error("❌ Import failed - configuration was not changed. Fix the issue(s) above and re-upload.")
+        elif st_module.session_state.config_manager.save_config(imported):
             st_module.session_state.app_config = imported
             st_module.session_state._constraint_widget_version = (
                 int(st_module.session_state.get("_constraint_widget_version", 0)) + 1
@@ -602,14 +645,25 @@ def render_player_management_tab(st_module, player_manager_cls):
                         st_module.rerun()
                     else:
                         st_module.error(f"❌ Failed to save preset: {preset_name}")
-                if st_module.button("🗑️ Delete", key=f"delete_{preset_name}"):
-                    del config["player_presets"][preset_name]
-                    if st_module.session_state.config_manager.save_config(config):
-                        if st_module.session_state.get("selected_player_preset") == preset_name:
-                            set_player_preset(st_module.session_state, "Custom")
+                delete_pending_key = f"_delete_preset_confirm_pending_{preset_name}"
+                if not st_module.session_state.get(delete_pending_key, False):
+                    if st_module.button("🗑️ Delete", key=f"delete_{preset_name}"):
+                        st_module.session_state[delete_pending_key] = True
                         st_module.rerun()
-                    else:
-                        st_module.error(f"❌ Failed to delete preset: {preset_name}")
+                else:
+                    st_module.warning(f"⚠️ Delete preset '{preset_name}'? This cannot be undone.")
+                    if st_module.button("✅ Confirm Delete", key=f"confirm_delete_{preset_name}"):
+                        del config["player_presets"][preset_name]
+                        if st_module.session_state.config_manager.save_config(config):
+                            if st_module.session_state.get("selected_player_preset") == preset_name:
+                                set_player_preset(st_module.session_state, "Custom")
+                            st_module.session_state.pop(delete_pending_key, None)
+                            st_module.rerun()
+                        else:
+                            st_module.error(f"❌ Failed to delete preset: {preset_name}")
+                    if st_module.button("Cancel", key=f"cancel_delete_{preset_name}"):
+                        st_module.session_state.pop(delete_pending_key, None)
+                        st_module.rerun()
 
     st_module.markdown("### ➕ Add New Preset")
     col1, col2 = st_module.columns([2, 1])
@@ -620,14 +674,22 @@ def render_player_management_tab(st_module, player_manager_cls):
 
     with col2:
         if st_module.button("Add Preset") and new_preset_name and new_preset_players:
-            config["player_presets"][new_preset_name] = [p.strip() for p in new_preset_players.split("\n") if p.strip()]
-            if st_module.session_state.config_manager.save_config(config):
-                st_module.session_state.global_status_message = f"✅ Added preset: {new_preset_name}"
-                defer_widget_value(st_module.session_state, "new_preset_name", "")
-                defer_widget_value(st_module.session_state, "new_preset_players", "")
-                st_module.rerun()
+            if new_preset_name in config["player_presets"]:
+                st_module.error(
+                    f"❌ A preset named '{new_preset_name}' already exists. "
+                    "Edit it above instead, or choose a different name."
+                )
             else:
-                st_module.error(f"❌ Failed to add preset: {new_preset_name}")
+                config["player_presets"][new_preset_name] = [
+                    p.strip() for p in new_preset_players.split("\n") if p.strip()
+                ]
+                if st_module.session_state.config_manager.save_config(config):
+                    st_module.session_state.global_status_message = f"✅ Added preset: {new_preset_name}"
+                    defer_widget_value(st_module.session_state, "new_preset_name", "")
+                    defer_widget_value(st_module.session_state, "new_preset_players", "")
+                    st_module.rerun()
+                else:
+                    st_module.error(f"❌ Failed to add preset: {new_preset_name}")
 
     skill_manager = st_module.session_state.get("skill_manager")
     if skill_manager is not None:
@@ -656,6 +718,8 @@ def render_player_management_tab(st_module, player_manager_cls):
                 if skill_manager.save_skills(new_ratings):
                     st_module.session_state.global_status_message = "✅ Skill ratings saved!"
                     st_module.rerun()
+                else:
+                    st_module.error("❌ Could not save skill ratings. Please try again.")
         else:
             st_module.info("Generate a schedule first, or add players, to rate their skill.")
 
@@ -742,8 +806,9 @@ def render_leaderboard_tab(st_module, pd_module):
                 score_inputs[i] = (game, team1_score, team2_score)
 
             if st_module.button("💾 Save Scores"):
+                failed_games = []
                 for game, team1_score, team2_score in score_inputs.values():
-                    history_manager.save_game_score(
+                    saved = history_manager.save_game_score(
                         schedule_id,
                         game["round_num"],
                         game["court"],
@@ -752,8 +817,15 @@ def render_leaderboard_tab(st_module, pd_module):
                         team1_score,
                         team2_score,
                     )
-                st_module.session_state.global_status_message = "✅ Scores saved!"
-                st_module.rerun()
+                    if not saved:
+                        failed_games.append(f"Round {game['round_num']}, Court {game['court']}")
+                if failed_games:
+                    st_module.error(
+                        "❌ Could not save score(s) for: " + ", ".join(failed_games) + ". Please try again."
+                    )
+                else:
+                    st_module.session_state.global_status_message = "✅ Scores saved!"
+                    st_module.rerun()
     else:
         st_module.info("Generate a schedule first to enter scores for it.")
 
@@ -762,8 +834,12 @@ def render_leaderboard_tab(st_module, pd_module):
     elo_manager = st_module.session_state.get("elo_manager")
     if elo_manager is not None:
         if st_module.button("🔄 Recompute ELO ratings"):
-            elo_manager.recompute_from_history(history_manager)
-            st_module.rerun()
+            try:
+                elo_manager.recompute_from_history(history_manager)
+            except RuntimeError:
+                st_module.error("❌ Could not save recomputed ELO ratings. Please try again.")
+            else:
+                st_module.rerun()
 
     leaderboard = history_manager.get_leaderboard()
     if not leaderboard:
@@ -832,17 +908,25 @@ def render_stress_test_tab(st_module, scheduler_cls, validate_schedule_integrity
     st_module.info(f"This will run {total_runs} generation(s). Larger sweeps take longer.")
 
     if st_module.button("▶️ Run Stress Test", type="primary"):
-        with st_module.spinner(f"Running {total_runs} generation(s)..."):
-            results = run_stress_test(
-                scheduler_cls,
-                validate_schedule_integrity_fn,
-                player_counts=player_counts,
-                round_counts=round_counts,
-                max_time=float(max_time),
-                num_pair_constraints=int(num_pair_constraints),
-                num_oppose_constraints=int(num_oppose_constraints),
-                trials_per_combo=int(trials_per_combo),
-            )
+        progress_bar = st_module.progress(0)
+        progress_text = st_module.empty()
+
+        def _on_stress_progress(completed, total, _bar=progress_bar, _text=progress_text):
+            fraction = completed / total if total else 1.0
+            _bar.progress(min(1.0, fraction))
+            _text.text(f"{completed} of {total} runs complete")
+
+        results = run_stress_test(
+            scheduler_cls,
+            validate_schedule_integrity_fn,
+            player_counts=player_counts,
+            round_counts=round_counts,
+            max_time=float(max_time),
+            num_pair_constraints=int(num_pair_constraints),
+            num_oppose_constraints=int(num_oppose_constraints),
+            trials_per_combo=int(trials_per_combo),
+            progress_callback=_on_stress_progress,
+        )
         st_module.session_state.stress_test_results = results
 
     results = st_module.session_state.get("stress_test_results")

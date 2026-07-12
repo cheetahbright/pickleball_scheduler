@@ -8,6 +8,16 @@ import time
 
 import streamlit as st
 
+try:
+    from streamlit.errors import StreamlitSecretNotFoundError
+except ImportError:  # pragma: no cover - defensive: some tests replace
+    # sys.modules["streamlit"] with a bare stand-in lacking real submodules.
+    # In that context _configured_password()'s except clause below simply
+    # never matches (st.secrets is always mocked per-test anyway), so a
+    # local placeholder is a safe fallback rather than crashing at import.
+    class StreamlitSecretNotFoundError(Exception):  # type: ignore[no-redef]
+        pass
+
 PASSWORD_ENV_VAR = "PICKLEBALL_APP_PASSWORD"
 PASSWORD_SECRET_KEY = "app_password"
 TRUE_VALUES = {"1", "true", "yes"}
@@ -33,7 +43,13 @@ def _configured_password() -> str | None:
             secret_password = secrets.get(PASSWORD_SECRET_KEY)
             if isinstance(secret_password, str) and secret_password:
                 return secret_password
-    except Exception:
+    except StreamlitSecretNotFoundError:
+        # Streamlit raises this both when no secrets.toml exists at all and
+        # when one exists but fails to parse - it does not distinguish the
+        # two. Either way, falling through to the env var (and ultimately to
+        # "auth not configured") is the correct behavior. Any OTHER
+        # exception here is a real bug in this code, not an absence of
+        # configuration, and must not be silently treated as "no password".
         pass
 
     env_password = os.environ.get(PASSWORD_ENV_VAR)

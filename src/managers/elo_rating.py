@@ -59,6 +59,10 @@ class EloRatingManager:
         currently saved - so the output only ever depends on the recorded
         score history itself. That's what makes recompute reproducible:
         running it twice against the same history yields identical ratings.
+
+        Raises RuntimeError if the recomputed ratings could not be
+        persisted, rather than silently discarding a failed write - a
+        caller must not treat this as having succeeded.
         """
         games = history_manager.get_all_scored_games()
         ratings: Dict[str, float] = {}
@@ -70,5 +74,6 @@ class EloRatingManager:
                 game["team1_score"],
                 game["team2_score"],
             )
-        self.save_ratings(ratings)
+        if not self.save_ratings(ratings):
+            raise RuntimeError("Failed to persist recomputed ELO ratings")
         return ratings

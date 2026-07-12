@@ -62,7 +62,6 @@ _main_scheduler_tab = _app_scheduler_flow.render_main_scheduler_tab
 _app_analytics = import_module_with_fallback("app_analytics")
 _build_pairing_matrices = _app_analytics.build_pairing_matrices
 _calculate_fairness_metrics = _app_analytics.calculate_fairness_metrics
-_create_fairness_visualization = _app_analytics.create_fairness_visualization
 _create_pairing_heatmap = _app_analytics.create_pairing_heatmap
 _create_player_stats_chart = _app_analytics.create_player_stats_chart
 _serialize_schedule_for_json = _app_analytics.serialize_schedule_for_json
@@ -108,11 +107,6 @@ class ScheduleAnalytics:
             num_rounds=num_rounds,
             num_courts=num_courts,
         )
-
-    @staticmethod
-    def create_fairness_visualization(metrics: Dict[str, Any]):
-        """Create plotly visualization of fairness metrics"""
-        return _create_fairness_visualization(metrics, HAS_PLOTLY, go)
 
     @staticmethod
     def create_player_stats_chart(metrics: Dict[str, Any]):

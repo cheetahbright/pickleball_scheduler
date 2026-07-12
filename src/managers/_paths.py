@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import TypeVar
 
@@ -50,11 +52,25 @@ def load_json_value(path: Path, expected_type: type[T], default: T, description:
 
 
 def save_json(path: Path, data: object, description: str) -> bool:
-    """Persist ``data`` as JSON to ``path``, creating parent directories as needed."""
+    """Persist ``data`` as JSON to ``path``, creating parent directories as needed.
+
+    Writes atomically: the new content lands in a temp file in the same
+    directory first, and is only swapped onto ``path`` via os.replace() after
+    a fully successful write. A failure mid-write (disk full, interrupted
+    process) then leaves the previous file exactly as it was, instead of
+    truncating it in place.
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as file_handle:
-            json.dump(data, file_handle, indent=2)
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as file_handle:
+                json.dump(data, file_handle, indent=2)
+            os.replace(tmp_name, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp_name)
+            raise
         return True
     except Exception:
         logger.exception("Failed to save %s to %s", description, path)

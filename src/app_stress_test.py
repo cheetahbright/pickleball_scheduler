@@ -31,15 +31,22 @@ def run_stress_test(
     num_oppose_constraints: int,
     trials_per_combo: int = 1,
     seed: int | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Run the real generation path across a grid of configurations.
 
     Mirrors render_main_scheduler_tab's generation block exactly (same
     scheduler kwargs, same constraint wiring, same validation call) so a
     failure found here is a failure the GUI would actually hit.
+
+    progress_callback, if given, is called as (completed, total) after every
+    trial - total_runs is known upfront (it's just the grid size), so the UI
+    can show real progress instead of an indeterminate spinner for sweeps
+    that can take a very long time.
     """
     rng = random.Random(seed)
     results: list[dict[str, Any]] = []
+    total_runs = len(player_counts) * len(round_counts) * trials_per_combo
 
     for num_players in player_counts:
         players = [f"Player{i + 1}" for i in range(num_players)]
@@ -91,6 +98,8 @@ def run_stress_test(
                     if not (isinstance(result, dict) and "schedule" in result):
                         row["status"] = "no_schedule"
                         results.append(row)
+                        if progress_callback is not None:
+                            progress_callback(len(results), total_runs)
                         continue
 
                     schedule_data = result["schedule"]
@@ -111,6 +120,8 @@ def run_stress_test(
                     row["traceback"] = traceback.format_exc()
 
                 results.append(row)
+                if progress_callback is not None:
+                    progress_callback(len(results), total_runs)
 
     return results
 

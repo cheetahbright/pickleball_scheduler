@@ -49,6 +49,9 @@ PWA_HEAD_HTML = """
 <link rel="manifest" href="./app/static/manifest.json">
 <meta name="theme-color" content="#2e7d32">
 <link rel="apple-touch-icon" href="./app/static/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Pickleball">
 <script>
 (function () {
     if ("serviceWorker" in navigator) {

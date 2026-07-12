@@ -234,13 +234,8 @@ data/default_player_names.backup.json
 # Mutable local app state under data/
 /data/app_config.json
 /data/schedule_history.db
-/data/weekly_history.db
-/data/bayesian_preferences.json
-/data/saved_player_config.json
-/data/saved_session.json
-/data/schedule_history.json
-/data/scheduler_settings.json
 /data/player_skills.json
+/data/player_elo.json
 
 # Local app history/stats artifacts
 /pickleball_history.json

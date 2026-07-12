@@ -73,7 +73,11 @@ def normalize_constraint_pairs(raw_constraints: Any) -> list[list[str]]:
         if parsed_pair is None:
             continue
 
-        pair_key = (parsed_pair[0], parsed_pair[1])
+        # Sorted so "Alice,Bob" and "Bob,Alice" collapse to the same key -
+        # the pair is semantically unordered (do_not_pair/do_not_oppose
+        # constraints have no direction), so keeping both as distinct
+        # entries would silently duplicate the same constraint.
+        pair_key = tuple(sorted((parsed_pair[0], parsed_pair[1])))
         if pair_key in seen_pairs:
             continue
 
@@ -258,6 +262,12 @@ def import_config_json(raw_bytes: bytes, default_config: Dict[str, Any]) -> tupl
         parsed = json.loads(raw_bytes.decode("utf-8"))
     except (UnicodeDecodeError, TypeError, ValueError) as exc:
         return deepcopy(default_config), [f"Not valid JSON: {exc}"]
+    except RecursionError:
+        # A deeply-nested payload (e.g. thousands of nested arrays) is only a
+        # few KB and sails under MAX_CONFIG_UPLOAD_BYTES, but json.loads still
+        # blows Python's recursion limit decoding it - this is a shape
+        # problem, not a size problem, so it gets its own message.
+        return deepcopy(default_config), ["JSON is too deeply nested to parse."]
 
     if not isinstance(parsed, dict):
         return deepcopy(default_config), ["Uploaded file must contain a JSON object."]

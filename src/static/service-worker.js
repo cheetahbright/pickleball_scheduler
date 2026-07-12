@@ -24,7 +24,12 @@
  * correct types and already provide real "Install app" value on their own.
  */
 
-const CACHE_NAME = "pickleball-shell-v1";
+// The trailing hex suffix is a content hash of manifest.json + both icons
+// (see tests/unit/test_pwa.py's cache-name test, which recomputes it and
+// fails CI if these files change without this being updated) - a cache-first
+// service worker otherwise never sees updated icons/manifest reach an
+// already-installed user unless a developer remembers to bump this by hand.
+const CACHE_NAME = "pickleball-shell-v1-7017e7de7e";
 
 // Only ever the small set of static assets served from this same directory.
 // Deliberately does NOT include the Streamlit app page itself or any

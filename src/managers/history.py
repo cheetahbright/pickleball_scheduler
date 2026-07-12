@@ -49,12 +49,20 @@ class HistoryManager:
         )
         self.ensure_db_exists()
 
+    # sqlite3's default busy timeout (5s) is short enough that two Streamlit
+    # sessions saving near-simultaneously can hit "database is locked" and
+    # fail outright; WAL mode lets readers proceed without blocking on a
+    # writer at all, and a longer timeout gives a genuine writer/writer
+    # collision more room to resolve on its own before giving up.
+    _BUSY_TIMEOUT_SECONDS = 15.0
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         """Open a connection that commits/rolls back on exit (sqlite3.Connection's
         own context-manager behavior) and is always explicitly closed afterward,
         rather than relying on CPython refcounting to close it."""
-        with closing(sqlite3.connect(self.db_path)) as raw_conn:
+        with closing(sqlite3.connect(self.db_path, timeout=self._BUSY_TIMEOUT_SECONDS)) as raw_conn:
+            raw_conn.execute("PRAGMA journal_mode=WAL")
             with raw_conn as conn:
                 yield conn
 
@@ -502,6 +510,29 @@ class HistoryManager:
             logger.exception("Failed to read deleted schedules from history")
             return []
 
+    # Chunk size for the IN (?,?,...) clauses below - comfortably under
+    # SQLite's bound-variable limit (999 on older builds, 32766 on newer
+    # ones) so a large soft-deleted backlog always makes forward progress
+    # instead of the whole purge silently failing past that limit.
+    _PURGE_CHUNK_SIZE = 500
+
+    def count_purgeable(self, older_than_days: int = 30) -> int:
+        """Count soft-deleted schedules that purge_deleted(older_than_days)
+        would permanently remove, without removing them - lets the UI show
+        the user what an irreversible purge is actually about to do."""
+        cutoff = (datetime.now() - timedelta(days=older_than_days)).isoformat()
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT COUNT(*) FROM schedule_history WHERE deleted_at IS NOT NULL AND deleted_at < ?",
+                    (cutoff,),
+                )
+                return cursor.fetchone()[0]
+        except Exception:
+            logger.exception("Failed to count purgeable history entries")
+            return 0
+
     def purge_deleted(self, older_than_days: int = 30) -> int:
         """Permanently remove soft-deleted schedules (and their scores) older than
         the given number of days. Returns the number of schedules purged."""
@@ -514,10 +545,11 @@ class HistoryManager:
                     (cutoff,),
                 )
                 ids = [row[0] for row in cursor.fetchall()]
-                if ids:
-                    placeholders = ",".join("?" * len(ids))
-                    cursor.execute(f"DELETE FROM game_scores WHERE schedule_id IN ({placeholders})", ids)
-                    cursor.execute(f"DELETE FROM schedule_history WHERE id IN ({placeholders})", ids)
+                for start in range(0, len(ids), self._PURGE_CHUNK_SIZE):
+                    chunk = ids[start : start + self._PURGE_CHUNK_SIZE]
+                    placeholders = ",".join("?" * len(chunk))
+                    cursor.execute(f"DELETE FROM game_scores WHERE schedule_id IN ({placeholders})", chunk)
+                    cursor.execute(f"DELETE FROM schedule_history WHERE id IN ({placeholders})", chunk)
                 conn.commit()
             if ids:
                 logger.info("History purge: removed %d schedules older than %d days", len(ids), older_than_days)
