@@ -160,9 +160,9 @@ def render_history_tab(st_module, pd_module, json_module):
                     st_module.session_state.global_status_message = "✅ Schedule loaded!"
                     logger.info("History load: rounds=%d players=%d", len(schedule_data), len(players))
                     st_module.rerun()
-                except Exception as exc:
+                except Exception:
                     logger.exception("History load failed")
-                    st_module.error(f"Failed to load schedule: {exc}")
+                    st_module.error("Failed to load the selected schedule. See the server logs for details.")
 
         with col2:
             if selected_entry is not None and st_module.button("🗑️ Delete Selected Schedule"):
@@ -223,7 +223,7 @@ def render_history_tab(st_module, pd_module, json_module):
     if partner_history:
         for week, pairs in sorted(partner_history.items(), reverse=True)[:4]:
             with st_module.expander(f"Week of {week}"):
-                partner_counts = {}
+                partner_counts: dict[str, set[str]] = {}
                 for p1, p2 in pairs:
                     for player in [p1, p2]:
                         if player not in partner_counts:
@@ -492,6 +492,8 @@ def render_configuration_tab(st_module):
             st_module.session_state._preserve_saved_constraints_from_config = True
             st_module.session_state.global_status_message = "✅ Configuration saved!"
             st_module.rerun()
+        else:
+            st_module.error("❌ Failed to save configuration.")
 
     st_module.markdown("### 💼 Backup / Restore")
     st_module.download_button(
@@ -517,6 +519,8 @@ def render_configuration_tab(st_module):
             _clear_configuration_widget_state(st_module.session_state)
             st_module.session_state.global_status_message = "✅ Configuration imported!"
             st_module.rerun()
+        else:
+            st_module.error("❌ Failed to save imported configuration.")
 
 
 _PRESET_WIDGET_KEY_PREFIX = "preset_"
@@ -551,7 +555,7 @@ def render_player_management_tab(st_module, player_manager_cls):
     )
 
     if substitution_enabled:
-        player_manager_cls.create_substitution_interface()
+        player_manager_cls.create_substitution_interface(st_module)
 
         st_module.markdown("### ℹ️ How Substitutions Work")
         substitution_round = st_module.session_state.get("substitution_round", 4)
@@ -596,12 +600,16 @@ def render_player_management_tab(st_module, player_manager_cls):
                     if st_module.session_state.config_manager.save_config(config):
                         st_module.session_state.global_status_message = f"✅ Saved preset: {preset_name}"
                         st_module.rerun()
+                    else:
+                        st_module.error(f"❌ Failed to save preset: {preset_name}")
                 if st_module.button("🗑️ Delete", key=f"delete_{preset_name}"):
                     del config["player_presets"][preset_name]
                     if st_module.session_state.config_manager.save_config(config):
                         if st_module.session_state.get("selected_player_preset") == preset_name:
                             set_player_preset(st_module.session_state, "Custom")
                         st_module.rerun()
+                    else:
+                        st_module.error(f"❌ Failed to delete preset: {preset_name}")
 
     st_module.markdown("### ➕ Add New Preset")
     col1, col2 = st_module.columns([2, 1])
@@ -618,6 +626,8 @@ def render_player_management_tab(st_module, player_manager_cls):
                 defer_widget_value(st_module.session_state, "new_preset_name", "")
                 defer_widget_value(st_module.session_state, "new_preset_players", "")
                 st_module.rerun()
+            else:
+                st_module.error(f"❌ Failed to add preset: {new_preset_name}")
 
     skill_manager = st_module.session_state.get("skill_manager")
     if skill_manager is not None:
@@ -863,6 +873,8 @@ def render_stress_test_tab(st_module, scheduler_cls, validate_schedule_integrity
             "seed": r["seed"],
             "status": r["status"],
             "total_range": r["total_range"],
+            "generations": r["generations"],
+            "time_seconds": r["time_seconds"],
         }
         for r in results
     ]

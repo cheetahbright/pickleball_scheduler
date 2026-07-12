@@ -1,12 +1,53 @@
 #!/usr/bin/env python3
 """Mathematical Feasibility Analysis for Pickleball Scheduling"""
 
+from __future__ import annotations
+
+from typing import Any, List, TypedDict
+
+
+class FeasibilityMinimums(TypedDict):
+    min_partner_range: int
+    min_games_range: int
+    min_courts_range: int
+    min_opponents_range: int
+    total_theoretical_min: int
+    range_0_possible: bool
+    games_per_player: float
+    sitting_players: int
+    players_per_round: int
+    total_games: int
+
+
+class QualityAssessment(TypedDict):
+    quality: str
+    grade: str
+    reason: str
+    gap_from_theoretical: int
+    theoretical_min: int
+    actual_total: int
+    critical_perfect: bool
+    feasibility_analysis: FeasibilityMinimums
+
+
+class OptimalParameters(TypedDict):
+    population_size: int
+    max_generations: int
+    max_runtime: float
+    convergence_patience: int
+    elite_size: int
+    tournament_size: int
+    mutation_rate: float
+    crossover_rate: float
+
 
 class ScheduleFeasibilityAnalyzer:
     """Analyzes mathematical constraints and feasibility for pickleball scheduling."""
 
     @staticmethod
-    def calculate_theoretical_minimums(num_players, num_courts=None, num_rounds=8):
+    def calculate_theoretical_minimums(
+        num_players: int, num_courts: int | None = None, num_rounds: int = 8
+    ) -> FeasibilityMinimums:
         """Calculate realistic theoretical minimum ranges for given configuration."""
 
         if num_courts is None:
@@ -21,7 +62,7 @@ class ScheduleFeasibilityAnalyzer:
         if sitting_players == 0:
             # No sitting - everyone plays same number of games
             min_games_range = 0
-            games_per_player = num_rounds
+            games_per_player: float = num_rounds
         else:
             # With sitting - games can't be perfectly equal
             total_player_spots = total_games * 4
@@ -35,10 +76,8 @@ class ScheduleFeasibilityAnalyzer:
             min_partner_range = 0  # Too few players for range
         elif sitting_players == 0 and num_players % 4 == 0:
             min_partner_range = 0  # Perfect pairing possible
-        elif num_players >= 16:
-            min_partner_range = 1  # Larger groups have slight imbalances
         else:
-            min_partner_range = 1  # Small imbalances likely
+            min_partner_range = 1  # Imbalances likely once perfect pairing isn't guaranteed
 
         # Courts range analysis
         if sitting_players == 0:
@@ -49,10 +88,7 @@ class ScheduleFeasibilityAnalyzer:
             min_courts_range = 0  # Small groups can balance courts well
 
         # Opponents range - usually achievable at 0-1
-        if num_players <= 8:
-            min_opponents_range = 0  # Small groups balance easily
-        else:
-            min_opponents_range = 0  # Good algorithms can balance this
+        min_opponents_range = 0  # Usually achievable at 0-1 regardless of group size
 
         total_theoretical_min = min_partner_range + min_games_range + min_courts_range + min_opponents_range
 
@@ -70,7 +106,9 @@ class ScheduleFeasibilityAnalyzer:
         }
 
     @staticmethod
-    def assess_quality_with_feasibility(breakdown, num_players, num_courts=None, num_rounds=8):
+    def assess_quality_with_feasibility(
+        breakdown: dict[str, int], num_players: int, num_courts: int | None = None, num_rounds: int = 8
+    ) -> QualityAssessment:
         """Assess schedule quality relative to mathematical feasibility."""
 
         # Get theoretical minimums
@@ -137,11 +175,11 @@ class ScheduleFeasibilityAnalyzer:
         }
 
     @staticmethod
-    def get_optimal_parameters(num_players):
+    def get_optimal_parameters(num_players: int) -> OptimalParameters:
         """Get optimal algorithm parameters based on player count and complexity."""
 
         # Base parameters
-        base_params = {
+        base_params: OptimalParameters = {
             "population_size": 100,
             "max_generations": 1200,
             "max_runtime": 30.0,
@@ -203,13 +241,13 @@ class ScheduleFeasibilityAnalyzer:
         return params
 
     @staticmethod
-    def create_performance_report(results_list):
+    def create_performance_report(results_list: List[Any]) -> str:
         """Create a comprehensive performance report for multiple test results."""
 
         if not results_list:
             return "No results to analyze"
 
-        report = []
+        report: List[str] = []
         report.append("🎯 MATHEMATICAL FEASIBILITY PERFORMANCE REPORT")
         report.append("=" * 60)
         report.append("")

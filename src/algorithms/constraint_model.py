@@ -22,7 +22,7 @@ class TeamGameLike(Protocol):
     team2: Iterable[object]
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class SchedulingProblem:
     """Canonical problem representation for all algorithms."""
 
@@ -44,17 +44,21 @@ class SchedulingProblem:
     def __post_init__(self):
         """Initialize defaults."""
         if not self.availability:
-            self.availability = {p: set(range(self.num_rounds)) for p in self.players}
+            object.__setattr__(self, "availability", {p: set(range(self.num_rounds)) for p in self.players})
 
         if not self.objective_weights:
-            self.objective_weights = {
-                "partner_variety": 3.0,
-                "opponent_variety": 2.0,
-                "court_balance": 1.0,
-                "skill_balance": 0.5,
-                "rest_spacing": 0.5,
-                "constraint_violations": 10.0,  # High penalty
-            }
+            object.__setattr__(
+                self,
+                "objective_weights",
+                {
+                    "partner_variety": 3.0,
+                    "opponent_variety": 2.0,
+                    "court_balance": 1.0,
+                    "skill_balance": 0.5,
+                    "rest_spacing": 0.5,
+                    "constraint_violations": 10.0,  # High penalty
+                },
+            )
 
 
 def _coerce_team(players: object) -> List[str]:
@@ -123,7 +127,7 @@ class ObjectiveCalculator:
     @staticmethod
     def calculate_partner_variety(schedule: Sequence[Sequence[object]], players: List[str]) -> float:
         """Calculate partner variety score (higher is better)."""
-        partner_counts = defaultdict(lambda: defaultdict(int))
+        partner_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
         for round_games in schedule:
             for game in round_games:
@@ -158,7 +162,7 @@ class ObjectiveCalculator:
     @staticmethod
     def calculate_opponent_variety(schedule: Sequence[Sequence[object]], players: List[str]) -> float:
         """Calculate opponent variety score (higher is better)."""
-        opponent_counts = defaultdict(lambda: defaultdict(int))
+        opponent_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
         for round_games in schedule:
             for game in round_games:
@@ -188,7 +192,7 @@ class ObjectiveCalculator:
     @staticmethod
     def calculate_court_balance(schedule: Sequence[Sequence[object]], players: List[str], num_courts: int) -> float:
         """Calculate court usage balance (higher is better)."""
-        court_usage = defaultdict(lambda: defaultdict(int))
+        court_usage: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
 
         for round_games in schedule:
             for game_idx, game in enumerate(round_games):
@@ -251,11 +255,6 @@ class ObjectiveCalculator:
         """Count total constraint violations."""
         violations = 0
         availability = problem.availability
-
-        # 🚨 DUPLICATE DETECTION TEMPORARILY DISABLED DUE TO FALSE POSITIVES
-        # if ScheduleRepair.has_duplicate_rounds(schedule):
-        #     violations += 1000  # Massive penalty for duplicate rounds
-        #     print("🚨 CRITICAL VIOLATION: Duplicate rounds detected!")
 
         # Check availability constraints
         for round_idx, round_games in enumerate(schedule):

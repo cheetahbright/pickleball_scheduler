@@ -8,11 +8,10 @@ import io
 import json
 import logging
 import sqlite3
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List
-
-import streamlit as st
+from typing import Any, Dict, Iterator, List
 
 try:
     from src._compat import import_module_with_fallback
@@ -23,6 +22,11 @@ try:
     from src.managers._paths import _resolve_storage_path
 except ImportError:
     from managers._paths import _resolve_storage_path
+
+try:
+    from src.utils.schedule_shapes import extract_game_teams
+except ImportError:
+    from utils.schedule_shapes import extract_game_teams
 
 _schedule_analytics_core = import_module_with_fallback("utils.schedule_analytics_core")
 calculate_fairness_metrics = _schedule_analytics_core.calculate_fairness_metrics
@@ -45,11 +49,20 @@ class HistoryManager:
         )
         self.ensure_db_exists()
 
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Open a connection that commits/rolls back on exit (sqlite3.Connection's
+        own context-manager behavior) and is always explicitly closed afterward,
+        rather than relying on CPython refcounting to close it."""
+        with closing(sqlite3.connect(self.db_path)) as raw_conn:
+            with raw_conn as conn:
+                yield conn
+
     def ensure_db_exists(self):
         """Create the history database if it does not exist."""
         self.db_path.parent.mkdir(exist_ok=True)
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
 
             cursor.execute("""
@@ -107,18 +120,25 @@ class HistoryManager:
                 )
             """)
 
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_schedule_history_active " "ON schedule_history(deleted_at, timestamp)"
+            )
+
             conn.commit()
 
-    def save_schedule(self, schedule: List[Dict], players: List[str], settings: Dict) -> int | None:
+    def save_schedule(
+        self, schedule: List[Dict], players: List[str], settings: Dict, algorithm: str = "genetic"
+    ) -> int | None:
         """Save schedule data and weekly relationships. Returns the new row's id, or
-        None on failure - callers use the id to attach game scores to this schedule."""
+        None on failure - callers use the id to attach game scores to this schedule,
+        and are responsible for surfacing a None return to the user."""
         try:
             metrics = calculate_fairness_metrics(schedule)
             serializable_schedule = serialize_schedule_for_json(schedule)
             stored_settings = dict(settings)
             stored_settings["players"] = list(players)
 
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
 
                 cursor.execute(
@@ -131,7 +151,7 @@ class HistoryManager:
                         datetime.now().isoformat(),
                         len(players),
                         len(schedule),
-                        "genetic",
+                        algorithm,
                         metrics.get("overall_fairness", 0),
                         json.dumps(serializable_schedule),
                         json.dumps(stored_settings),
@@ -147,9 +167,8 @@ class HistoryManager:
             logger.info("History save: rounds=%d players=%d schedule_id=%s", len(schedule), len(players), schedule_id)
             return schedule_id
 
-        except Exception as e:
+        except Exception:
             logger.exception("History save failed")
-            st.error(f"Failed to save history: {e}")
             return None
 
     def save_game_score(
@@ -165,7 +184,7 @@ class HistoryManager:
         """Record or update the score for one game. A schedule_id+round+court is unique -
         re-entering a score for the same game updates it rather than duplicating."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
@@ -252,7 +271,7 @@ class HistoryManager:
     def get_game_scores(self, schedule_id: int) -> List[Dict]:
         """Return every recorded score for a schedule, ordered by round then court."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     "SELECT * FROM game_scores WHERE schedule_id = ? ORDER BY round_num, court",
@@ -275,7 +294,7 @@ class HistoryManager:
         counts toward games_played but not wins or losses.
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     "SELECT gs.team1_players, gs.team2_players, gs.team1_score, gs.team2_score "
@@ -309,7 +328,7 @@ class HistoryManager:
             for player in losers:
                 _player_stats(player)["losses"] += 1
 
-        leaderboard = []
+        leaderboard: List[Dict[str, Any]] = []
         for player, record in stats.items():
             games = record["games_played"]
             win_rate = record["wins"] / games if games else 0.0
@@ -335,7 +354,7 @@ class HistoryManager:
         the same ratings, regardless of the order scores were entered in.
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     "SELECT gs.team1_players, gs.team2_players, gs.team1_score, gs.team2_score, gs.recorded_at "
@@ -362,43 +381,41 @@ class HistoryManager:
 
     def _save_weekly_relationships(self, cursor, schedule, week_date):
         """Save weekly partner and opponent relationships."""
+        partner_rows: list[tuple[str, str, str]] = []
+        opponent_rows: list[tuple[str, str, str]] = []
+
         for round_data in schedule:
             games = round_data.get("games", []) if hasattr(round_data, "get") else [round_data]
 
             for game in games:
-                if hasattr(game, "team1"):
-                    team1 = [str(p) for p in game.team1]
-                    team2 = [str(p) for p in game.team2]
-                else:
-                    team1 = [str(p) for p in game.get("team1", [])]
-                    team2 = [str(p) for p in game.get("team2", [])]
+                raw_team1, raw_team2, _court = extract_game_teams(game)
+                team1 = [str(p) for p in raw_team1]
+                team2 = [str(p) for p in raw_team2]
 
                 for team in (team1, team2):
                     if len(team) == 2:
                         p1, p2 = sorted(team)
-                        cursor.execute(
-                            """
-                            INSERT OR IGNORE INTO partner_history (week_date, player1, player2)
-                            VALUES (?, ?, ?)
-                        """,
-                            (week_date, p1, p2),
-                        )
+                        partner_rows.append((week_date, p1, p2))
 
                 for t1_player in team1:
                     for t2_player in team2:
                         p1, p2 = sorted([t1_player, t2_player])
-                        cursor.execute(
-                            """
-                            INSERT OR IGNORE INTO opponent_history (week_date, player1, player2)
-                            VALUES (?, ?, ?)
-                        """,
-                            (week_date, p1, p2),
-                        )
+                        opponent_rows.append((week_date, p1, p2))
+
+        if partner_rows:
+            cursor.executemany(
+                "INSERT OR IGNORE INTO partner_history (week_date, player1, player2) VALUES (?, ?, ?)", partner_rows
+            )
+        if opponent_rows:
+            cursor.executemany(
+                "INSERT OR IGNORE INTO opponent_history (week_date, player1, player2) VALUES (?, ?, ?)",
+                opponent_rows,
+            )
 
     def get_recent_schedules(self, limit: int = 10) -> List[Dict]:
         """Get recent (non-deleted) schedules from history."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
@@ -418,7 +435,7 @@ class HistoryManager:
     def get_schedule(self, schedule_id: int) -> Dict | None:
         """Fetch a single history entry by id, or None if it doesn't exist."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT * FROM schedule_history WHERE id = ?", (schedule_id,))
                 row = cursor.fetchone()
@@ -437,7 +454,7 @@ class HistoryManager:
         Returns True if a non-deleted row was found and marked deleted.
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     "UPDATE schedule_history SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
@@ -455,7 +472,7 @@ class HistoryManager:
     def restore_schedule(self, schedule_id: int) -> bool:
         """Undo a soft-delete. Returns True if a deleted row was found and restored."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     "UPDATE schedule_history SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL",
@@ -473,7 +490,7 @@ class HistoryManager:
     def get_deleted_schedules(self, limit: int = 10) -> List[Dict]:
         """Get recently soft-deleted schedules, most recently deleted first."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     "SELECT * FROM schedule_history WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT ?",
@@ -490,7 +507,7 @@ class HistoryManager:
         the given number of days. Returns the number of schedules purged."""
         cutoff = (datetime.now() - timedelta(days=older_than_days)).isoformat()
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     "SELECT id FROM schedule_history WHERE deleted_at IS NOT NULL AND deleted_at < ?",
@@ -512,7 +529,7 @@ class HistoryManager:
     def get_weekly_partners(self, weeks_back: int = 4) -> Dict[str, List]:
         """Get partner history keyed by week."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """

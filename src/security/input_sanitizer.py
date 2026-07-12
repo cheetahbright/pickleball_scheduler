@@ -19,10 +19,12 @@ class InputSanitizer:
 
         if base_dir:
             resolved_base = Path(base_dir).expanduser().resolve()
-            if resolved_path.is_absolute() or path.startswith(("/", "\\")):
-                return path
-
-            resolved_target = (resolved_base / resolved_path).resolve()
+            # Fold absolute paths into the same containment check instead of
+            # returning them unchecked - an absolute path must still resolve
+            # inside base_dir.
+            resolved_target = (
+                resolved_path if resolved_path.is_absolute() else (resolved_base / resolved_path)
+            ).resolve()
             try:
                 resolved_target.relative_to(resolved_base)
             except ValueError as exc:

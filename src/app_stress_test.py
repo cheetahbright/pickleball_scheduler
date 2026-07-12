@@ -61,6 +61,12 @@ def run_stress_test(
                     "seed": trial_seed,
                     "status": "ok",
                     "total_range": None,
+                    # generations == 0 marks a constructive-fast-path row (see
+                    # constructive_scheduler.py) - distinguishing it from a GA
+                    # row (generations > 0) is the whole point of surfacing
+                    # this column in the stress-test view.
+                    "generations": None,
+                    "time_seconds": None,
                     "errors": [],
                 }
 
@@ -90,6 +96,8 @@ def run_stress_test(
                     schedule_data = result["schedule"]
                     schedule_errors = validate_schedule_integrity_fn(schedule_data, players)
                     row["total_range"] = result.get("total_range")
+                    row["generations"] = result.get("generations")
+                    row["time_seconds"] = result.get("time_seconds")
 
                     if schedule_errors:
                         row["status"] = "invalid_schedule"

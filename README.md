@@ -147,7 +147,6 @@ python -m pytest tests/organized/ui/test_main_ui_smoke.py -q
 src/
 ├── main_app.py              # Main Streamlit application facade
 ├── simple_auth.py           # Authentication system
-├── theme_styles.py          # Dark theme CSS
 ├── mobile_styles.py         # Mobile-responsive CSS
 ├── pwa.py                   # PWA manifest/service-worker injection
 ├── rating_elo.py            # Pure ELO math

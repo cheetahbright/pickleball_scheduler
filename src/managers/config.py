@@ -11,12 +11,10 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List
 
-import streamlit as st
-
 try:
-    from src.managers._paths import _resolve_default_names_path, _resolve_storage_path
+    from src.managers._paths import _resolve_default_names_path, _resolve_storage_path, save_json
 except ImportError:
-    from managers._paths import _resolve_default_names_path, _resolve_storage_path
+    from managers._paths import _resolve_default_names_path, _resolve_storage_path, save_json
 
 logger = logging.getLogger(__name__)
 
@@ -143,18 +141,10 @@ def _is_valid_player_presets(player_presets: Any) -> bool:
     return True
 
 
-def _is_valid_ui(ui: Any) -> bool:
-    """A ui section has a theme that is either 'light' or 'dark'."""
-    if not isinstance(ui, dict):
-        return False
-    return ui.get("theme") in ("light", "dark")
-
-
 _CONFIG_SECTION_VALIDATORS = {
     "objectives": _is_valid_objectives,
     "scheduling": _is_valid_scheduling,
     "player_presets": _is_valid_player_presets,
-    "ui": _is_valid_ui,
 }
 
 CONFIG_REPAIR_MESSAGES_KEY = "_config_repair_messages"
@@ -167,16 +157,14 @@ CURRENT_CONFIG_SCHEMA_VERSION = 3
 
 
 def _migrate_v1_to_v2(config: Dict[str, Any]) -> Dict[str, Any]:
-    """v1 configs predate the 'must_pair' constraint list - add it, empty."""
-    constraints = config.setdefault("constraints", {})
-    constraints.setdefault("must_pair", [])
+    """v1 configs need no shape change to reach v2 - the version bump alone
+    is the migration (v1 predated an unused, since-removed constraint list)."""
     return config
 
 
 def _migrate_v2_to_v3(config: Dict[str, Any]) -> Dict[str, Any]:
-    """v2 configs predate the 'ui' section - add it, defaulting to light."""
-    ui = config.setdefault("ui", {})
-    ui.setdefault("theme", "light")
+    """v2 configs need no shape change to reach v3 - the version bump alone
+    is the migration (v2 predated an unused, since-removed 'ui'/theme section)."""
     return config
 
 
@@ -302,13 +290,12 @@ class ConfigurationManager:
         self.config_path.parent.mkdir(exist_ok=True)
         self.default_config = {
             CONFIG_SCHEMA_VERSION_KEY: CURRENT_CONFIG_SCHEMA_VERSION,
-            "ui": {"theme": "light"},
             "objectives": {
                 "equal_games": {"weight": 5000, "min": 1000, "max": 10000},
                 "equal_variety": {"weight": 4000, "min": 1000, "max": 10000},
                 "constraints": {"weight": 6000, "min": 2000, "max": 10000},
             },
-            "constraints": {"do_not_pair": [], "do_not_oppose": [], "must_pair": []},
+            "constraints": {"do_not_pair": [], "do_not_oppose": []},
             "player_presets": {
                 "Regular Group": [
                     "Teresa",
@@ -401,19 +388,18 @@ class ConfigurationManager:
         return repaired
 
     def save_config(self, config: Dict) -> bool:
-        """Save configuration to file. Returns True on success, False on failure."""
+        """Save configuration to file. Returns True on success, False on failure.
+
+        Callers are responsible for surfacing a False return to the user -
+        this manager has no UI dependency of its own."""
         try:
             normalized_config = normalize_config_constraints(deepcopy(config))
             normalized_config.pop(CONFIG_REPAIR_MESSAGES_KEY, None)
             normalized_config[CONFIG_SCHEMA_VERSION_KEY] = CURRENT_CONFIG_SCHEMA_VERSION
-            self.config_path.parent.mkdir(exist_ok=True)
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(normalized_config, f, indent=2)
-            return True
-        except Exception as e:
-            logger.exception("Failed to save configuration")
-            st.error(f"Failed to save configuration: {e}")
+        except Exception:
+            logger.exception("Failed to normalize configuration")
             return False
+        return save_json(self.config_path, normalized_config, "app configuration")
 
     def _merge_configs(self, default: Dict, user: Dict) -> Dict:
         """Merge user configuration with defaults."""

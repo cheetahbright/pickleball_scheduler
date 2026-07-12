@@ -98,12 +98,17 @@ except ImportError:
     from algorithms.arrangement_generator import generate_arrangements as _generate_arrangements_fn
 
 try:
+    from src.algorithms.constructive_scheduler import build_perfect_schedule as _build_perfect_schedule_fn
+except ImportError:
+    from algorithms.constructive_scheduler import build_perfect_schedule as _build_perfect_schedule_fn
+
+try:
     from src.utils.feasibility_analyzer import ScheduleFeasibilityAnalyzer
 except ImportError:
     try:
         from utils.feasibility_analyzer import ScheduleFeasibilityAnalyzer
     except ImportError:
-        ScheduleFeasibilityAnalyzer = None
+        ScheduleFeasibilityAnalyzer = None  # type: ignore[assignment,misc]
 
 
 def _console_print(*args, sep: str = " ", end: str = "\n", file=None, flush=False):
@@ -158,11 +163,90 @@ class GeneticPickleballScheduler:
         "opponents_range": 10,  # Opponents minimized last
     }
 
+    # Defensive bound on the per-run evaluation caches (_fitness_cache,
+    # _metrics_cache, _schedule_cache, _signature_cache). A caller-requested
+    # max_generations budget (see _resolve_ga_sizing) can run long enough for
+    # these to otherwise grow unbounded for the lifetime of one
+    # generate_schedule() call - past this many distinct individuals seen,
+    # they're cleared together rather than left to grow forever.
+    _MAX_CACHE_ENTRIES = 300_000
+
     # Fixed court assignment based on player count
     @classmethod
     def get_fixed_courts(cls, num_players: int) -> int:
         """Calculate fixed court count based on player count."""
         return max(1, num_players // 4)
+
+    def _resolve_ga_sizing(self, use_desktop_params, num_players, population_size, max_generations, max_runtime):
+        """Resolve population_size/max_generations/max_runtime for desktop mode.
+
+        max_generations/max_runtime of None mean "the caller has no explicit
+        preference" - resolved to the desktop-tier default (or the plain
+        constructor default outside desktop mode). An explicit value from the
+        caller is never silently discarded: in desktop mode it's combined with
+        the feasibility analyzer's tier via max(), so a caller asking for a
+        longer budget than the analyzer's tier actually gets it, while a
+        caller asking for less still benefits from the analyzer's recommended
+        floor.
+
+        Returns (population_size, max_generations, max_runtime, desktop_tunables),
+        where desktop_tunables is the optimal_params/DESKTOP_PARAMS dict to apply
+        verbatim via _resolve_ga_tunables when use_desktop_params is True, else None.
+        """
+        if not use_desktop_params:
+            return (
+                population_size,
+                max_generations if max_generations is not None else 1000,
+                max_runtime if max_runtime is not None else 300.0,
+                None,
+            )
+
+        if ScheduleFeasibilityAnalyzer is not None:
+            optimal_params = ScheduleFeasibilityAnalyzer.get_optimal_parameters(num_players)
+            resolved_generations = optimal_params["max_generations"]
+            if max_generations is not None:
+                resolved_generations = max(resolved_generations, max_generations)
+            resolved_runtime = optimal_params["max_runtime"]
+            if max_runtime is not None:
+                resolved_runtime = max(resolved_runtime, max_runtime)
+            return (
+                optimal_params["population_size"],
+                resolved_generations,
+                resolved_runtime,
+                optimal_params,
+            )
+
+        # Fallback to original desktop params - max_generations/max_runtime are
+        # intentionally left as the caller's values here, matching this
+        # fallback's long-standing behavior (only population_size and the
+        # tunables below come from DESKTOP_PARAMS in this branch).
+        return (
+            self.DESKTOP_PARAMS["population_size"],
+            max_generations if max_generations is not None else self.DESKTOP_PARAMS["max_generations"],
+            max_runtime if max_runtime is not None else 300.0,
+            self.DESKTOP_PARAMS,
+        )
+
+    def _resolve_ga_tunables(self, use_desktop_params, desktop_tunables, population_size):
+        """Resolve mutation_rate/crossover_rate/elite_size/tournament_size/
+        convergence_patience for both desktop and non-desktop modes, so every
+        GA tunable is always set here rather than via a trailing
+        hasattr(self, "convergence_patience") fallback."""
+        if use_desktop_params and desktop_tunables is not None:
+            return {
+                "mutation_rate": desktop_tunables["mutation_rate"],
+                "crossover_rate": desktop_tunables["crossover_rate"],
+                "convergence_patience": desktop_tunables["convergence_patience"],
+                "elite_size": desktop_tunables["elite_size"],
+                "tournament_size": desktop_tunables["tournament_size"],
+            }
+        return {
+            "mutation_rate": 0.20,  # Increased from 0.12 for better exploration
+            "crossover_rate": 0.85,  # Increased from 0.8
+            "convergence_patience": 60,
+            "elite_size": max(4, population_size // 5),  # Keep more elites
+            "tournament_size": 7,
+        }
 
     def __init__(
         self,
@@ -171,8 +255,8 @@ class GeneticPickleballScheduler:
         num_rounds: Optional[int] = None,
         *,
         population_size: int = 100,  # Will use DESKTOP_PARAMS for desktop mode
-        max_generations: int = 1000,  # Reduced from 2000
-        max_runtime: float = 300.0,  # 5 minutes default for Range 0 optimization
+        max_generations: Optional[int] = None,  # None = no explicit preference; see _resolve_ga_sizing
+        max_runtime: Optional[float] = None,  # None = no explicit preference; see _resolve_ga_sizing
         min_runtime: float | None = None,
         use_desktop_params: bool = False,  # Enable desktop optimization
         progress_callback: Optional[Callable[..., object]] = None,
@@ -182,26 +266,9 @@ class GeneticPickleballScheduler:
             raise ValueError("num_courts must be >= 1")
 
         # Desktop parameter optimization with feasibility analysis
-        if use_desktop_params:
-            # Get optimal parameters based on player count and mathematical constraints
-            if ScheduleFeasibilityAnalyzer:
-                optimal_params = ScheduleFeasibilityAnalyzer.get_optimal_parameters(len(players))
-                population_size = optimal_params["population_size"]
-                max_generations = optimal_params["max_generations"]
-                max_runtime = optimal_params["max_runtime"]
-                self.mutation_rate = optimal_params["mutation_rate"]
-                self.crossover_rate = optimal_params["crossover_rate"]
-                self.convergence_patience = optimal_params["convergence_patience"]
-                self.elite_size = optimal_params["elite_size"]
-                self.tournament_size = optimal_params["tournament_size"]
-            else:
-                # Fallback to original desktop params
-                population_size = self.DESKTOP_PARAMS["population_size"]
-                self.mutation_rate = self.DESKTOP_PARAMS["mutation_rate"]
-                self.crossover_rate = self.DESKTOP_PARAMS["crossover_rate"]
-                self.convergence_patience = self.DESKTOP_PARAMS["convergence_patience"]
-                self.elite_size = self.DESKTOP_PARAMS["elite_size"]
-                self.tournament_size = self.DESKTOP_PARAMS["tournament_size"]
+        population_size, max_generations, max_runtime, desktop_tunables = self._resolve_ga_sizing(
+            use_desktop_params, len(players), population_size, max_generations, max_runtime
+        )
 
         # Store progress callback for real-time updates
         self.progress_callback = progress_callback
@@ -223,11 +290,12 @@ class GeneticPickleballScheduler:
         if self.num_players == 0:
             raise ValueError("players list cannot be empty")
 
-        # Use fixed court assignment for desktop mode
-        if use_desktop_params:
-            self.num_courts = self.get_fixed_courts(self.num_players)
-        else:
-            self.num_courts = int(num_courts)
+        # num_courts is always the caller's explicit choice (physical courts
+        # available cannot be inferred from player count alone - a club with
+        # 16 players and 3 courts is a real, common case). Desktop mode only
+        # affects population/mutation tuning via _resolve_ga_sizing, never
+        # how many courts are used.
+        self.num_courts = int(num_courts)
 
         self.num_rounds = int(num_rounds) if num_rounds is not None else 8
 
@@ -252,19 +320,18 @@ class GeneticPickleballScheduler:
         if self.max_runtime < self.min_runtime:
             self.max_runtime = max(1.0, self.min_runtime)  # At least 1 second max
 
-        # Default parameters (overridden by desktop params if enabled)
-        if not use_desktop_params:
-            # Increase mutation for better exploration (non-desktop mode)
-            self.mutation_rate = 0.20  # Increased from 0.12
-            self.crossover_rate = 0.85  # Increased from 0.8
-            self.elite_size = max(4, self.population_size // 5)  # Keep more elites
-            self.tournament_size = 7  # Default tournament size for non-desktop mode
+        # GA tunables - resolved here for both desktop and non-desktop modes,
+        # so every tunable (including convergence_patience) is always set.
+        tunables = self._resolve_ga_tunables(use_desktop_params, desktop_tunables, self.population_size)
+        self.mutation_rate = tunables["mutation_rate"]
+        self.crossover_rate = tunables["crossover_rate"]
+        self.convergence_patience = tunables["convergence_patience"]
+        self.elite_size = tunables["elite_size"]
+        self.tournament_size = tunables["tournament_size"]
 
         # Constraints
         self.do_not_pair_map: Dict[str, set[str]] = defaultdict(set)
         self.do_not_oppose_map: Dict[str, set[str]] = defaultdict(set)
-        self.must_pair_map: Dict[str, set[str]] = defaultdict(set)
-        self.must_oppose_map: Dict[str, set[str]] = defaultdict(set)
 
         # Availability/timing (legacy compatibility)
         self.availability: Dict[str, Any] = {}
@@ -283,7 +350,7 @@ class GeneticPickleballScheduler:
                     "to": getattr(p, "available_to", None),
                 }
 
-        if ScheduleFeasibilityAnalyzer:
+        if ScheduleFeasibilityAnalyzer is not None:
             feasibility = ScheduleFeasibilityAnalyzer.calculate_theoretical_minimums(
                 self.num_players,
                 self.num_courts,
@@ -335,9 +402,6 @@ class GeneticPickleballScheduler:
         self._progress_update_interval = 2.0  # Update every 2 seconds max
         # Last run diagnostics
         self.last_fitness_details: Dict[str, int] | None = None
-        # Legacy/compatibility knobs - don't override convergence_patience if already set by desktop params
-        if not hasattr(self, "convergence_patience"):
-            self.convergence_patience: int = 60
         self.time_budget: float = float(self.max_runtime)
 
     # ---------------- Public API ----------------
@@ -345,8 +409,6 @@ class GeneticPickleballScheduler:
         self,
         pair_constraints: List[Tuple[str, str]] | None = None,
         oppose_constraints: List[Tuple[str, str]] | None = None,
-        must_pair: List[Tuple[str, str]] | None = None,
-        must_oppose: List[Tuple[str, str]] | None = None,
     ) -> None:
         if pair_constraints:
             for a, b in pair_constraints:
@@ -377,16 +439,6 @@ class GeneticPickleballScheduler:
             self._schedule_cache.clear()
             self._signature_cache.clear()
             self._refresh_arrangement_stats()
-        if must_pair:
-            for a, b in must_pair:
-                a, b = str(a), str(b)
-                self.must_pair_map[a].add(b)
-                self.must_pair_map[b].add(a)
-        if must_oppose:
-            for a, b in must_oppose:
-                a, b = str(a), str(b)
-                self.must_oppose_map[a].add(b)
-                self.must_oppose_map[b].add(a)
 
     def _minimum_runtime_before_general_stop(self) -> float:
         """Return the minimum runtime before non-perfect early exits are allowed."""
@@ -437,6 +489,14 @@ class GeneticPickleballScheduler:
         self._run_rng = rng
         self._run_clock = now
 
+        # A verified constructive design (see constructive_scheduler.py) may
+        # exist for this exact player count/court/round combination. With no
+        # active constraints it is already optimal, so skip the GA entirely;
+        # with constraints active, use it to seed the initial population
+        # instead of starting purely random.
+        seed_individual = self._build_seed_individual()
+        has_active_constraints = any(self.do_not_pair_map.values()) or any(self.do_not_oppose_map.values())
+
         print_scheduler_start_banner(
             print,
             absolute_min_runtime=absolute_min_runtime,
@@ -451,18 +511,25 @@ class GeneticPickleballScheduler:
             seed=seed,
         )
 
-        best_individual, best_fitness, generations_run = run_evolution_loop(
-            self,
-            rng=rng,
-            now=now,
-            start_time=start_time,
-            verbose=verbose,
-            progress_callback=progress_callback,
-            absolute_min_runtime=absolute_min_runtime,
-            perfect_stop_runtime=perfect_stop_runtime,
-            printer=print,
-            invoke_progress=invoke_progress_callback,
-        )
+        if seed_individual is not None and not has_active_constraints:
+            print("✨ Using a verified constructive design - already optimal, skipping search.")
+            best_individual = seed_individual
+            best_fitness = self._fitness(best_individual)
+            generations_run = 0
+        else:
+            best_individual, best_fitness, generations_run = run_evolution_loop(
+                self,
+                rng=rng,
+                now=now,
+                start_time=start_time,
+                verbose=verbose,
+                progress_callback=progress_callback,
+                absolute_min_runtime=absolute_min_runtime,
+                perfect_stop_runtime=perfect_stop_runtime,
+                printer=print,
+                invoke_progress=invoke_progress_callback,
+                seed_individuals=[seed_individual] if seed_individual is not None else None,
+            )
 
         # Final results
         if best_individual is None:
@@ -496,7 +563,7 @@ class GeneticPickleballScheduler:
                     final_metrics = repair_metrics
                     current_total_range = repair_total
                 else:
-                    print(f"   ⚠️ REPAIR PARTIAL: Reduced to total range {repair_total}")
+                    print(f"   ⚠️ REPAIR PARTIAL: No improvement - still total range {repair_total}")
 
         elapsed_seconds = now() - start_time
         print_scheduler_final_report(
@@ -548,7 +615,7 @@ class GeneticPickleballScheduler:
                 )
 
         # Add feasibility analysis if available
-        if ScheduleFeasibilityAnalyzer:
+        if ScheduleFeasibilityAnalyzer is not None:
             feasibility_assessment = ScheduleFeasibilityAnalyzer.assess_quality_with_feasibility(
                 final_metrics, self.num_players, self.num_courts, self.num_rounds
             )
@@ -642,6 +709,79 @@ class GeneticPickleballScheduler:
         """Check if a game satisfies all constraints."""
         return _game_valid_fn(game, self.do_not_pair_map, self.do_not_oppose_map)
 
+    def _build_seed_individual(self) -> Tuple[int, ...] | None:
+        """Build a GA individual from a verified constructive design (see
+        constructive_scheduler.py) for this player count, or None if no
+        design applies here - in which case the caller falls back to a fully
+        random initial population exactly as before this existed.
+
+        With no active do_not_pair/do_not_oppose constraints, the returned
+        individual decodes to a schedule that is already optimal (range 0),
+        so the caller can use it directly instead of running the GA at all.
+        With constraints active, up to 20 random player-to-group reorderings
+        are tried until one produces a schedule where every game satisfies
+        the constraints; if none do, seeding is skipped (None) rather than
+        forcing an invalid schedule into the population.
+
+        Only extends self.arrangements (and refreshes the pool stats derived
+        from it) when a usable design is actually found - a no-op on every
+        unsupported player count/court/round combination.
+        """
+        if self.num_players != self.num_courts * 4:
+            return None  # the design assumes every player plays every round
+
+        # Shuffle which physical player fills each design slot so repeated,
+        # unseeded calls return varied schedules instead of the byte-identical
+        # one every time - the construction is optimal for any name ordering,
+        # so this can't regress range/fairness. A fixed seed still reproduces
+        # the exact same shuffle, so seed-replay stays deterministic.
+        rng = getattr(self, "_run_rng", None) or random.Random(0)
+        names = list(self._names)
+        rng.shuffle(names)
+        probe = _build_perfect_schedule_fn(names, self.num_courts, self.num_rounds)
+        if probe is None:
+            return None  # no verified design for this (courts, rounds) combination
+
+        has_constraints = any(self.do_not_pair_map.values()) or any(self.do_not_oppose_map.values())
+        if not has_constraints:
+            schedule = probe
+        else:
+            schedule = None
+            for _ in range(20):
+                candidate_names = rng.sample(names, len(names))
+                candidate = _build_perfect_schedule_fn(candidate_names, self.num_courts, self.num_rounds)
+                if candidate and all(self._game_valid(game) for round_games in candidate for game in round_games):
+                    schedule = candidate
+                    break
+            if schedule is None:
+                return None  # constraints conflict with the design in every tried ordering
+
+        assert schedule is not None
+        # Reuse existing pool slots for rounds already present (by signature)
+        # instead of blindly appending - otherwise a long-lived instance whose
+        # caller replays the same seed repeatedly (or regenerates without a
+        # seed) grows self.arrangements by num_rounds on every single call.
+        signature_to_index = {
+            self._round_signature(arrangement): idx for idx, arrangement in enumerate(self.arrangements)
+        }
+        new_indices = []
+        pool_grew = False
+        for round_games in schedule:
+            signature = self._round_signature(round_games)
+            idx = signature_to_index.get(signature)
+            if idx is None:
+                idx = len(self.arrangements)
+                self.arrangements.append(round_games)
+                signature_to_index[signature] = idx
+                pool_grew = True
+            new_indices.append(idx)
+
+        if pool_grew:
+            self._refresh_arrangement_stats()
+            self.max_unique_rounds = len({self._round_signature(arrangement) for arrangement in self.arrangements})
+            self.minimum_duplicate_rounds = max(0, self.num_rounds - self.max_unique_rounds)
+        return tuple(new_indices)
+
     def _tournament_select(self, population, fitness_scores, rng, k=7):
         """Tournament selection with configurable tournament size."""
         return _tournament_select_fn(population, fitness_scores, rng, k)
@@ -729,6 +869,19 @@ class GeneticPickleballScheduler:
         """Count duplicate rounds beyond the mathematically unavoidable minimum."""
         return count_avoidable_duplicate_rounds(schedule, self.minimum_duplicate_rounds)
 
+    def _enforce_cache_size_limit(self) -> None:
+        """Clear the per-run evaluation caches together once they've grown
+        past _MAX_CACHE_ENTRIES, so a long-running search (large
+        max_generations) can't grow them without bound. A full clear (rather
+        than per-cache LRU eviction) keeps the four caches - which all key on
+        the same individual tuples - always in sync with each other."""
+        if len(self._fitness_cache) <= self._MAX_CACHE_ENTRIES:
+            return
+        self._fitness_cache.clear()
+        self._metrics_cache.clear()
+        self._schedule_cache.clear()
+        self._signature_cache.clear()
+
     def _get_duplicate_signature_cached(self, individual: Tuple[int, ...], schedule: List[List[Tuple]]) -> Tuple:
         """Cached duplicate-round signature built from precomputed pool signatures."""
         _ = schedule  # The individual's pool indices fully determine the signature.
@@ -794,6 +947,7 @@ class GeneticPickleballScheduler:
 
         # Cache the result
         self._fitness_cache[individual] = penalty
+        self._enforce_cache_size_limit()
 
         return penalty
 
@@ -850,6 +1004,8 @@ class GeneticPickleballScheduler:
             max_time,
             evaluate_metrics=self._evaluate_metrics,
             printer=print,
+            rng=getattr(self, "_run_rng", None),
+            clock=getattr(self, "_run_clock", None),
         )
 
     def _format_schedule(self, schedule: List[List[Tuple[str, str, str, str]]]) -> List[Dict[str, Any]]:

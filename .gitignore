@@ -227,9 +227,6 @@ artifacts/ui_smoke/
 /run_all_gui_tests.py
 /GUI_TEST_CONSOLIDATION_SUMMARY.py
 
-# Local-only archive of retired root diagnostics (never tracked; kept for reference)
-/archive/root_diagnostics/
-
 # Default player names backup files (preserve originals)
 data/default_player_names.backup.json
 /manage_defaults.py

@@ -11,6 +11,15 @@ try:
 except ImportError:
     from utils.schedule_shapes import extract_game_teams
 
+_FORMULA_TRIGGER_CHARS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _excel_safe(value: str) -> str:
+    """Neutralize spreadsheet formula injection (CWE-1236) in exported cells."""
+    if value and value[0] in _FORMULA_TRIGGER_CHARS:
+        return "'" + value
+    return value
+
 
 def compute_round_times(num_rounds: int, start_time: str, end_time: str) -> List[str]:
     """Evenly divide a scheduling window into a display time per round.
@@ -170,8 +179,8 @@ def blank_score_sheet_csv(games: List[dict]) -> str:
     from list_games_for_scoring(schedule) output, for a scorekeeper to fill in and re-import."""
     lines = ["round,court,team1,team2,team1_score,team2_score"]
     for game in games:
-        team1 = " & ".join(game["team1"])
-        team2 = " & ".join(game["team2"])
+        team1 = _excel_safe(" & ".join(game["team1"]))
+        team2 = _excel_safe(" & ".join(game["team2"]))
         lines.append(f"{game['round_num']},{game['court']},{team1},{team2},,")
     return "\n".join(lines)
 
@@ -239,8 +248,8 @@ def schedule_to_csv(schedule: Iterable[Any]) -> str:
         games = round_data.get("games", [])
         for game in games:
             raw_team1, raw_team2, court = extract_game_teams(game)
-            team1 = [str(p) for p in raw_team1]
-            team2 = [str(p) for p in raw_team2]
+            team1 = [_excel_safe(str(p)) for p in raw_team1]
+            team2 = [_excel_safe(str(p)) for p in raw_team2]
 
             line = f"{round_num},{court},{team1[0]},{team1[1]},{team2[0]},{team2[1]}"
             csv_lines.append(line)
@@ -286,8 +295,8 @@ def schedule_to_xlsx(schedule, all_players=None, round_times=None, scores=None) 
             [
                 game["round_num"],
                 game["court"],
-                " & ".join(game["team1"]),
-                " & ".join(game["team2"]),
+                _excel_safe(" & ".join(game["team1"])),
+                _excel_safe(" & ".join(game["team2"])),
                 sitting_out,
             ]
         )
@@ -307,8 +316,8 @@ def schedule_to_xlsx(schedule, all_players=None, round_times=None, scores=None) 
                 [
                     row["round_num"],
                     row["court"],
-                    " & ".join(row["team1_players"]),
-                    " & ".join(row["team2_players"]),
+                    _excel_safe(" & ".join(row["team1_players"])),
+                    _excel_safe(" & ".join(row["team2_players"])),
                     row.get("team1_score"),
                     row.get("team2_score"),
                 ]

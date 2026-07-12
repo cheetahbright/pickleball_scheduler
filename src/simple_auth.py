@@ -3,6 +3,7 @@
 
 import hmac
 import os
+import threading
 import time
 
 import streamlit as st
@@ -13,6 +14,15 @@ TRUE_VALUES = {"1", "true", "yes"}
 
 MAX_LOGIN_ATTEMPTS = 5
 LOGIN_ATTEMPT_WINDOW_SECONDS = 600
+
+# Failed-login timestamps for the single shared app password, tracked process-wide
+# rather than in st.session_state. session_state is scoped per browser session, so
+# an attacker could reset the lockout just by opening a new tab/incognito window.
+# Streamlit Community Cloud runs one process per app, so module-level state is shared
+# across every session; the lock guards concurrent ScriptRunner threads. A process
+# restart clears this, which is acceptable - it is not an attacker-triggerable reset.
+_failed_attempts_lock = threading.Lock()
+_failed_attempts: list[float] = []
 
 
 def _configured_password() -> str | None:
@@ -40,15 +50,36 @@ def _is_e2e_mode() -> bool:
 
 def _recent_failed_attempts() -> list[float]:
     """Return failed-login timestamps still inside the rate-limit window, pruning stale ones."""
-    attempts = st.session_state.get("simple_auth_failed_attempts", [])
     cutoff = time.time() - LOGIN_ATTEMPT_WINDOW_SECONDS
-    recent = [attempt for attempt in attempts if attempt > cutoff]
-    st.session_state.simple_auth_failed_attempts = recent
-    return recent
+    with _failed_attempts_lock:
+        _failed_attempts[:] = [attempt for attempt in _failed_attempts if attempt > cutoff]
+        return list(_failed_attempts)
+
+
+def _record_failed_attempt() -> None:
+    """Record one failed login against the process-wide rate-limit window."""
+    cutoff = time.time() - LOGIN_ATTEMPT_WINDOW_SECONDS
+    now = time.time()
+    with _failed_attempts_lock:
+        _failed_attempts[:] = [attempt for attempt in _failed_attempts if attempt > cutoff]
+        _failed_attempts.append(now)
+
+
+def _reset_failed_attempts() -> None:
+    """Clear the failed-login window after a successful login."""
+    with _failed_attempts_lock:
+        _failed_attempts.clear()
 
 
 def simple_auth():
     """Return True when auth is satisfied or disabled by configuration."""
+    if _is_e2e_mode() and _configured_password() is not None:
+        raise RuntimeError(
+            "E2E_TEST auth bypass is enabled while an app password is configured - "
+            "refusing to start with authentication disabled. Unset E2E_TEST in any "
+            "environment where PICKLEBALL_APP_PASSWORD or the app_password secret is set."
+        )
+
     if _is_e2e_mode():
         st.session_state.simple_auth = True
         return True
@@ -75,11 +106,11 @@ def simple_auth():
     if st.button("Login"):
         if hmac.compare_digest(password.encode("utf-8"), configured_password.encode("utf-8")):
             st.session_state.simple_auth = True
-            st.session_state.simple_auth_failed_attempts = []
+            _reset_failed_attempts()
             st.success("✅ Welcome!")
             st.rerun()
         else:
-            st.session_state.simple_auth_failed_attempts = _recent_failed_attempts() + [time.time()]
+            _record_failed_attempt()
             st.error("❌ Wrong password")
 
     return False

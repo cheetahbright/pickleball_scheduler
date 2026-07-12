@@ -1,6 +1,8 @@
 """Pure schedule analytics helpers shared by the Streamlit app and tests."""
 
-from typing import Any, Dict, List, Optional
+from __future__ import annotations
+
+from typing import Any
 
 try:
     from src.utils.schedule_shapes import extract_game_teams
@@ -73,7 +75,7 @@ def serialize_schedule_for_json(schedule):
     return serializable_schedule
 
 
-def compute_team_skill_balance(schedule: List[Dict], skills: Dict[str, int]) -> List[Dict[str, Any]]:
+def compute_team_skill_balance(schedule: list[dict], skills: dict[str, int]) -> list[dict[str, Any]]:
     """Per-game team skill totals and imbalance, for players with a rated skill.
 
     Unrated players are excluded from their team's sum (not treated as 0 -
@@ -82,19 +84,14 @@ def compute_team_skill_balance(schedule: List[Dict], skills: Dict[str, int]) -> 
     nothing to report. Does not feed into schedule generation; this is a
     post-hoc analytics view only (see SkillRatingManager docstring).
     """
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
 
     for round_num, round_data in enumerate(schedule, 1):
         games = round_data.get("games", []) if hasattr(round_data, "get") else [round_data]
         for game in games:
-            if hasattr(game, "team1"):
-                team1 = [str(p) for p in game.team1]
-                team2 = [str(p) for p in game.team2]
-                court = game.court
-            else:
-                team1 = [str(p) for p in game.get("team1", [])]
-                team2 = [str(p) for p in game.get("team2", [])]
-                court = game.get("court", 1)
+            raw_team1, raw_team2, court = extract_game_teams(game)
+            team1 = [str(p) for p in raw_team1]
+            team2 = [str(p) for p in raw_team2]
 
             team1_ratings = [skills[p] for p in team1 if p in skills]
             team2_ratings = [skills[p] for p in team2 if p in skills]
@@ -119,7 +116,7 @@ def compute_team_skill_balance(schedule: List[Dict], skills: Dict[str, int]) -> 
     return rows
 
 
-def build_pairing_matrices(schedule: List[Dict], players: List[str]):
+def build_pairing_matrices(schedule: list[dict], players: list[str]) -> tuple[list[list[int]], list[list[int]]]:
     """Return (partner_counts, opponent_counts) as NxN matrices in `players` order.
 
     partner_counts[i][j] is how many times players[i] and players[j] were on
@@ -134,12 +131,9 @@ def build_pairing_matrices(schedule: List[Dict], players: List[str]):
     for round_data in schedule:
         games = round_data.get("games", []) if hasattr(round_data, "get") else []
         for game in games:
-            if hasattr(game, "team1"):
-                team1 = [str(p) for p in game.team1]
-                team2 = [str(p) for p in game.team2]
-            else:
-                team1 = [str(p) for p in game.get("team1", [])]
-                team2 = [str(p) for p in game.get("team2", [])]
+            raw_team1, raw_team2, _court = extract_game_teams(game)
+            team1 = [str(p) for p in raw_team1]
+            team2 = [str(p) for p in raw_team2]
 
             for team, matrix in ((team1, partner_counts), (team2, partner_counts)):
                 for a in range(len(team)):
@@ -162,16 +156,16 @@ def build_pairing_matrices(schedule: List[Dict], players: List[str]):
 
 
 def calculate_fairness_metrics(
-    schedule: List[Dict],
-    num_players: Optional[int] = None,
-    num_rounds: Optional[int] = None,
-    num_courts: Optional[int] = None,
-) -> Dict[str, Any]:
+    schedule: list[dict],
+    num_players: int | None = None,
+    num_rounds: int | None = None,
+    num_courts: int | None = None,
+) -> dict[str, Any]:
     """Calculate fairness metrics and theoretical optimality for a schedule."""
     if not schedule:
         return {}
 
-    player_stats: Dict[str, Dict[str, Any]] = {}
+    player_stats: dict[str, dict[str, Any]] = {}
 
     for round_data in schedule:
         games = round_data.get("games", [])

@@ -94,6 +94,17 @@ def remove_player_from_text(players_text: str, player_to_remove: str) -> str:
     return "\n".join([player for player in current_players if player != player_to_remove])
 
 
+def _constructive_design_available(num_players: int, num_courts: int, num_rounds: int) -> bool:
+    """Whether the constructive fast path (constructive_scheduler.py) has a
+    verified design for this exact configuration - producing a range-0
+    schedule instantly, without running the GA search at all."""
+    if num_players != num_courts * 4:
+        return False
+    build_perfect_schedule = import_module_with_fallback("algorithms.constructive_scheduler").build_perfect_schedule
+    probe_names = [str(i) for i in range(num_players)]
+    return build_perfect_schedule(probe_names, num_courts, num_rounds) is not None
+
+
 def build_feasibility_notes(num_players: int, num_courts: int, num_rounds: int) -> list[str]:
     """Advisory notes about whether this configuration can reach a perfectly fair schedule.
 
@@ -107,7 +118,12 @@ def build_feasibility_notes(num_players: int, num_courts: int, num_rounds: int) 
     notes: list[str] = []
 
     if feasibility["range_0_possible"]:
-        notes.append(f"✅ A perfectly fair schedule (range 0) is mathematically possible for {num_players} players.")
+        if _constructive_design_available(num_players, num_courts, num_rounds):
+            notes.append(f"✅ A perfectly fair schedule (range 0) is guaranteed instant for {num_players} players.")
+        else:
+            notes.append(
+                f"✅ A perfectly fair schedule (range 0) is mathematically possible for {num_players} players."
+            )
         return notes
 
     notes.append(
@@ -131,6 +147,29 @@ def build_feasibility_notes(num_players: int, num_courts: int, num_rounds: int) 
         notes.append(f"With {counts_text} players (same round count), range 0 becomes possible.")
 
     return notes
+
+
+def suggest_max_generation_time(num_players: int, num_constraints: int) -> int:
+    """Suggest a starting "Max generation time" scaled to this configuration's
+    complexity, rather than a flat default regardless of player count or
+    constraint pressure.
+
+    Starts from the same per-player-count runtime tiers
+    ScheduleFeasibilityAnalyzer.get_optimal_parameters already uses internally
+    for the GA's own tuning, then adds a bump proportional to constraint
+    density: do_not_pair/do_not_oppose constraints shrink the feasible
+    arrangement pool add_constraints() has to rebuild and search
+    (see genetic_scheduler.py), so a heavily constrained group needs more
+    time to find a good schedule than an unconstrained one of the same size.
+    The result is capped to the widget's own 10-300s range.
+    """
+    ScheduleFeasibilityAnalyzer = import_module_with_fallback("utils.feasibility_analyzer").ScheduleFeasibilityAnalyzer
+    base_runtime = ScheduleFeasibilityAnalyzer.get_optimal_parameters(num_players)["max_runtime"]
+
+    constraint_density = num_constraints / max(1, num_players)
+    constraint_bump = min(60.0, constraint_density * 40.0)
+
+    return int(min(300, max(10, round(base_runtime + constraint_bump))))
 
 
 def constraint_pressure_warnings(
@@ -397,24 +436,12 @@ def render_enhanced_scheduler_page(
         for message in repair_messages or []:
             st_module.warning(f"⚠️ {message}")
 
-    ui_config = st_module.session_state.app_config.setdefault("ui", {"theme": "light"})
-
-    col1, col2, col3 = st_module.columns([1, 0.3, 0.2])
+    col1, col2 = st_module.columns([1, 0.2])
     with col1:
         st_module.title("🎾 Pickleball Scheduler")
     with col2:
-        dark_mode = st_module.checkbox("🌙 Dark mode", value=ui_config.get("theme") == "dark")
-        new_theme = "dark" if dark_mode else "light"
-        if new_theme != ui_config.get("theme"):
-            ui_config["theme"] = new_theme
-            st_module.session_state.config_manager.save_config(st_module.session_state.app_config)
-            st_module.rerun()
-    with col3:
         if st_module.button("Logout"):
             logout_fn()
-
-    inject_theme_css = import_module_with_fallback("theme_styles").inject_theme_css
-    inject_theme_css(st_module, ui_config.get("theme", "light"))
 
     st_module.markdown("*Complete scheduling with analytics and history*")
 
@@ -448,6 +475,177 @@ def render_enhanced_scheduler_page(
     for tab, tab_fn in zip(tabs, tab_fns):
         with tab:
             tab_fn()
+
+
+def _handle_generate_schedule_click(
+    st_module,
+    config,
+    players,
+    num_rounds,
+    courts,
+    max_time,
+    generation_seed,
+    scheduler_cls,
+    schedule_analytics_cls,
+    validate_schedule_integrity_fn,
+) -> bool:
+    """Handle the "Generate Enhanced Schedule" button: build the scheduler,
+    generate and validate a schedule, and persist it to session_state/history.
+
+    Returns True if the caller should skip rendering the persistent schedule
+    view this run (mirrors this code's original early `return` on a
+    no-schedule or invalid-schedule result); False otherwise, including when
+    generation raises - the caller falls through to the persistent view then,
+    exactly as it did before this was extracted.
+    """
+    with st_module.status("Generating schedule...", expanded=True) as status_box:
+        progress_bar = st_module.progress(0)
+        progress_text = st_module.empty()
+
+        def _on_progress(progress_data, _bar=progress_bar, _text=progress_text, _max_time=max_time):
+            try:
+                elapsed = float(progress_data.get("elapsed_time", 0.0))
+                budget = float(progress_data.get("max_time") or _max_time or 1.0)
+                fraction = max(0.0, min(1.0, elapsed / budget)) if budget else 0.0
+                _bar.progress(fraction)
+                generation = progress_data.get("generation", 0)
+                total_range = progress_data.get("total_range", "?")
+                _text.text(f"Generation {generation} - best range {total_range} - {elapsed:.0f}s elapsed")
+            except Exception:
+                logger.debug("Progress callback failed", exc_info=True)
+
+        import time as _time
+
+        generation_started_at = _time.time()
+        logger.info(
+            "Generation start: players=%d rounds=%d courts=%d " "pair_constraints=%d oppose_constraints=%d seed=%s",
+            len(players),
+            num_rounds,
+            courts,
+            len(config["constraints"]["do_not_pair"]),
+            len(config["constraints"]["do_not_oppose"]),
+            generation_seed,
+        )
+
+        try:
+            if not st_module.session_state.config_manager.save_config(config):
+                st_module.warning("⚠️ Could not save configuration before generating - continuing anyway.")
+
+            scheduler = scheduler_cls(
+                players=players,
+                num_courts=courts,
+                num_rounds=num_rounds,
+                use_desktop_params=True,
+                max_runtime=max_time,
+                max_generations=max(2000, int(max_time * 70)),
+            )
+
+            constraints = config["constraints"]
+            if constraints["do_not_pair"] or constraints["do_not_oppose"]:
+                scheduler.add_constraints(
+                    pair_constraints=[
+                        tuple(pair) if isinstance(pair, list) else pair for pair in constraints["do_not_pair"]
+                    ],
+                    oppose_constraints=[
+                        tuple(pair) if isinstance(pair, list) else pair for pair in constraints["do_not_oppose"]
+                    ],
+                )
+
+            result = scheduler.generate_schedule(
+                max_time=max_time,
+                seed=generation_seed,
+                progress_callback=_on_progress,
+            )
+
+            if not (isinstance(result, dict) and "schedule" in result):
+                logger.warning(
+                    "Generation end: status=no_schedule elapsed=%.1fs",
+                    _time.time() - generation_started_at,
+                )
+                st_module.error("❌ Could not generate schedule. Try adjusting parameters.")
+                status_box.update(label="❌ Generation failed", state="error")
+                return True
+
+            schedule_data = result["schedule"]
+            schedule_errors = validate_schedule_integrity_fn(schedule_data, players)
+
+            if schedule_errors:
+                logger.error(
+                    "Generation end: status=invalid_schedule elapsed=%.1fs errors=%d",
+                    _time.time() - generation_started_at,
+                    len(schedule_errors),
+                )
+                st_module.error("🚨 **CRITICAL ERROR: Invalid schedule generated!**")
+                st_module.error("**The algorithm has bugs that generated impossible player assignments!**")
+                for error in schedule_errors:
+                    st_module.error(f"❌ {error}")
+                st_module.error("**🛑 This indicates serious bugs in the scheduling algorithm!**")
+                st_module.info("Please report this bug with the exact player configuration.")
+                status_box.update(label="❌ Invalid schedule generated", state="error")
+                return True
+
+            progress_bar.progress(1.0)
+            status_box.update(label="✅ Done", state="complete")
+            st_module.success("✅ Enhanced schedule generated!")
+
+            metrics = schedule_analytics_cls.calculate_fairness_metrics(
+                schedule_data,
+                num_players=len(players),
+                num_rounds=num_rounds,
+                num_courts=courts,
+            )
+
+            logger.info(
+                "Generation end: status=ok elapsed=%.1fs total_range=%s",
+                _time.time() - generation_started_at,
+                metrics.get("total_range") if isinstance(metrics, dict) else None,
+            )
+
+            compute_round_times = import_module_with_fallback("app_schedule_helpers").compute_round_times
+
+            scheduling_config = config.get("scheduling", {})
+            round_times = compute_round_times(
+                num_rounds,
+                scheduling_config.get("start_time"),
+                scheduling_config.get("end_time"),
+            )
+
+            st_module.session_state.current_schedule = schedule_data
+            st_module.session_state.current_players = players
+            st_module.session_state.current_metrics = metrics
+            st_module.session_state.current_seed = result.get("seed")
+            st_module.session_state.current_round_times = round_times
+
+            settings = {
+                "num_rounds": num_rounds,
+                "courts": courts,
+                "max_time": max_time,
+                "constraints": config["constraints"],
+                "seed": result.get("seed"),
+            }
+            # generations == 0 means the constructive fast path produced this
+            # schedule directly, without running the GA search at all.
+            algorithm = "constructive" if result.get("generations") == 0 else "genetic"
+            st_module.session_state.current_schedule_id = st_module.session_state.history_manager.save_schedule(
+                schedule_data, players, settings, algorithm=algorithm
+            )
+            if st_module.session_state.current_schedule_id is None:
+                st_module.warning("⚠️ Schedule generated but could not be saved to history.")
+
+        except MemoryError:
+            logger.exception("Generation end: status=exception elapsed=%.1fs", _time.time() - generation_started_at)
+            st_module.error("❌ Ran out of memory while generating the schedule. Try fewer players or rounds.")
+            status_box.update(label="❌ Out of memory", state="error")
+        except ValueError as exc:
+            logger.exception("Generation end: status=exception elapsed=%.1fs", _time.time() - generation_started_at)
+            st_module.error(f"❌ Invalid input: {exc}. Check your players and constraints.")
+            status_box.update(label="❌ Invalid input", state="error")
+        except Exception:
+            logger.exception("Generation end: status=exception elapsed=%.1fs", _time.time() - generation_started_at)
+            st_module.error("❌ Schedule generation failed unexpectedly. See the server logs for details.")
+            status_box.update(label="❌ Generation error", state="error")
+
+    return False
 
 
 def render_main_scheduler_tab(
@@ -526,6 +724,8 @@ def render_main_scheduler_tab(
                 config["player_presets"][preset_name.strip()] = preset_players
                 if st_module.session_state.config_manager.save_config(config):
                     st_module.success(f"Saved preset: {preset_name.strip()}")
+                else:
+                    st_module.error(f"❌ Failed to save preset: {preset_name.strip()}")
 
     players = parse_players_text(players_text)
 
@@ -631,7 +831,8 @@ def render_main_scheduler_tab(
                 )
                 added, message = add_quick_constraint(config, quick_player_a, quick_player_b, constraint_key)
                 if added:
-                    st_module.session_state.config_manager.save_config(config)
+                    if not st_module.session_state.config_manager.save_config(config):
+                        st_module.error("❌ Failed to save constraint.")
                     st_module.session_state.app_config = config
                     st_module.session_state._constraint_widget_version = (
                         int(st_module.session_state.get("_constraint_widget_version", 0)) + 1
@@ -664,7 +865,18 @@ def render_main_scheduler_tab(
         )
 
     with col3:
-        max_time = st_module.number_input("Max generation time (seconds):", min_value=10, max_value=300, value=60)
+        suggested_max_time = suggest_max_generation_time(len(players), total_constraints)
+        max_time = st_module.number_input(
+            "Max generation time (seconds):",
+            min_value=10,
+            max_value=300,
+            value=suggested_max_time,
+            help=(
+                f"Suggested for {len(players)} players and {total_constraints} constraint(s) - "
+                "harder setups (more players, more do-not-pair/oppose constraints) suggest more "
+                "time. Adjust as needed."
+            ),
+        )
 
     with st_module.expander("📐 Expected quality for this configuration"):
         for note in build_feasibility_notes(len(players), courts, num_rounds):
@@ -692,146 +904,20 @@ def render_main_scheduler_tab(
             st_module.warning("Seed must be a whole number - ignoring it for this run.")
 
     if st_module.button("🎯 Generate Enhanced Schedule", type="primary"):
-        with st_module.status("Generating schedule...", expanded=True) as status_box:
-            progress_bar = st_module.progress(0)
-            progress_text = st_module.empty()
-
-            def _on_progress(progress_data, _bar=progress_bar, _text=progress_text, _max_time=max_time):
-                try:
-                    elapsed = float(progress_data.get("elapsed_time", 0.0))
-                    budget = float(progress_data.get("max_time") or _max_time or 1.0)
-                    fraction = max(0.0, min(1.0, elapsed / budget)) if budget else 0.0
-                    _bar.progress(fraction)
-                    generation = progress_data.get("generation", 0)
-                    total_range = progress_data.get("total_range", "?")
-                    _text.text(f"Generation {generation} - best range {total_range} - {elapsed:.0f}s elapsed")
-                except Exception:
-                    logger.debug("Progress callback failed", exc_info=True)
-
-            import time as _time
-
-            generation_started_at = _time.time()
-            logger.info(
-                "Generation start: players=%d rounds=%d courts=%d " "pair_constraints=%d oppose_constraints=%d seed=%s",
-                len(players),
-                num_rounds,
-                courts,
-                len(config["constraints"]["do_not_pair"]),
-                len(config["constraints"]["do_not_oppose"]),
-                generation_seed,
-            )
-
-            try:
-                st_module.session_state.config_manager.save_config(config)
-
-                scheduler = scheduler_cls(
-                    players=players,
-                    num_courts=courts,
-                    num_rounds=num_rounds,
-                    use_desktop_params=True,
-                    max_runtime=max_time,
-                    max_generations=max(2000, int(max_time * 70)),
-                )
-
-                constraints = config["constraints"]
-                if constraints["do_not_pair"] or constraints["do_not_oppose"]:
-                    scheduler.add_constraints(
-                        pair_constraints=[
-                            tuple(pair) if isinstance(pair, list) else pair for pair in constraints["do_not_pair"]
-                        ],
-                        oppose_constraints=[
-                            tuple(pair) if isinstance(pair, list) else pair for pair in constraints["do_not_oppose"]
-                        ],
-                    )
-
-                result = scheduler.generate_schedule(
-                    max_time=max_time,
-                    seed=generation_seed,
-                    progress_callback=_on_progress,
-                )
-
-                if not (isinstance(result, dict) and "schedule" in result):
-                    logger.warning(
-                        "Generation end: status=no_schedule elapsed=%.1fs",
-                        _time.time() - generation_started_at,
-                    )
-                    st_module.error("❌ Could not generate schedule. Try adjusting parameters.")
-                    status_box.update(label="❌ Generation failed", state="error")
-                    return
-
-                schedule_data = result["schedule"]
-                schedule_errors = validate_schedule_integrity_fn(schedule_data, players)
-
-                if schedule_errors:
-                    logger.error(
-                        "Generation end: status=invalid_schedule elapsed=%.1fs errors=%d",
-                        _time.time() - generation_started_at,
-                        len(schedule_errors),
-                    )
-                    st_module.error("🚨 **CRITICAL ERROR: Invalid schedule generated!**")
-                    st_module.error("**The algorithm has bugs that generated impossible player assignments!**")
-                    for error in schedule_errors:
-                        st_module.error(f"❌ {error}")
-                    st_module.error("**🛑 This indicates serious bugs in the scheduling algorithm!**")
-                    st_module.info("Please report this bug with the exact player configuration.")
-                    status_box.update(label="❌ Invalid schedule generated", state="error")
-                    return
-
-                progress_bar.progress(1.0)
-                status_box.update(label="✅ Done", state="complete")
-                st_module.success("✅ Enhanced schedule generated!")
-
-                metrics = schedule_analytics_cls.calculate_fairness_metrics(
-                    schedule_data,
-                    num_players=len(players),
-                    num_rounds=num_rounds,
-                    num_courts=courts,
-                )
-
-                logger.info(
-                    "Generation end: status=ok elapsed=%.1fs total_range=%s",
-                    _time.time() - generation_started_at,
-                    metrics.get("total_range") if isinstance(metrics, dict) else None,
-                )
-
-                compute_round_times = import_module_with_fallback("app_schedule_helpers").compute_round_times
-
-                scheduling_config = config.get("scheduling", {})
-                round_times = compute_round_times(
-                    num_rounds,
-                    scheduling_config.get("start_time"),
-                    scheduling_config.get("end_time"),
-                )
-
-                st_module.session_state.current_schedule = schedule_data
-                st_module.session_state.current_players = players
-                st_module.session_state.current_metrics = metrics
-                st_module.session_state.current_seed = result.get("seed")
-                st_module.session_state.current_round_times = round_times
-
-                settings = {
-                    "num_rounds": num_rounds,
-                    "courts": courts,
-                    "max_time": max_time,
-                    "constraints": config["constraints"],
-                    "seed": result.get("seed"),
-                }
-                st_module.session_state.current_schedule_id = st_module.session_state.history_manager.save_schedule(
-                    schedule_data, players, settings
-                )
-
-            except MemoryError:
-                logger.exception("Generation end: status=exception elapsed=%.1fs", _time.time() - generation_started_at)
-                st_module.error("❌ Ran out of memory while generating the schedule. Try fewer players or rounds.")
-                status_box.update(label="❌ Out of memory", state="error")
-            except ValueError as exc:
-                logger.exception("Generation end: status=exception elapsed=%.1fs", _time.time() - generation_started_at)
-                st_module.error(f"❌ Invalid input: {exc}. Check your players and constraints.")
-                status_box.update(label="❌ Invalid input", state="error")
-            except Exception as exc:
-                logger.exception("Generation end: status=exception elapsed=%.1fs", _time.time() - generation_started_at)
-                st_module.error(f"❌ Error ({type(exc).__name__}): {str(exc)}")
-                status_box.update(label="❌ Generation error", state="error")
+        skip_persistent_render = _handle_generate_schedule_click(
+            st_module,
+            config,
+            players,
+            num_rounds,
+            courts,
+            max_time,
+            generation_seed,
+            scheduler_cls,
+            schedule_analytics_cls,
+            validate_schedule_integrity_fn,
+        )
+        if skip_persistent_render:
+            return
 
     _render_persistent_schedule(
         st_module,
@@ -841,6 +927,7 @@ def render_main_scheduler_tab(
         schedule_analytics_cls,
         display_enhanced_schedule_fn,
         schedule_to_csv_fn,
+        config,
     )
 
 
@@ -852,6 +939,7 @@ def _render_persistent_schedule(
     schedule_analytics_cls,
     display_enhanced_schedule_fn,
     schedule_to_csv_fn,
+    config,
 ):
     """Re-render the last generated schedule from session_state on every run.
 
@@ -889,10 +977,10 @@ def _render_persistent_schedule(
         schedule_to_csv_fn,
     )
 
-    _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players)
+    _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players, config)
 
 
-def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players):
+def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players, config):
     """Let the user regenerate only the not-yet-played rounds, optionally with a
     changed player list (someone left early / showed up late) - without losing
     the rounds already played.
@@ -939,31 +1027,70 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players)
                 return
 
             locked_rounds, remaining_round_count = split_schedule_at_round(schedule_data, played_rounds)
-            courts = len(locked_rounds[0].get("games", [])) if locked_rounds else 1
+            # schedule_data[0] is the original schedule's first round, which is
+            # always present regardless of played_rounds - unlike locked_rounds[0],
+            # which is empty exactly when played_rounds == 0 and would otherwise
+            # silently fall back to courts=1.
+            courts = len(schedule_data[0].get("games", []))
 
-            try:
-                scheduler = scheduler_cls(
-                    players=remaining_players,
-                    num_courts=courts,
-                    num_rounds=remaining_round_count,
-                    use_desktop_params=True,
-                )
-                result = scheduler.generate_schedule()
-            except Exception as exc:
-                logger.exception("Mid-session replan failed")
-                st_module.error(f"❌ Replan failed: {exc}")
-                return
+            constraints = config["constraints"]
+            pair_constraints = [tuple(pair) if isinstance(pair, list) else pair for pair in constraints["do_not_pair"]]
+            oppose_constraints = [
+                tuple(pair) if isinstance(pair, list) else pair for pair in constraints["do_not_oppose"]
+            ]
+            total_constraints = len(pair_constraints) + len(oppose_constraints)
+            max_time = suggest_max_generation_time(len(remaining_players), total_constraints)
 
-            if not (isinstance(result, dict) and "schedule" in result):
-                st_module.error("❌ Could not replan the remaining rounds. Try adjusting the player list.")
-                return
+            with st_module.status("Replanning remaining rounds...", expanded=True) as status_box:
+                progress_bar = st_module.progress(0)
+                progress_text = st_module.empty()
+
+                def _on_progress(progress_data, _bar=progress_bar, _text=progress_text, _max_time=max_time):
+                    try:
+                        elapsed = float(progress_data.get("elapsed_time", 0.0))
+                        budget = float(progress_data.get("max_time") or _max_time or 1.0)
+                        fraction = max(0.0, min(1.0, elapsed / budget)) if budget else 0.0
+                        _bar.progress(fraction)
+                        generation = progress_data.get("generation", 0)
+                        total_range = progress_data.get("total_range", "?")
+                        _text.text(f"Generation {generation} - best range {total_range} - {elapsed:.0f}s elapsed")
+                    except Exception:
+                        logger.debug("Progress callback failed", exc_info=True)
+
+                try:
+                    scheduler = scheduler_cls(
+                        players=remaining_players,
+                        num_courts=courts,
+                        num_rounds=remaining_round_count,
+                        use_desktop_params=True,
+                        max_runtime=max_time,
+                        max_generations=max(2000, int(max_time * 70)),
+                    )
+                    if pair_constraints or oppose_constraints:
+                        scheduler.add_constraints(
+                            pair_constraints=pair_constraints,
+                            oppose_constraints=oppose_constraints,
+                        )
+                    result = scheduler.generate_schedule(max_time=max_time, progress_callback=_on_progress)
+                except Exception:
+                    logger.exception("Mid-session replan failed")
+                    st_module.error("❌ Replan failed unexpectedly. See the server logs for details.")
+                    status_box.update(label="❌ Replan failed", state="error")
+                    return
+
+                if not (isinstance(result, dict) and "schedule" in result):
+                    st_module.error("❌ Could not replan the remaining rounds. Try adjusting the player list.")
+                    status_box.update(label="❌ Replan failed", state="error")
+                    return
+
+                status_box.update(label="✅ Replan complete", state="complete")
 
             st_module.session_state.current_schedule = splice_schedules(locked_rounds, result["schedule"])
             st_module.session_state.current_players = sorted(set(players) | set(remaining_players))
             # The metrics and seed shown belong to the pre-replan schedule;
             # after splicing they no longer describe what's on screen.
             st_module.session_state.current_metrics = {}
-            st_module.session_state.current_seed = None
+            st_module.session_state.current_seed = result.get("seed")
             st_module.session_state.global_status_message = f"✅ Replanned rounds {played_rounds + 1}-{total_rounds}."
             st_module.rerun()
 

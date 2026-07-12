@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 try:
     from src._compat import import_module_with_fallback
@@ -54,7 +55,7 @@ def _fallback_log_error(logger, error, message, context=None):
 
 
 SecurityError: type[Exception] = Exception
-InputSanitizer = _FallbackInputSanitizer
+InputSanitizer: Any = _FallbackInputSanitizer
 setup_logging = _fallback_setup_logging
 log_error_with_context = _fallback_log_error
 logger = None
@@ -278,7 +279,7 @@ def launch_cli() -> None:
 
             _console_print("\n✅ Schedule generation completed!")
         else:
-            _console_print("\n� Could not generate a valid schedule")
+            _console_print("\n❌ Could not generate a valid schedule")
             _console_print("Consider:")
             _console_print("• Reducing the number of rounds")
             _console_print("• Adding more players")

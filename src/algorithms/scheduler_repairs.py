@@ -165,10 +165,97 @@ def repair_opponent_imbalance(
     *,
     evaluate_metrics: ScheduleMetricsEvaluator,
     printer: RepairPrinter,
+    rng: random.Random | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> list[list[GameTuple]]:
-    """Placeholder opponent repair hook kept separate from the GA class."""
-    _ = (max_time, evaluate_metrics, printer)
-    return schedule
+    """Target opponent-balance repairs with the same lightweight round-to-round
+    swaps as repair_partner_imbalance, but scored on opponents_range.
+
+    A move is only accepted when it strictly improves opponents_range without
+    regressing games_range, partners_range, or courts_range - so this cannot
+    undo work repair_partner_imbalance already did (it normally runs after
+    partner repair, once partners_range is already at its achievable minimum)."""
+    rand = rng if rng is not None else random
+    now = clock if clock is not None else time.time
+    start_time = now()
+    best_schedule = [round_games[:] for round_games in schedule]
+    current_metrics = evaluate_metrics(best_schedule)
+
+    if current_metrics["opponents_range"] == 0:
+        return best_schedule
+
+    printer(f"   🔧 Opponent repair starting: range {current_metrics['opponents_range']}")
+
+    attempts = 0
+    max_attempts = 200
+    improvements = 0
+    swap_strategies = [
+        [(0, 0), (1, 1)],
+        [(2, 2), (3, 3)],
+        [(0, 2), (1, 3)],
+        [(0, 3), (1, 2)],
+        [(0, 1)],
+        [(2, 3)],
+        [(0, 2)],
+        [(1, 3)],
+    ]
+
+    while now() - start_time < max_time and attempts < max_attempts:
+        attempts += 1
+        test_schedule = [round_games[:] for round_games in best_schedule]
+
+        r1_idx = rand.randint(0, len(test_schedule) - 1)
+        r2_idx = rand.randint(0, len(test_schedule) - 1)
+        if r1_idx == r2_idx or len(test_schedule[r1_idx]) == 0 or len(test_schedule[r2_idx]) == 0:
+            continue
+
+        g1_idx = rand.randint(0, len(test_schedule[r1_idx]) - 1)
+        g2_idx = rand.randint(0, len(test_schedule[r2_idx]) - 1)
+
+        game1 = list(test_schedule[r1_idx][g1_idx])
+        game2 = list(test_schedule[r2_idx][g2_idx])
+        strategy = swap_strategies[attempts % len(swap_strategies)]
+
+        for pos1, pos2 in strategy:
+            if pos1 < len(game1) and pos2 < len(game2):
+                game1[pos1], game2[pos2] = game2[pos2], game1[pos1]
+
+        test_schedule[r1_idx][g1_idx] = cast(GameTuple, tuple(game1))
+        test_schedule[r2_idx][g2_idx] = cast(GameTuple, tuple(game2))
+
+        test_metrics = evaluate_metrics(test_schedule)
+        is_improvement = test_metrics["opponents_range"] < current_metrics["opponents_range"] and (
+            test_metrics["games_range"] <= current_metrics["games_range"]
+            and test_metrics["partners_range"] <= current_metrics["partners_range"]
+            and test_metrics["courts_range"] <= current_metrics["courts_range"]
+        )
+
+        if is_improvement and test_metrics["violations"] == 0:
+            best_schedule = test_schedule
+            current_metrics = test_metrics
+            improvements += 1
+            printer(
+                f"   🎯 Improvement #{improvements}: "
+                f"O:{test_metrics['opponents_range']} "
+                f"P:{test_metrics['partners_range']} "
+                f"(attempt {attempts})"
+            )
+            if test_metrics["opponents_range"] == 0:
+                printer(f"   🎉 Opponent balance achieved after {attempts} attempts!")
+                break
+
+    final_metrics = current_metrics
+    final_total = sum_range_metrics(final_metrics)
+    printer(f"   🏁 Opponent repair complete: {attempts} attempts, {improvements} improvements")
+    printer(f"      Opponents Range: {final_metrics['opponents_range']} | Total Range: {final_total}")
+    printer(
+        f"      Breakdown - G:{final_metrics['games_range']} "
+        f"P:{final_metrics['partners_range']} "
+        f"O:{final_metrics['opponents_range']} "
+        f"C:{final_metrics['courts_range']}"
+    )
+
+    return best_schedule
 
 
 def apply_targeted_repairs(
@@ -186,6 +273,7 @@ def apply_targeted_repairs(
     start_time = now()
     current_schedule = [round_games[:] for round_games in schedule]
     current_metrics = evaluate_metrics(current_schedule)
+    starting_total = sum_range_metrics(current_metrics)
 
     printer(
         "   Starting repair: "
@@ -209,7 +297,10 @@ def apply_targeted_repairs(
         printer("   🎉 REPAIR SUCCESS: Achieved Range 0!")
         return current_schedule
 
-    printer(f"   ⚠️ REPAIR PARTIAL: Reduced to total range {final_total}")
+    if final_total < starting_total:
+        printer(f"   ⚠️ REPAIR PARTIAL: Reduced to total range {final_total}")
+    else:
+        printer(f"   ⚠️ REPAIR PARTIAL: No improvement - still total range {final_total}")
     printer(
         f"      Breakdown - G:{current_metrics['games_range']} "
         f"P:{current_metrics['partners_range']} "

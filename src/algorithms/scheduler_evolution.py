@@ -355,6 +355,19 @@ def compute_perfect_stop_threshold(
     return min(30.0, max_runtime * 0.8)
 
 
+def _evaluate_current_best(scheduler, individual):
+    """Decode and evaluate an individual, returning what every caller of this
+    sequence needs: schedule, metrics, duplicate-round signature, and the
+    duplicate-round count beyond the mathematical minimum."""
+    schedule = scheduler._decode_cached(individual)
+    metrics = scheduler._evaluate_metrics_cached(schedule, individual)
+    signature = scheduler._get_duplicate_signature_cached(individual, schedule)
+    avoidable_duplicate_rounds = avoidable_duplicate_rounds_from_signature(
+        signature, scheduler.minimum_duplicate_rounds
+    )
+    return schedule, metrics, signature, avoidable_duplicate_rounds
+
+
 def run_evolution_loop(
     scheduler,
     *,
@@ -367,6 +380,7 @@ def run_evolution_loop(
     perfect_stop_runtime,
     printer,
     invoke_progress,
+    seed_individuals=None,
 ):
     """Run the main GA evolution loop extracted from GeneticPickleballScheduler.
 
@@ -374,6 +388,14 @@ def run_evolution_loop(
     access and returns (best_individual, best_fitness, generations_run).
     Seeded runs with an injected clock are fully reproducible, which is the
     equivalence check used when this code was moved out of generate_schedule.
+
+    seed_individuals, if given, replaces the first len(seed_individuals)
+    slots of the initial population with those individuals (e.g. a
+    constructive-design starting point) instead of a fully random start.
+    Population size and the rng draw sequence used to build it are
+    unaffected either way - the seeds only overwrite slots after the random
+    population is built, so omitting seed_individuals (the default) leaves
+    this function's behavior identical to before it existed.
     """
     # Initialize tracking
     best_individual = None
@@ -387,6 +409,9 @@ def run_evolution_loop(
 
     # Initialize population
     population = [scheduler._random_individual(rng) for _ in range(scheduler.population_size)]
+    if seed_individuals:
+        for i, seed_ind in enumerate(seed_individuals[: scheduler.population_size]):
+            population[i] = seed_ind
     current_ranges = {"games": 0, "partners": 0, "opponents": 0, "courts": 0}
 
     # MAIN EVOLUTION LOOP - GUARANTEED TO RUN FOR MINIMUM TIME
@@ -399,11 +424,8 @@ def run_evolution_loop(
 
         # Check for Range 0 achievement
         if best_individual is not None:
-            schedule = scheduler._decode_cached(best_individual)
-            metrics = scheduler._evaluate_metrics_cached(schedule, best_individual)
-            signature = scheduler._get_duplicate_signature_cached(best_individual, schedule)
-            avoidable_duplicate_rounds = avoidable_duplicate_rounds_from_signature(
-                signature, scheduler.minimum_duplicate_rounds
+            schedule, metrics, signature, avoidable_duplicate_rounds = _evaluate_current_best(
+                scheduler, best_individual
             )
             current_ranges = {
                 "games": metrics["games_range"],
@@ -522,11 +544,8 @@ def run_evolution_loop(
 
         # Check for convergence with Range 0 priority
         if best_individual is not None:
-            schedule = scheduler._decode_cached(best_individual)
-            metrics = scheduler._evaluate_metrics_cached(schedule, best_individual)
-            signature = scheduler._get_duplicate_signature_cached(best_individual, schedule)
-            avoidable_duplicate_rounds = avoidable_duplicate_rounds_from_signature(
-                signature, scheduler.minimum_duplicate_rounds
+            schedule, metrics, signature, avoidable_duplicate_rounds = _evaluate_current_best(
+                scheduler, best_individual
             )
             total_range = sum(
                 [

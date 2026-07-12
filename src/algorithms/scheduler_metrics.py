@@ -39,6 +39,13 @@ def round_signature(round_games: Sequence[Sequence[object]]) -> tuple[tuple[tupl
     return tuple(sorted(normalized_games))
 
 
+def _metric_range(values: Iterable[int]) -> int:
+    data = list(values)
+    if not data:
+        return 0
+    return max(data) - min(data)
+
+
 def count_duplicate_rounds(schedule: Sequence[Sequence[Sequence[object]]]) -> int:
     """Count repeated round patterns in a schedule."""
     signatures = [round_signature(round_games) for round_games in schedule]
@@ -158,17 +165,11 @@ def evaluate_metrics_from_arrangement_stats(
             opponents[player].update(opponents_of[player])
             courts[player].add(court_of[player])
 
-    def metric_range(values: Iterable[int]) -> int:
-        data = list(values)
-        if not data:
-            return 0
-        return max(data) - min(data)
-
     return {
-        "games_range": metric_range(games[player] for player in player_names),
-        "partners_range": metric_range(len(partners[player]) for player in player_names),
-        "opponents_range": metric_range(len(opponents[player]) for player in player_names),
-        "courts_range": metric_range(len(courts[player]) for player in player_names),
+        "games_range": _metric_range(games[player] for player in player_names),
+        "partners_range": _metric_range(len(partners[player]) for player in player_names),
+        "opponents_range": _metric_range(len(opponents[player]) for player in player_names),
+        "courts_range": _metric_range(len(courts[player]) for player in player_names),
         "violations": violations,
     }
 
@@ -232,17 +233,11 @@ def evaluate_schedule_metrics(
                     opponents[a][b] += 1
                     opponents[b][a] += 1
 
-    def metric_range(values: Iterable[int]) -> int:
-        data = list(values)
-        if not data:
-            return 0
-        return max(data) - min(data)
-
     return {
-        "games_range": metric_range(games_played[player] for player in player_names),
-        "partners_range": metric_range(len(partners[player]) for player in player_names),
-        "opponents_range": metric_range(len(opponents[player]) for player in player_names),
-        "courts_range": metric_range(
+        "games_range": _metric_range(games_played[player] for player in player_names),
+        "partners_range": _metric_range(len(partners[player]) for player in player_names),
+        "opponents_range": _metric_range(len(opponents[player]) for player in player_names),
+        "courts_range": _metric_range(
             sum(1 for count in courts[player].values() if count > 0) for player in player_names
         ),
         "violations": violations,
