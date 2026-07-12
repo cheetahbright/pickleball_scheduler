@@ -78,7 +78,24 @@ def create_pairing_heatmap(matrix: List[List[int]], players: List[str], title: s
         for col, value in enumerate(row_values)
     ]
 
-    fig.update_layout(title=title, xaxis_title="Player", yaxis_title="Player", annotations=annotations)
+    # At small player counts the default plotly sizing is fine, but past ~20
+    # players the fixed-height square chart squeezes that many axis labels
+    # and cell annotations into an unreadable smear - scale height and shrink
+    # label/annotation font size with N so large rosters stay legible.
+    num_players = len(players)
+    tick_font_size = 12 if num_players <= 20 else max(6, 12 - (num_players - 20) // 4)
+    for annotation in annotations:
+        annotation.font["size"] = tick_font_size
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Player",
+        yaxis_title="Player",
+        annotations=annotations,
+        height=max(400, 22 * num_players),
+        xaxis={"tickangle": -45, "tickfont": {"size": tick_font_size}},
+        yaxis={"tickfont": {"size": tick_font_size}},
+    )
     return fig
 
 
