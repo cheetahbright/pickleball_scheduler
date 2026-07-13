@@ -907,6 +907,15 @@ def render_stress_test_tab(st_module, scheduler_cls, validate_schedule_integrity
     total_runs = len(player_counts) * len(round_counts) * int(trials_per_combo)
     st_module.info(f"This will run {total_runs} generation(s). Larger sweeps take longer.")
 
+    current_params = (
+        tuple(player_counts),
+        tuple(round_counts),
+        float(max_time),
+        int(num_pair_constraints),
+        int(num_oppose_constraints),
+        int(trials_per_combo),
+    )
+
     if st_module.button("▶️ Run Stress Test", type="primary"):
         progress_bar = st_module.progress(0)
         progress_text = st_module.empty()
@@ -928,10 +937,17 @@ def render_stress_test_tab(st_module, scheduler_cls, validate_schedule_integrity
             progress_callback=_on_stress_progress,
         )
         st_module.session_state.stress_test_results = results
+        st_module.session_state.stress_test_params = current_params
 
     results = st_module.session_state.get("stress_test_results")
     if not results:
         return
+
+    if st_module.session_state.get("stress_test_params") != current_params:
+        st_module.warning(
+            "⚠️ These results are from a previous configuration. Click "
+            "'▶️ Run Stress Test' to refresh with the settings above."
+        )
 
     summary = summarize_stress_test(results)
     failures = summary["invalid_schedule"] + summary["exception"] + summary["no_schedule"]
