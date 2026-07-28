@@ -622,6 +622,10 @@ def _handle_generate_schedule_click(
             st_module.session_state.current_metrics = metrics
             st_module.session_state.current_seed = result.get("seed")
             st_module.session_state.current_round_times = round_times
+            # A fresh generation uses one roster for every round - clear any
+            # per-round roster segmentation left over from a previous
+            # schedule's mid-session replan.
+            st_module.session_state.current_roster_by_round = None
 
             settings = {
                 "num_rounds": num_rounds,
@@ -990,6 +994,7 @@ def _render_persistent_schedule(
     metrics = st_module.session_state.get("current_metrics", {})
     seed = st_module.session_state.get("current_seed")
     round_times = st_module.session_state.get("current_round_times") or None
+    roster_by_round = st_module.session_state.get("current_roster_by_round")
 
     if seed is not None:
         st_module.caption(
@@ -999,7 +1004,7 @@ def _render_persistent_schedule(
     _render_metric_summary(st_module, metrics, players)
     _render_optimality_status(st_module, metrics, players)
 
-    display_enhanced_schedule_fn(schedule_data, players, round_times=round_times)
+    display_enhanced_schedule_fn(schedule_data, players, round_times=round_times, roster_by_round=roster_by_round)
 
     # display_enhanced_schedule_fn already showed the critical-error banner
     # above for an invalid schedule - exports must not offer to download
@@ -1014,6 +1019,7 @@ def _render_persistent_schedule(
             players,
             round_times,
             schedule_to_csv_fn,
+            roster_by_round,
         )
 
     _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players, config)
@@ -1124,6 +1130,24 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
 
                 status_box.update(label="✅ Replan complete", state="complete")
 
+            # Track which roster was actually in effect for each round, so
+            # "sitting out" can be computed per-round instead of against the
+            # union below - which would otherwise show departed players as
+            # still sitting out in every future round, and incoming players
+            # as already sitting out in rounds before they joined. Reuse the
+            # previous replan's per-round tracking for the still-locked
+            # portion (a second replan must not flatten it back to `players`,
+            # which is only correct for a schedule that's never been
+            # replanned before).
+            previous_roster_by_round = st_module.session_state.get("current_roster_by_round")
+            if previous_roster_by_round and len(previous_roster_by_round) == total_rounds:
+                locked_roster_by_round = previous_roster_by_round[:played_rounds]
+            else:
+                locked_roster_by_round = [players] * played_rounds
+            st_module.session_state.current_roster_by_round = (
+                locked_roster_by_round + [remaining_players] * remaining_round_count
+            )
+
             st_module.session_state.current_schedule = splice_schedules(locked_rounds, result["schedule"])
             st_module.session_state.current_players = sorted(set(players) | set(remaining_players))
             # The metrics and seed shown belong to the pre-replan schedule;
@@ -1193,6 +1217,7 @@ def _render_download_buttons(
     players,
     round_times,
     schedule_to_csv_fn,
+    roster_by_round=None,
 ):
     """Render CSV/JSON/text/xlsx download buttons and copy-friendly views for the schedule."""
     _app_schedule_helpers = import_module_with_fallback("app_schedule_helpers")
@@ -1219,7 +1244,7 @@ def _render_download_buttons(
             "application/json",
         )
     with col3:
-        text_data = schedule_to_text(schedule_data, players, round_times)
+        text_data = schedule_to_text(schedule_data, players, round_times, roster_by_round=roster_by_round)
         st_module.download_button(
             "📋 Download Text",
             text_data,
@@ -1227,7 +1252,7 @@ def _render_download_buttons(
             "text/plain",
         )
     with col4:
-        xlsx_data = schedule_to_xlsx(schedule_data, players, round_times)
+        xlsx_data = schedule_to_xlsx(schedule_data, players, round_times, roster_by_round=roster_by_round)
         st_module.download_button(
             "📊 Download Excel",
             xlsx_data,
@@ -1240,4 +1265,4 @@ def _render_download_buttons(
 
     if players:
         with st_module.expander("👤 Per-player schedule"):
-            st_module.code(schedule_to_player_text(schedule_data, players))
+            st_module.code(schedule_to_player_text(schedule_data, players, roster_by_round=roster_by_round))

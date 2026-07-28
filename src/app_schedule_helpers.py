@@ -89,12 +89,28 @@ def validate_schedule_integrity(schedule: Iterable[Any], all_players: Any = None
     return errors
 
 
+def _round_roster(all_players: Any, roster_by_round: Any, round_num: int) -> Any:
+    """Return the roster to compare "sitting out" against for a given round.
+
+    Mid-session replan splices old-roster rounds with new-roster rounds under
+    one schedule (see splice_schedules in app_scheduler_flow.py), so a single
+    flat all_players list is wrong for either half: it would show players who
+    already left as still sitting out, and players who haven't joined yet as
+    already sitting out. roster_by_round, when supplied, is a list aligned to
+    schedule rounds giving the actual roster in effect for each one.
+    """
+    if roster_by_round and round_num - 1 < len(roster_by_round):
+        return roster_by_round[round_num - 1]
+    return all_players
+
+
 def display_enhanced_schedule(
     schedule: Iterable[Any],
     st_module: Any,
     pd_module: Any,
     all_players: Any = None,
     round_times: Any = None,
+    roster_by_round: Any = None,
 ) -> None:
     """Display schedule with enhanced formatting and error checking."""
     schedule_errors = validate_schedule_integrity(schedule, all_players)
@@ -141,8 +157,9 @@ def display_enhanced_schedule(
             df = pd_module.DataFrame(games_data)
             st_module.table(df)
 
-            if all_players:
-                sitting_out = [str(p) for p in all_players if str(p) not in playing_players]
+            round_roster = _round_roster(all_players, roster_by_round, round_num)
+            if round_roster:
+                sitting_out = [str(p) for p in round_roster if str(p) not in playing_players]
                 if sitting_out:
                     st_module.info(f"🪑 **Sitting out this round:** {', '.join(sitting_out)}")
                 else:
@@ -185,7 +202,12 @@ def blank_score_sheet_csv(games: List[dict]) -> str:
     return "\n".join(lines)
 
 
-def schedule_to_text(schedule: Iterable[Any], all_players: Any = None, round_times: Any = None) -> str:
+def schedule_to_text(
+    schedule: Iterable[Any],
+    all_players: Any = None,
+    round_times: Any = None,
+    roster_by_round: Any = None,
+) -> str:
     """Render a schedule as plain text suitable for pasting into chat apps."""
     round_blocks: List[str] = []
 
@@ -202,8 +224,9 @@ def schedule_to_text(schedule: Iterable[Any], all_players: Any = None, round_tim
             playing_players.update(team2)
             lines.append(f"Court {court}: {' & '.join(team1)} vs {' & '.join(team2)}")
 
-        if all_players:
-            sitting_out = [str(p) for p in all_players if str(p) not in playing_players]
+        round_roster = _round_roster(all_players, roster_by_round, round_num)
+        if round_roster:
+            sitting_out = [str(p) for p in round_roster if str(p) not in playing_players]
             if sitting_out:
                 lines.append(f"Sitting out: {', '.join(sitting_out)}")
 
@@ -212,7 +235,11 @@ def schedule_to_text(schedule: Iterable[Any], all_players: Any = None, round_tim
     return "\n\n".join(round_blocks)
 
 
-def schedule_to_player_text(schedule: Iterable[Any], all_players: Iterable[Any]) -> str:
+def schedule_to_player_text(
+    schedule: Iterable[Any],
+    all_players: Iterable[Any],
+    roster_by_round: Any = None,
+) -> str:
     """Render a per-player view: one line per round showing court/partner/opponents."""
     player_lines: dict[str, list[str]] = {str(p): [] for p in all_players}
 
@@ -232,10 +259,18 @@ def schedule_to_player_text(schedule: Iterable[Any], all_players: Iterable[Any])
                     )
                     players_seen_this_round.add(player)
 
+        # A player only "sits out" a round they were actually eligible for -
+        # skip anyone outside that round's roster segment (e.g. a player who
+        # left, or hasn't joined yet, across a mid-session replan).
+        round_roster = _round_roster(all_players, roster_by_round, round_num)
+        round_roster_players = {str(p) for p in round_roster} if round_roster else None
         for player in all_players:
             player = str(player)
-            if player not in players_seen_this_round:
-                player_lines.setdefault(player, []).append(f"R{round_num}: sitting out")
+            if player in players_seen_this_round:
+                continue
+            if round_roster_players is not None and player not in round_roster_players:
+                continue
+            player_lines.setdefault(player, []).append(f"R{round_num}: sitting out")
 
     return "\n\n".join(f"{player}\n" + "\n".join(lines) for player, lines in player_lines.items())
 
@@ -257,7 +292,7 @@ def schedule_to_csv(schedule: Iterable[Any]) -> str:
     return "\n".join(csv_lines)
 
 
-def schedule_to_xlsx(schedule, all_players=None, round_times=None, scores=None) -> bytes:
+def schedule_to_xlsx(schedule, all_players=None, round_times=None, scores=None, roster_by_round=None) -> bytes:
     """Render a schedule as a formatted .xlsx workbook, returned as bytes.
 
     One "Schedule" sheet with a row per game (round, court, teams), reusing
@@ -288,9 +323,10 @@ def schedule_to_xlsx(schedule, all_players=None, round_times=None, scores=None) 
 
     for game in games:
         sitting_out = ""
-        if all_players:
+        round_roster = _round_roster(all_players, roster_by_round, game["round_num"])
+        if round_roster:
             playing = round_playing.get(game["round_num"], set())
-            sitting_out = ", ".join(str(p) for p in all_players if str(p) not in playing)
+            sitting_out = ", ".join(str(p) for p in round_roster if str(p) not in playing)
         sheet.append(
             [
                 game["round_num"],

@@ -192,9 +192,9 @@ def validate_schedule_integrity(schedule, all_players=None):
     return _validate_schedule_integrity(schedule, all_players)
 
 
-def display_enhanced_schedule(schedule, all_players=None, round_times=None):
+def display_enhanced_schedule(schedule, all_players=None, round_times=None, roster_by_round=None):
     """Display schedule with enhanced formatting and error checking."""
-    return _display_enhanced_schedule(schedule, st, pd, all_players, round_times)
+    return _display_enhanced_schedule(schedule, st, pd, all_players, round_times, roster_by_round)
 
 
 def schedule_to_csv(schedule):

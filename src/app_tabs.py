@@ -157,6 +157,10 @@ def render_history_tab(st_module, pd_module, json_module):
                     st_module.session_state.current_metrics = {}
                     st_module.session_state.current_seed = None
                     st_module.session_state.current_round_times = None
+                    # A loaded schedule has no known per-round roster segmentation -
+                    # clear any leftover mid-session-replan tracking from whatever
+                    # schedule was on screen before.
+                    st_module.session_state.current_roster_by_round = None
                     st_module.session_state.global_status_message = "✅ Schedule loaded!"
                     logger.info("History load: rounds=%d players=%d", len(schedule_data), len(players))
                     st_module.rerun()
