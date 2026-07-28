@@ -565,6 +565,16 @@ class GeneticPickleballScheduler:
                 else:
                     print(f"   ⚠️ REPAIR PARTIAL: No improvement - still total range {repair_total}")
 
+        constraint_violations = sum(
+            0 if self._game_valid(game) else 1 for round_games in final_schedule for game in round_games
+        )
+        if constraint_violations:
+            print(
+                f"⚠️ {constraint_violations} game(s) in the final schedule violate a "
+                "requested do-not-pair/do-not-oppose constraint - the constraints "
+                "may be infeasible together with this many players/courts/rounds."
+            )
+
         elapsed_seconds = now() - start_time
         print_scheduler_final_report(
             print,
@@ -603,6 +613,7 @@ class GeneticPickleballScheduler:
             max_unique_rounds=self.max_unique_rounds,
             fitness_details=self.last_fitness_details,
             seed=seed,
+            constraint_violations=constraint_violations,
         )
 
         # Quality check for small problems

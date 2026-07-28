@@ -677,8 +677,10 @@ def render_player_management_tab(st_module, player_manager_cls):
         new_preset_players = st_module.text_area("Players (one per line):", key="new_preset_players")
 
     with col2:
-        if st_module.button("Add Preset") and new_preset_name and new_preset_players:
-            if new_preset_name in config["player_presets"]:
+        if st_module.button("Add Preset"):
+            if not new_preset_name or not new_preset_players:
+                st_module.warning("⚠️ Enter both a preset name and at least one player before adding.")
+            elif new_preset_name in config["player_presets"]:
                 st_module.error(
                     f"❌ A preset named '{new_preset_name}' already exists. "
                     "Edit it above instead, or choose a different name."

@@ -595,6 +595,14 @@ def _handle_generate_schedule_click(
             status_box.update(label="✅ Done", state="complete")
             st_module.success("✅ Schedule generated!")
 
+            constraint_violations = result.get("constraint_violations", 0)
+            if constraint_violations:
+                st_module.warning(
+                    f"⚠️ {constraint_violations} game(s) in this schedule violate a requested "
+                    "'do not pair' or 'do not oppose' constraint - your constraints may not be "
+                    "fully satisfiable together with this many players/courts/rounds."
+                )
+
             metrics = schedule_analytics_cls.calculate_fairness_metrics(
                 schedule_data,
                 num_players=len(players),
@@ -735,14 +743,20 @@ def render_main_scheduler_tab(
                 st_module.warning("⚠️ Type a preset name first.")
             else:
                 preset_players = parse_players_text(players_text)
+                stripped_name = preset_name.strip()
                 if not preset_players:
                     st_module.warning("⚠️ Add at least one player before saving a preset.")
+                elif stripped_name in config["player_presets"]:
+                    st_module.error(
+                        f"❌ A preset named '{stripped_name}' already exists. "
+                        "Use a different name, or edit it from the Player Management tab."
+                    )
                 else:
-                    config["player_presets"][preset_name.strip()] = preset_players
+                    config["player_presets"][stripped_name] = preset_players
                     if st_module.session_state.config_manager.save_config(config):
-                        st_module.success(f"Saved preset: {preset_name.strip()}")
+                        st_module.success(f"Saved preset: {stripped_name}")
                     else:
-                        st_module.error(f"❌ Failed to save preset: {preset_name.strip()}")
+                        st_module.error(f"❌ Failed to save preset: {stripped_name}")
 
     players = parse_players_text(players_text)
 
@@ -1047,6 +1061,17 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
             "already played together in the rounds you keep."
         )
 
+        # Re-seed whenever the current schedule's players change (new
+        # generation, history load, completed replan), preserving in-progress
+        # edits otherwise. "Rounds already played" is specific to whichever
+        # schedule is on screen, so it must reset too - otherwise a stale
+        # count from a previous schedule/replan can silently lock rounds of
+        # a brand-new, entirely unplayed schedule out of re-optimization.
+        roster_text = "\n".join(players)
+        roster_changed = seed_widget_from_source(st_module.session_state, "replan_players_input", roster_text)
+        if roster_changed:
+            st_module.session_state["replan_played_rounds"] = 0
+
         played_rounds = st_module.number_input(
             "Rounds already played:",
             min_value=0,
@@ -1054,11 +1079,6 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
             value=0,
             key="replan_played_rounds",
         )
-        # Re-seed whenever the current schedule's players change (new
-        # generation, history load, completed replan), preserving in-progress
-        # edits otherwise.
-        roster_text = "\n".join(players)
-        seed_widget_from_source(st_module.session_state, "replan_players_input", roster_text)
         remaining_players_text = st_module.text_area(
             "Players for the remaining rounds (edit to reflect who's still here):",
             value=roster_text,
@@ -1077,6 +1097,18 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
             # which is empty exactly when played_rounds == 0 and would otherwise
             # silently fall back to courts=1.
             courts = len(schedule_data[0].get("games", []))
+            # The remaining roster may be too small for the original court
+            # count (players left without replacements) - reduce courts to
+            # fit rather than letting the scheduler constructor raise, which
+            # would otherwise surface as an opaque "failed unexpectedly".
+            max_courts_for_remaining = len(remaining_players) // 4
+            if max_courts_for_remaining < courts:
+                st_module.warning(
+                    f"⚠️ Only {len(remaining_players)} players remain, which supports "
+                    f"{max_courts_for_remaining} court(s) instead of the original {courts} - "
+                    "using the reduced court count for the remaining rounds."
+                )
+                courts = max_courts_for_remaining
 
             constraints = config["constraints"]
             pair_constraints = [tuple(pair) if isinstance(pair, list) else pair for pair in constraints["do_not_pair"]]
@@ -1129,6 +1161,14 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
                     return
 
                 status_box.update(label="✅ Replan complete", state="complete")
+
+            replan_constraint_violations = result.get("constraint_violations", 0)
+            if replan_constraint_violations:
+                st_module.warning(
+                    f"⚠️ {replan_constraint_violations} game(s) in the replanned rounds violate a "
+                    "requested 'do not pair' or 'do not oppose' constraint - your constraints may "
+                    "not be fully satisfiable with the remaining players/courts/rounds."
+                )
 
             # Track which roster was actually in effect for each round, so
             # "sitting out" can be computed per-round instead of against the

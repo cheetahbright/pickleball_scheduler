@@ -57,6 +57,7 @@ def build_scheduler_result(
     fitness_details: Mapping[str, int] | None,
     algorithm: str = "Genetic Algorithm",
     seed: int | None = None,
+    constraint_violations: int = 0,
 ) -> dict[str, Any]:
     """Build the backward-compatible scheduler result payload."""
     raw_metrics = {key: int(final_metrics[key]) for key in RANGE_METRIC_KEYS}
@@ -65,7 +66,13 @@ def build_scheduler_result(
 
     result = {
         "schedule": formatted_schedule,
-        "success": total_range == 0 and avoidable_duplicate_rounds == 0,
+        # A schedule that violates a user-requested do-not-pair/do-not-oppose
+        # constraint is not a success, even at Range 0 - constraints can be
+        # infeasible together with the round/court shape, in which case the
+        # search falls back to the unconstrained pool rather than failing
+        # outright (see GeneticPickleballScheduler.add_constraints).
+        "success": total_range == 0 and avoidable_duplicate_rounds == 0 and constraint_violations == 0,
+        "constraint_violations": constraint_violations,
         "fitness": best_fitness,
         "score": score,
         "fitness_score": score,
