@@ -219,10 +219,18 @@ def invoke_progress_callback(
         callback(progress_data)
         return
 
+    # Only count parameters the caller MUST supply. A closure like
+    # `def _on_progress(progress_data, _bar=progress_bar, _text=...): ...`
+    # (a common pattern for capturing local UI state) has several
+    # positional-capable parameters, but only the first is actually
+    # required - counting the defaulted ones would misclassify a modern
+    # single-dict callback as the legacy 3/4-scalar-arg shape and call it
+    # with the wrong arguments.
     positional_params = [
         parameter
         for parameter in callback_signature.parameters.values()
         if parameter.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
+        and parameter.default is Parameter.empty
     ]
     has_varargs = any(
         parameter.kind == Parameter.VAR_POSITIONAL for parameter in callback_signature.parameters.values()

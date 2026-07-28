@@ -321,8 +321,14 @@ class HistoryManager:
             return stats.setdefault(name, {"wins": 0, "losses": 0, "games_played": 0})
 
         for team1_json, team2_json, team1_score, team2_score in rows:
-            team1 = json.loads(team1_json)
-            team2 = json.loads(team2_json)
+            try:
+                team1 = json.loads(team1_json)
+                team2 = json.loads(team2_json)
+            except (TypeError, json.JSONDecodeError):
+                # One corrupted row must not take down the whole leaderboard -
+                # skip it and keep aggregating the rest.
+                logger.exception("Skipping unparseable leaderboard row")
+                continue
 
             for player in team1 + team2:
                 _player_stats(player)["games_played"] += 1
@@ -376,16 +382,26 @@ class HistoryManager:
             logger.exception("Failed to read all scored games")
             return []
 
-        return [
-            {
-                "team1_players": json.loads(team1_json),
-                "team2_players": json.loads(team2_json),
-                "team1_score": team1_score,
-                "team2_score": team2_score,
-                "recorded_at": recorded_at,
-            }
-            for team1_json, team2_json, team1_score, team2_score, recorded_at in rows
-        ]
+        games = []
+        for team1_json, team2_json, team1_score, team2_score, recorded_at in rows:
+            try:
+                team1_players = json.loads(team1_json)
+                team2_players = json.loads(team2_json)
+            except (TypeError, json.JSONDecodeError):
+                # One corrupted row must not take down ELO recompute for
+                # every other schedule - skip it and keep replaying the rest.
+                logger.exception("Skipping unparseable scored-game row")
+                continue
+            games.append(
+                {
+                    "team1_players": team1_players,
+                    "team2_players": team2_players,
+                    "team1_score": team1_score,
+                    "team2_score": team2_score,
+                    "recorded_at": recorded_at,
+                }
+            )
+        return games
 
     def _save_weekly_relationships(self, cursor, schedule, week_date):
         """Save weekly partner and opponent relationships."""
