@@ -68,7 +68,7 @@ class HistoryManager:
 
     def ensure_db_exists(self):
         """Create the history database if it does not exist."""
-        self.db_path.parent.mkdir(exist_ok=True)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         with self._connect() as conn:
             cursor = conn.cursor()

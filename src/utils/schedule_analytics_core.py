@@ -210,7 +210,9 @@ def calculate_fairness_metrics(
         total_partnerships = (num_players * (num_players - 1)) // 2
         partnership_slots = total_slots // 2
 
-        partner_range0_possible = (
+        # A single player has zero possible partnerships (total_partnerships
+        # == 0) - guard the modulo rather than dividing by it.
+        partner_range0_possible = total_partnerships > 0 and (
             partnership_slots % total_partnerships == 0 and partnership_slots >= total_partnerships
         )
 

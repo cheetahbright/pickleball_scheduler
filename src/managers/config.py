@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 try:
-    from src.managers._paths import _resolve_default_names_path, _resolve_storage_path, save_json
+    from src.managers._paths import _resolve_default_names_path, _resolve_storage_path, load_json_value, save_json
 except ImportError:
-    from managers._paths import _resolve_default_names_path, _resolve_storage_path, save_json
+    from managers._paths import _resolve_default_names_path, _resolve_storage_path, load_json_value, save_json
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +297,7 @@ class ConfigurationManager:
         self.default_names_path = (
             Path(default_names_path) if default_names_path is not None else _resolve_default_names_path()
         )
-        self.config_path.parent.mkdir(exist_ok=True)
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
         self.default_config = {
             CONFIG_SCHEMA_VERSION_KEY: CURRENT_CONFIG_SCHEMA_VERSION,
             "objectives": {
@@ -422,12 +422,12 @@ class ConfigurationManager:
         return result
 
     def load_default_names(self) -> List[str]:
-        """Load default player names from file."""
-        try:
-            if self.default_names_path.exists():
-                with open(self.default_names_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            return []
-        except (OSError, json.JSONDecodeError):
-            logger.exception("Failed to load default player names")
-            return []
+        """Load default player names from file.
+
+        Non-string or blank entries in a malformed file are dropped rather
+        than passed through raw - a caller (e.g. selecting the "Default
+        Names" preset) that assumes every element is a usable name string
+        would otherwise crash on the first non-string element.
+        """
+        data = load_json_value(self.default_names_path, list, [], "default player names")
+        return [str(name) for name in data if str(name).strip()]

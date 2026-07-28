@@ -770,18 +770,21 @@ def render_leaderboard_tab(st_module, pd_module):
                 "Paste filled-in CSV (round,court,team1,team2,team1_score,team2_score)",
                 key="score_csv_import",
             )
-            if st_module.button("📥 Import CSV") and csv_text:
-                result = history_manager.import_scores_csv(schedule_id, games, csv_text)
-                if result["applied"]:
-                    st_module.session_state.global_status_message = f"✅ Imported {result['applied']} score(s)."
-                for error in result["errors"]:
-                    st_module.error(error)
-                if result["applied"]:
-                    # The score number_inputs are keyed widgets, so Streamlit
-                    # would keep showing their pre-import session values and a
-                    # later "Save Scores" would overwrite the imported scores
-                    # with them. Drop the keys so they re-seed from the DB.
-                    _clear_score_widget_state(st_module.session_state, schedule_id)
+            if st_module.button("📥 Import CSV"):
+                if not csv_text:
+                    st_module.warning("⚠️ Paste CSV data first.")
+                else:
+                    result = history_manager.import_scores_csv(schedule_id, games, csv_text)
+                    if result["applied"]:
+                        st_module.session_state.global_status_message = f"✅ Imported {result['applied']} score(s)."
+                    for error in result["errors"]:
+                        st_module.error(error)
+                    if result["applied"]:
+                        # The score number_inputs are keyed widgets, so Streamlit
+                        # would keep showing their pre-import session values and a
+                        # later "Save Scores" would overwrite the imported scores
+                        # with them. Drop the keys so they re-seed from the DB.
+                        _clear_score_widget_state(st_module.session_state, schedule_id)
                     st_module.rerun()
 
         with st_module.expander("📝 Enter scores for the current schedule", expanded=True):
@@ -923,27 +926,36 @@ def render_stress_test_tab(st_module, scheduler_cls, validate_schedule_integrity
     )
 
     if st_module.button("▶️ Run Stress Test", type="primary"):
-        progress_bar = st_module.progress(0)
-        progress_text = st_module.empty()
+        if total_runs == 0:
+            # An inverted or empty range (e.g. Min players > Max players)
+            # yields zero combinations - running anyway would silently wipe
+            # any previously-displayed valid sweep results with nothing.
+            st_module.warning(
+                "⚠️ This configuration produces 0 runs - check that Min players/rounds "
+                "aren't set higher than Max players/rounds."
+            )
+        else:
+            progress_bar = st_module.progress(0)
+            progress_text = st_module.empty()
 
-        def _on_stress_progress(completed, total, _bar=progress_bar, _text=progress_text):
-            fraction = completed / total if total else 1.0
-            _bar.progress(min(1.0, fraction))
-            _text.text(f"{completed} of {total} runs complete")
+            def _on_stress_progress(completed, total, _bar=progress_bar, _text=progress_text):
+                fraction = completed / total if total else 1.0
+                _bar.progress(min(1.0, fraction))
+                _text.text(f"{completed} of {total} runs complete")
 
-        results = run_stress_test(
-            scheduler_cls,
-            validate_schedule_integrity_fn,
-            player_counts=player_counts,
-            round_counts=round_counts,
-            max_time=float(max_time),
-            num_pair_constraints=int(num_pair_constraints),
-            num_oppose_constraints=int(num_oppose_constraints),
-            trials_per_combo=int(trials_per_combo),
-            progress_callback=_on_stress_progress,
-        )
-        st_module.session_state.stress_test_results = results
-        st_module.session_state.stress_test_params = current_params
+            results = run_stress_test(
+                scheduler_cls,
+                validate_schedule_integrity_fn,
+                player_counts=player_counts,
+                round_counts=round_counts,
+                max_time=float(max_time),
+                num_pair_constraints=int(num_pair_constraints),
+                num_oppose_constraints=int(num_oppose_constraints),
+                trials_per_combo=int(trials_per_combo),
+                progress_callback=_on_stress_progress,
+            )
+            st_module.session_state.stress_test_results = results
+            st_module.session_state.stress_test_params = current_params
 
     results = st_module.session_state.get("stress_test_results")
     if not results:
