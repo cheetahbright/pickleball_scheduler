@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import random
+from collections import Counter
 from typing import Callable, List, Tuple
 
 try:
@@ -48,15 +49,11 @@ def random_individual(rng: random.Random, num_arrangements: int, num_rounds: int
         Tuple of arrangement indices, one per round.
     """
     if num_arrangements >= num_rounds:
-        indices = list(range(num_arrangements))
-        rng.shuffle(indices)
-        selected = indices[:num_rounds]
-
-        # Paranoia check – should never trigger, but guarantees uniqueness
-        if len(set(selected)) != len(selected):
-            selected = rng.sample(range(num_arrangements), num_rounds)
-
-        return tuple(selected)
+        # rng.sample draws num_rounds unique values directly, without
+        # building and shuffling the full (up to hundreds-long) index list
+        # just to keep the first few - it can never produce duplicates, so
+        # no follow-up uniqueness check is needed either.
+        return tuple(rng.sample(range(num_arrangements), num_rounds))
     else:
         # Not enough unique arrangements – cycle through available pool
         indices: List[int] = []
@@ -149,17 +146,39 @@ def super_aggressive_mutate(
     strategy = rng.randint(0, 6)
 
     if strategy == 0:
-        # Replace many genes with diversity enforcement
-        for i in range(len(out)):
-            if rng.random() < mut_rate:
-                if arr_len >= len(out):
-                    used = set(out[j] for j in range(len(out)) if j != i)
-                    available = [x for x in range(arr_len) if x not in used]
-                    if available:
-                        out[i] = rng.choice(available)
-                    else:
-                        out[i] = rng.randrange(0, arr_len)
-                else:
+        # Replace many genes with diversity enforcement. Track how many
+        # positions currently hold each value via a running Counter (an
+        # individual can legitimately contain duplicate arrangement indices,
+        # so plain set membership isn't enough) and update it incrementally,
+        # instead of rebuilding an O(arr_len) "available" list from scratch
+        # for every mutating gene - arr_len is typically far larger than the
+        # handful of distinct values in use, so a few random draws almost
+        # always land on an unused one.
+        if arr_len >= len(out):
+            used_counts: Counter[int] = Counter(out)
+            for i in range(len(out)):
+                if rng.random() < mut_rate:
+                    old_val = out[i]
+                    used_counts[old_val] -= 1
+                    if used_counts[old_val] == 0:
+                        del used_counts[old_val]
+
+                    new_val = rng.randrange(0, arr_len)
+                    attempts = 0
+                    while new_val in used_counts and attempts < 20:
+                        new_val = rng.randrange(0, arr_len)
+                        attempts += 1
+                    if new_val in used_counts:
+                        # Exhausted quick draws (used_counts is close to
+                        # arr_len) - fall back to an exact scan.
+                        available = [x for x in range(arr_len) if x not in used_counts]
+                        new_val = rng.choice(available) if available else rng.randrange(0, arr_len)
+
+                    out[i] = new_val
+                    used_counts[new_val] += 1
+        else:
+            for i in range(len(out)):
+                if rng.random() < mut_rate:
                     out[i] = rng.randrange(0, arr_len)
 
     elif strategy == 1:
@@ -214,9 +233,7 @@ def super_aggressive_mutate(
     else:
         # Strategy 6: enforce complete diversity when pool is large enough
         if arr_len >= len(out):
-            all_indices = list(range(arr_len))
-            rng.shuffle(all_indices)
-            out = all_indices[: len(out)]
+            out = rng.sample(range(arr_len), len(out))
         else:
             # Aggressive fallback for small pools
             for i in range(len(out)):
