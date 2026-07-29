@@ -87,9 +87,15 @@ def precompute_arrangement_stats(
     """
     stats: list[dict[str, Any]] = []
     for round_games in arrangements:
-        partner_of: dict[str, str] = {}
-        opponents_of: dict[str, tuple[str, str]] = {}
-        court_of: dict[str, int] = {}
+        # Lists, not single values: a well-formed arrangement never repeats
+        # a player within a round, but a malformed one (already penalized
+        # above via `overlap`) can - a plain dict assignment would silently
+        # let the second game's appearance overwrite the first's, breaking
+        # the equivalence with evaluate_schedule_metrics's Counter-based
+        # accumulation for any such input.
+        partner_of: dict[str, list[str]] = defaultdict(list)
+        opponents_of: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        court_of: dict[str, list[int]] = defaultdict(list)
         violations = 0
 
         if len(round_games) != num_courts:
@@ -117,16 +123,16 @@ def precompute_arrangement_stats(
                 if b in do_not_oppose_map[a] or a in do_not_oppose_map[b]:
                     violations += 1
 
-            partner_of[p1] = p2
-            partner_of[p2] = p1
-            partner_of[p3] = p4
-            partner_of[p4] = p3
-            opponents_of[p1] = (p3, p4)
-            opponents_of[p2] = (p3, p4)
-            opponents_of[p3] = (p1, p2)
-            opponents_of[p4] = (p1, p2)
+            partner_of[p1].append(p2)
+            partner_of[p2].append(p1)
+            partner_of[p3].append(p4)
+            partner_of[p4].append(p3)
+            opponents_of[p1].append((p3, p4))
+            opponents_of[p2].append((p3, p4))
+            opponents_of[p3].append((p1, p2))
+            opponents_of[p4].append((p1, p2))
             for player in game_players:
-                court_of[player] = court_index
+                court_of[player].append(court_index)
 
         stats.append(
             {
@@ -159,11 +165,14 @@ def evaluate_metrics_from_arrangement_stats(
         violations += stat["violations"]
         opponents_of = stat["opponents_of"]
         court_of = stat["court_of"]
-        for player, partner in stat["partner_of"].items():
-            games[player] += 1
-            partners[player].add(partner)
-            opponents[player].update(opponents_of[player])
-            courts[player].add(court_of[player])
+        for player, player_partners in stat["partner_of"].items():
+            for partner in player_partners:
+                games[player] += 1
+                partners[player].add(partner)
+            for opponent_pair in opponents_of[player]:
+                opponents[player].update(opponent_pair)
+            for court in court_of[player]:
+                courts[player].add(court)
 
     return {
         "games_range": _metric_range(games[player] for player in player_names),
