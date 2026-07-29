@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import random
 import time
-from collections import defaultdict
 from typing import Callable, cast
 
 try:
@@ -16,53 +15,6 @@ except ImportError:
 
 ScheduleMetricsEvaluator = Callable[[list[list[GameTuple]]], dict[str, int]]
 RepairPrinter = Callable[[str], None]
-
-
-def repair_invalid_schedule(
-    schedule: list[list[GameTuple]],
-    problematic_round_idx: int,
-    arrangements: list[list[GameTuple]],
-    printer: RepairPrinter,
-) -> list[list[GameTuple]]:
-    """Replace an invalid round when a conflict-free arrangement is available."""
-    used_players: set[str] = set()
-    for round_idx, round_games in enumerate(schedule):
-        if round_idx != problematic_round_idx:
-            for game in round_games:
-                used_players.update(map(str, game))
-
-    available_arrangements: list[tuple[int, list[GameTuple]]] = []
-    for arrangement_index, arrangement in enumerate(arrangements):
-        arrangement_players: set[str] = set()
-        for game in arrangement:
-            arrangement_players.update(map(str, game))
-
-        if not (arrangement_players & used_players):
-            available_arrangements.append((arrangement_index, arrangement))
-
-    if available_arrangements:
-        replacement_idx, replacement_arrangement = available_arrangements[0]
-        schedule[problematic_round_idx] = replacement_arrangement
-        printer(f"✅ Repaired round {problematic_round_idx + 1} with arrangement {replacement_idx}")
-    else:
-        printer(f"⚠️ No perfect replacement for round {problematic_round_idx + 1}, using fallback")
-
-    return schedule
-
-
-def count_partners(schedule: list[list[GameTuple]]) -> dict[str, dict[str, int]]:
-    """Count partner pairings for each player in the schedule."""
-    partner_count: defaultdict[str, defaultdict[str, int]] = defaultdict(lambda: defaultdict(int))
-
-    for round_games in schedule:
-        for game in round_games:
-            p1, p2, p3, p4 = map(str, game)
-            partner_count[p1][p2] += 1
-            partner_count[p2][p1] += 1
-            partner_count[p3][p4] += 1
-            partner_count[p4][p3] += 1
-
-    return {player: dict(partners) for player, partners in partner_count.items()}
 
 
 def repair_partner_imbalance(

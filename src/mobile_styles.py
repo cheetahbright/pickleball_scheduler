@@ -57,7 +57,7 @@ MOBILE_CSS = f"""
         padding-right: 1rem;
     }}
 
-    /* Metric labels/values shrink so 3-4 column metric rows don't wrap
+    /* Metric values shrink so 3-4 column metric rows don't wrap
        into an unreadable stack of overlapping text. */
     div[data-testid="stMetricValue"] {{
         font-size: 1.25rem;

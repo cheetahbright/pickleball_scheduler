@@ -73,11 +73,6 @@ _OFFSET_TABLES: dict[tuple[int, int], tuple[list[tuple[int, int, int]], list[int
 }
 
 
-def supported_court_counts() -> tuple[int, ...]:
-    """Court counts this module has at least one verified design for."""
-    return tuple(sorted({num_courts for num_courts, _num_rounds in _OFFSET_TABLES}))
-
-
 def _derive_offset_sets(m: int, triples: list[tuple[int, int, int]], ks: list[int]) -> dict[str, set[int]]:
     return {
         "f": {f for f, _, _ in triples},
@@ -102,16 +97,12 @@ def _resolve_ks(m: int, triples: list[tuple[int, int, int]], explicit_ks: list[i
     return explicit_ks if explicit_ks is not None else [(f + g + h) % m for f, g, h in triples]
 
 
-def _best_base_table(
-    num_courts: int, num_rounds: int
-) -> tuple[list[tuple[int, int, int]], list[int] | None] | None:
+def _best_base_table(num_courts: int, num_rounds: int) -> tuple[list[tuple[int, int, int]], list[int] | None] | None:
     """The largest verified round set for this num_courts that is no longer
     than num_rounds, so padding to num_rounds maximizes distinct rounds
     before any repeat is needed. None if no verified table for num_courts is
     short enough to pad up to num_rounds."""
-    candidates = [
-        (table_rounds, entry) for (m, table_rounds), entry in _OFFSET_TABLES.items() if m == num_courts
-    ]
+    candidates = [(table_rounds, entry) for (m, table_rounds), entry in _OFFSET_TABLES.items() if m == num_courts]
     candidates = [item for item in candidates if item[0] <= num_rounds]
     if not candidates:
         return None

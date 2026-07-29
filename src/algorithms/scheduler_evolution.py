@@ -6,7 +6,8 @@ by scheduler_repairs.py, scheduler_metrics.py, and scheduler_reporting.py.
 Covers:
 - Population initialisation (random_individual)
 - Crossover and mutation operators (crossover, super_aggressive_mutate)
-- Parent selection and elite preservation (tournament_select, elitism)
+- Parent selection (tournament_select) - elite preservation is inlined in
+  run_evolution_loop's hot path rather than factored out here
 - Diversity injection / stagnation handling (inject_diversity)
 - Termination / early-stop thresholds (compute_general_stop_threshold,
   compute_perfect_stop_threshold)
@@ -251,25 +252,6 @@ def tournament_select(
     tournament = [(population[i], fitness_scores[i][1]) for i in tournament_indices]
     tournament.sort(key=lambda x: x[1])
     return tournament[0][0]
-
-
-def elitism(
-    population: List[Individual],
-    fitnesses: List[float],
-    k: int,
-) -> List[Individual]:
-    """Select the *k* best (lowest-fitness) individuals for elite preservation.
-
-    Args:
-        population: Current population list.
-        fitnesses: Parallel fitness values (lower is better).
-        k: Number of elites to return.
-
-    Returns:
-        List of the *k* best individuals.
-    """
-    idxs = sorted(range(len(population)), key=lambda i: fitnesses[i])[:k]
-    return [population[i] for i in idxs]
 
 
 # ---------------------------------------------------------------------------

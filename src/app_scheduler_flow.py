@@ -737,6 +737,8 @@ def render_main_scheduler_tab(
                     defer_widget_value(st_module.session_state, PLAYERS_INPUT_KEY, updated_text)
                     defer_widget_value(st_module.session_state, QUICK_ADD_KEY, "")
                     st_module.rerun()
+                else:
+                    st_module.warning(f"⚠️ '{new_player.strip()}' is already in the player list.")
 
         if st_module.button("💾 Save as Preset"):
             if not preset_name.strip():

@@ -848,6 +848,7 @@ def render_leaderboard_tab(st_module, pd_module):
             except RuntimeError:
                 st_module.error("❌ Could not save recomputed ELO ratings. Please try again.")
             else:
+                st_module.session_state.global_status_message = "✅ ELO ratings recomputed!"
                 st_module.rerun()
 
     leaderboard = history_manager.get_leaderboard()
