@@ -388,6 +388,9 @@ def run_evolution_loop(
 
     # Track if we've logged progress recently
     last_progress_log = 0
+    # Negative so the very first generation's callback fires immediately
+    # rather than waiting a full _progress_update_interval first.
+    last_callback_time = -scheduler._progress_update_interval
 
     # Initialize population
     population = [scheduler._random_individual(rng) for _ in range(scheduler.population_size)]
@@ -427,8 +430,13 @@ def run_evolution_loop(
                 )
                 last_progress_log = elapsed
 
-            # Progress callback for real-time Streamlit updates
-            if progress_callback:
+            # Progress callback for real-time Streamlit updates - throttled to
+            # the same cadence as the internal progress log (_progress_update_interval),
+            # since firing on every single generation (this loop can run
+            # thousands of times) means thousands of real UI widget mutations
+            # for no benefit: nothing meaningfully different has happened
+            # between two generations a few milliseconds apart.
+            if progress_callback and elapsed - last_callback_time >= scheduler._progress_update_interval:
                 progress_data = {
                     "elapsed_time": elapsed,
                     "generation": generations_run,
@@ -443,6 +451,7 @@ def run_evolution_loop(
                     invoke_progress(progress_callback, progress_data)
                 except Exception as e:
                     printer(f"Progress callback failed: {e}")
+                last_callback_time = elapsed
 
             # Check stopping conditions - RUN FOR FULL TIME FOR QUALITY
             if total_range == 0 and avoidable_duplicate_rounds == 0:
