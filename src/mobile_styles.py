@@ -34,15 +34,22 @@ MOBILE_CSS = f"""
 
     /* Sliders' default thumb is far smaller than a comfortable 44px tap
        target - the weight and skill-rating sliders are otherwise unusable
-       with a fingertip. Padding widens the actual hit-area beyond just the
-       visible thumb. */
+       with a fingertip. Padding on an ANCESTOR container doesn't extend a
+       descendant element's own hit-box, so it has to go on the thumb
+       itself: content-box sizing keeps the visible thumb at its normal 24px
+       while padding grows the actual clickable/tappable box to 44px, and
+       background-clip keeps the painted color from spreading into that
+       padding so it still looks like a 24px thumb. */
     .stSlider {{
         padding-top: 12px;
         padding-bottom: 12px;
     }}
     .stSlider [role="slider"] {{
+        box-sizing: content-box;
         width: 24px;
         height: 24px;
+        padding: 10px;
+        background-clip: content-box;
     }}
 
     /* Wide tables/dataframes must scroll horizontally instead of forcing

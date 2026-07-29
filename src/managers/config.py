@@ -298,6 +298,9 @@ class ConfigurationManager:
             Path(default_names_path) if default_names_path is not None else _resolve_default_names_path()
         )
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        # Snapshot of what this instance last loaded/saved, for detecting a
+        # concurrent save from another session at save time (see save_config).
+        self._loaded_snapshot: Dict | None = None
         self.default_config = {
             CONFIG_SCHEMA_VERSION_KEY: CURRENT_CONFIG_SCHEMA_VERSION,
             "objectives": {
@@ -395,6 +398,11 @@ class ConfigurationManager:
         repair_messages = repaired.get(CONFIG_REPAIR_MESSAGES_KEY)
         if repair_messages:
             logger.warning("Config repaired on load: %s", "; ".join(repair_messages))
+
+        snapshot = deepcopy(repaired)
+        snapshot.pop(CONFIG_REPAIR_MESSAGES_KEY, None)
+        self._loaded_snapshot = snapshot
+
         return repaired
 
     def save_config(self, config: Dict) -> bool:
@@ -409,7 +417,48 @@ class ConfigurationManager:
         except Exception:
             logger.exception("Failed to normalize configuration")
             return False
-        return save_json(self.config_path, normalized_config, "app configuration")
+        to_write = self._merge_concurrent_edits(normalized_config)
+        return save_json(self.config_path, to_write, "app configuration")
+
+    def _merge_concurrent_edits(self, config: Dict) -> Dict:
+        """Merge this save against whatever is currently on disk, so a
+        concurrent session's edit to a section THIS session never touched
+        (e.g. Player Management saving player_presets while this session
+        only edited Configuration's objectives) isn't silently discarded by
+        a blind whole-file overwrite - each browser session holds its own
+        in-memory config copy and its own ConfigurationManager instance, so
+        two sessions can easily save moments apart without either knowing
+        about the other's change.
+
+        Only top-level sections THIS session actually changed since it last
+        loaded/saved (via this instance) win; every other section defers to
+        whatever is currently on disk. If both sessions changed the exact
+        same section, this session's edit still wins for that section
+        (last-write-wins, same as before) - only sections neither of them
+        touched are protected here.
+        """
+        if self._loaded_snapshot is None:
+            return config  # never loaded via this instance - nothing to diff against
+
+        # load_config() below overwrites self._loaded_snapshot as a side
+        # effect (it's meant to track "what did this instance last see"),
+        # so the baseline for this diff must be captured BEFORE calling it -
+        # otherwise every field would compare against the fresh on-disk
+        # snapshot instead of what this session actually started from,
+        # making every field look "changed" and defeating the merge.
+        baseline = self._loaded_snapshot
+        try:
+            current_on_disk = self.load_config()
+        except Exception:
+            logger.exception("Failed to read current config for concurrent-edit merge")
+            return config
+
+        current_on_disk.pop(CONFIG_REPAIR_MESSAGES_KEY, None)
+        merged = deepcopy(current_on_disk)
+        for key, value in config.items():
+            if key not in baseline or baseline[key] != value:
+                merged[key] = value
+        return merged
 
     def _merge_configs(self, default: Dict, user: Dict) -> Dict:
         """Merge user configuration with defaults."""

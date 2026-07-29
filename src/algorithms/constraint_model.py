@@ -255,8 +255,11 @@ class ObjectiveCalculator:
         """Count total constraint violations."""
         violations = 0
         availability = problem.availability
+        timing_constraints = problem.timing_constraints or {}
 
-        # Check availability constraints
+        # Check availability (allow-list) and timing (deny-list) constraints -
+        # independent mechanisms a caller may set either or both of, per the
+        # SchedulingProblem docstring, so a player can violate either.
         for round_idx, round_games in enumerate(schedule):
             for game in round_games:
                 teams = _extract_teams(game)
@@ -267,6 +270,8 @@ class ObjectiveCalculator:
 
                 for player in game_players:
                     if round_idx not in availability.get(player, set(range(problem.num_rounds))):
+                        violations += 1
+                    if round_idx in timing_constraints.get(player, set()):
                         violations += 1
 
         # Check pair constraints (must be teammates)

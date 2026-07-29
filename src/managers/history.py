@@ -561,15 +561,29 @@ class HistoryManager:
                     (cutoff,),
                 )
                 ids = [row[0] for row in cursor.fetchall()]
+                purged = 0
                 for start in range(0, len(ids), self._PURGE_CHUNK_SIZE):
                     chunk = ids[start : start + self._PURGE_CHUNK_SIZE]
                     placeholders = ",".join("?" * len(chunk))
-                    cursor.execute(f"DELETE FROM game_scores WHERE schedule_id IN ({placeholders})", chunk)
-                    cursor.execute(f"DELETE FROM schedule_history WHERE id IN ({placeholders})", chunk)
+                    # Re-check deleted_at IS NOT NULL/cutoff at delete time,
+                    # not just at the SELECT above - a concurrent
+                    # restore_schedule() between the two could otherwise
+                    # still get deleted here despite no longer being
+                    # soft-deleted. Both deletes share the same live
+                    # condition so a schedule's scores and its history row
+                    # are purged (or spared) together.
+                    still_purgeable = (
+                        f"SELECT id FROM schedule_history WHERE id IN ({placeholders}) "
+                        "AND deleted_at IS NOT NULL AND deleted_at < ?"
+                    )
+                    params = (*chunk, cutoff)
+                    cursor.execute(f"DELETE FROM game_scores WHERE schedule_id IN ({still_purgeable})", params)
+                    cursor.execute(f"DELETE FROM schedule_history WHERE id IN ({still_purgeable})", params)
+                    purged += cursor.rowcount
                 conn.commit()
-            if ids:
-                logger.info("History purge: removed %d schedules older than %d days", len(ids), older_than_days)
-            return len(ids)
+            if purged:
+                logger.info("History purge: removed %d schedules older than %d days", purged, older_than_days)
+            return purged
         except Exception:
             logger.exception("Failed to purge deleted history entries")
             return 0
