@@ -3,29 +3,49 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from itertools import chain
 from typing import Any, Iterable, Mapping, Sequence, cast
+
+try:
+    from src.utils.schedule_shapes import games_in_round
+except ImportError:
+    from utils.schedule_shapes import games_in_round
 
 GameTuple = tuple[str, str, str, str]
 RawSchedule = list[list[GameTuple]]
 
 
 def normalize_schedule(schedule: Sequence[Sequence[object]] | Sequence[dict[str, Any]]) -> RawSchedule:
-    """Normalize either formatted or raw schedules into tuple-based rounds."""
+    """Normalize either formatted or raw schedules into tuple-based rounds.
+
+    Formatted rounds ({"games": [...]}) may hold attribute-style Game objects
+    or dict games; only their teams are read, so a game needs no court. Any
+    game without two 2-player teams (including something that isn't a game at
+    all) raises ValueError rather than being dropped, since a dropped game
+    would make every range below read as if it had never been scheduled.
+    """
     if schedule and isinstance(schedule[0], dict):
         raw_schedule: RawSchedule = []
         for round_data in cast(list[dict[str, Any]], schedule):
-            round_games: list[GameTuple] = []
-            games = round_data.get("games", [])
-            for game in games:
-                if hasattr(game, "team1") and hasattr(game, "team2"):
-                    team1 = [str(player) for player in game.team1]
-                    team2 = [str(player) for player in game.team2]
-                    if len(team1) >= 2 and len(team2) >= 2:
-                        round_games.append((team1[0], team1[1], team2[0], team2[1]))
-            raw_schedule.append(round_games)
+            raw_schedule.append([_formatted_game_tuple(game) for game in games_in_round(round_data)])
         return raw_schedule
 
     return cast(RawSchedule, schedule)
+
+
+def _formatted_game_tuple(game: object) -> GameTuple:
+    """Read one dict or attribute-style formatted game as a GameTuple."""
+    if isinstance(game, dict):
+        teams = (game.get("team1"), game.get("team2"))
+    else:
+        teams = (getattr(game, "team1", None), getattr(game, "team2", None))
+    team1, team2 = (
+        [str(player) for player in team] if isinstance(team, Iterable) and not isinstance(team, str) else []
+        for team in teams
+    )
+    if len(team1) != 2 or len(team2) != 2:
+        raise ValueError(f"Game does not have two 2-player teams: {game!r}")
+    return (team1[0], team1[1], team2[0], team2[1])
 
 
 def round_signature(round_games: Sequence[Sequence[object]]) -> tuple[tuple[tuple[str, str], tuple[str, str]], ...]:
@@ -96,6 +116,7 @@ def precompute_arrangement_stats(
         partner_of: dict[str, list[str]] = defaultdict(list)
         opponents_of: dict[str, list[tuple[str, str]]] = defaultdict(list)
         court_of: dict[str, list[int]] = defaultdict(list)
+        partner_pairs: list[tuple[str, str]] = []
         violations = 0
 
         if len(round_games) != num_courts:
@@ -127,6 +148,8 @@ def precompute_arrangement_stats(
             partner_of[p2].append(p1)
             partner_of[p3].append(p4)
             partner_of[p4].append(p3)
+            partner_pairs.append((p1, p2) if p1 < p2 else (p2, p1))
+            partner_pairs.append((p3, p4) if p3 < p4 else (p4, p3))
             opponents_of[p1].append((p3, p4))
             opponents_of[p2].append((p3, p4))
             opponents_of[p3].append((p1, p2))
@@ -139,10 +162,34 @@ def precompute_arrangement_stats(
                 "partner_of": partner_of,
                 "opponents_of": opponents_of,
                 "court_of": court_of,
+                "partner_pairs": partner_pairs,
                 "violations": violations,
             }
         )
     return stats
+
+
+def partner_repeat_score(round_stats: Iterable[Mapping[str, Any]]) -> tuple[int, int]:
+    """Score how much a schedule repeats the same partnerships; lower is better.
+
+    The range metrics only count how many *different* partners each player
+    has, so once those counts are even they can't tell a schedule that
+    spreads partnerships out from one that keeps pairing the same two
+    players. Returns (most times any one pair partners, sum of
+    count * (count - 1) over every pair), compared in that order: the second
+    part is 0 when no pair partners twice and, for a fixed number of games,
+    lowest when partnerships are spread as evenly as possible.
+    """
+    counts = Counter(chain.from_iterable(stat["partner_pairs"] for stat in round_stats))
+    return max(counts.values(), default=0), sum(count * (count - 1) for count in counts.values())
+
+
+def partner_repeat_floor(num_players: int, num_partnerships: int) -> tuple[int, int]:
+    """The lowest partner_repeat_score possible: every pair of players
+    partnering as close to equally often as num_partnerships allows."""
+    pairs = num_players * (num_players - 1) // 2
+    times, extra = divmod(num_partnerships, pairs)
+    return times + (extra > 0), extra * (times + 1) * times + (pairs - extra) * times * (times - 1)
 
 
 def evaluate_metrics_from_arrangement_stats(

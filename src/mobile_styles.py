@@ -19,9 +19,23 @@ MOBILE_CSS = f"""
     /* Larger touch targets for buttons and inputs - the default sizing
        assumes mouse precision, which mobile taps don't have. */
     .stButton > button,
-    .stDownloadButton > button {{
+    .stDownloadButton > button,
+    .stFormSubmitButton > button {{
         min-height: 44px;
         font-size: 1rem;
+        width: 100%;
+    }}
+
+    /* Streamlit sizes a button's .stButton wrapper and the element
+       container around it to the button's own text, so the width: 100%
+       above only filled that. Widen the wrappers to the full column. (A
+       form submit button has one more unnamed div between the two, so
+       this matches any descendant; an element container holds one
+       element, never a whole form.) */
+    [data-testid="stElementContainer"]:has(.stButton, .stDownloadButton, .stFormSubmitButton),
+    .stButton,
+    .stDownloadButton,
+    .stFormSubmitButton {{
         width: 100%;
     }}
 
@@ -50,6 +64,14 @@ MOBILE_CSS = f"""
         height: 24px;
         padding: 10px;
         background-clip: content-box;
+    }}
+    /* The slider's value is drawn just above the thumb's box, which now
+       reaches 16px higher than Streamlit's 12px thumb (the 10px padding
+       plus 6px of the bigger thumb), so it printed over the label - over
+       the player's name on every skill slider left at Unrated. Move the
+       track down past it: Streamlit's own label margin is 0.25rem. */
+    .stSlider [data-testid="stWidgetLabel"] {{
+        margin-bottom: 1.5rem;
     }}
 
     /* Wide tables/dataframes must scroll horizontally instead of forcing

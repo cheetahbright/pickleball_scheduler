@@ -99,6 +99,8 @@ class ScheduleAnalytics:
         num_players: Optional[int] = None,
         num_rounds: Optional[int] = None,
         num_courts: Optional[int] = None,
+        players: Optional[List[str]] = None,
+        roster_by_round: Optional[List[List[str]]] = None,
     ) -> Dict[str, Any]:
         """Calculate comprehensive fairness metrics normalized by mathematical optimality"""
         return _calculate_fairness_metrics(
@@ -106,6 +108,8 @@ class ScheduleAnalytics:
             num_players=num_players,
             num_rounds=num_rounds,
             num_courts=num_courts,
+            players=players,
+            roster_by_round=roster_by_round,
         )
 
     @staticmethod
@@ -130,7 +134,7 @@ def enhanced_scheduler_page():
         st,
         HistoryManager,
         ConfigurationManager,
-        logout,
+        logout if _simple_auth.auth_enabled() else None,
         main_scheduler_tab,
         analytics_tab,
         history_tab,
@@ -188,7 +192,7 @@ def leaderboard_tab():
 
 
 def validate_schedule_integrity(schedule, all_players=None):
-    """Comprehensive validation of schedule integrity."""
+    """List what makes a schedule impossible to play (see app_schedule_helpers), or [] if nothing does."""
     return _validate_schedule_integrity(schedule, all_players)
 
 

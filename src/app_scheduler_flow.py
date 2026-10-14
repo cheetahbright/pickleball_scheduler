@@ -4,8 +4,14 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
-from typing import Any, Mapping
+import sqlite3
+import threading
+import unicodedata
+from collections import Counter
+from contextlib import contextmanager
+from typing import Any, Iterator, Mapping, Sequence
 
 try:
     from src._compat import import_module_with_fallback
@@ -13,9 +19,32 @@ except ImportError:
     from _compat import import_module_with_fallback
 
 try:
-    from src.widget_state import apply_deferred_widget_values, defer_widget_value, seed_widget_from_source
+    from src.app_schedule_helpers import escape_markdown
 except ImportError:
-    from widget_state import apply_deferred_widget_values, defer_widget_value, seed_widget_from_source
+    from app_schedule_helpers import escape_markdown
+
+try:
+    from src.widget_state import (
+        apply_deferred_widget_values,
+        defer_widget_value,
+        forget_widget_state,
+        rebase_line_edits,
+        remember_seeded_widget_values,
+        remember_widget_choice,
+        seed_widget_choice,
+        seed_widget_from_source,
+    )
+except ImportError:
+    from widget_state import (
+        apply_deferred_widget_values,
+        defer_widget_value,
+        forget_widget_state,
+        rebase_line_edits,
+        remember_seeded_widget_values,
+        remember_widget_choice,
+        seed_widget_choice,
+        seed_widget_from_source,
+    )
 
 normalize_config_constraints = import_module_with_fallback("app_managers").normalize_config_constraints
 
@@ -30,6 +59,49 @@ SAMPLE_PLAYER_NAMES = ["Alex", "Blake", "Casey", "Drew", "Emery", "Finley", "Gra
 PLAYER_PRESET_SELECT_KEY = "player_preset_select"
 PLAYERS_INPUT_KEY = "players_input"
 QUICK_ADD_KEY = "quick_add"
+PRESET_NAME_KEY = "preset_name"
+NUM_ROUNDS_KEY = "num_rounds_input"
+COURTS_KEY = "courts_available"
+MAX_TIME_KEY = "max_generation_time"
+# Quick Remove buttons are keyed by name (see render_main_scheduler_tab).
+QUICK_REMOVE_KEY_PREFIX = "quick_remove::"
+
+# The preset dropdown's own choices, listed ahead of the saved presets. A
+# saved preset can't share one of these names: picking it would load the
+# built-in choice instead.
+RESERVED_PRESET_NAMES = ("Custom", "Default Names")
+
+# The history save that failed for the schedule on screen, kept so it can be
+# retried (see save_schedule_to_history).
+UNSAVED_SCHEDULE_KEY = "unsaved_schedule"
+
+# The schedule the mid-session replan's inputs were last set up for (see
+# _render_mid_session_replan).
+REPLAN_INPUTS_SCHEDULE_KEY = "_replan_inputs_schedule"
+
+# Largest roster the scheduler accepts - 50 courts, far beyond any real session
+# (the Stress Test tab stops at 40 players). The constraint pickers offer every
+# possible pair, which grows with the square of the roster, so a pasted
+# membership list of thousands of names would otherwise stall every rerun and
+# run the shared server process out of memory.
+MAX_PLAYERS = 200
+
+
+def is_reserved_preset_name(name: str) -> bool:
+    """Whether ``name`` is, ignoring case and outer spaces, one of RESERVED_PRESET_NAMES."""
+    return name.strip().casefold() in {reserved.casefold() for reserved in RESERVED_PRESET_NAMES}
+
+
+def reserved_preset_name_message(name: str) -> str:
+    return (
+        f"❌ '{escape_markdown(name.strip())}' is one of the preset list's built-in choices "
+        f"({', '.join(RESERVED_PRESET_NAMES)}), so a preset can't use it. Choose a different name."
+    )
+
+
+def too_many_players_message(player_count: int) -> str:
+    """Why a roster over MAX_PLAYERS is refused - shared by every place one can be entered or saved."""
+    return f"{player_count} players is more than the {MAX_PLAYERS} this scheduler supports."
 
 
 def set_player_preset(session_state: Any, preset: str) -> None:
@@ -105,12 +177,17 @@ def _constructive_design_available(num_players: int, num_courts: int, num_rounds
     return build_perfect_schedule(probe_names, num_courts, num_rounds) is not None
 
 
-def build_feasibility_notes(num_players: int, num_courts: int, num_rounds: int) -> list[str]:
+def build_feasibility_notes(num_players: int, num_courts: int, num_rounds: int, num_constraints: int = 0) -> list[str]:
     """Advisory notes about whether this configuration can reach a perfectly fair schedule.
 
     Runs before generation so users are not surprised by a mediocre score after
     waiting up to the full max-time budget for a combination that was never
-    going to reach range 0.
+    going to reach range 0. It warns only about what is proven (see
+    ScheduleFeasibilityAnalyzer.calculate_theoretical_minimums): games that
+    can't divide evenly, or players who can't get a game at all. Anything else
+    is left to the search. num_constraints is the number of do-not-pair/
+    do-not-oppose constraints active for this roster: any of them turns off
+    the instant constructive schedule, so the search runs instead.
     """
     ScheduleFeasibilityAnalyzer = import_module_with_fallback("utils.feasibility_analyzer").ScheduleFeasibilityAnalyzer
 
@@ -118,38 +195,47 @@ def build_feasibility_notes(num_players: int, num_courts: int, num_rounds: int) 
     notes: list[str] = []
 
     if feasibility["range_0_possible"]:
-        if _constructive_design_available(num_players, num_courts, num_rounds):
+        if not num_constraints and _constructive_design_available(num_players, num_courts, num_rounds):
             notes.append(f"✅ A perfectly fair schedule (range 0) is guaranteed instant for {num_players} players.")
         else:
             notes.append(
-                f"✅ A perfectly fair schedule (range 0) is mathematically possible for {num_players} players."
+                f"Nothing rules out a perfectly fair schedule (range 0) for {num_players} players - the search "
+                "looks for one for up to the max generation time, and stops early if it finds one."
+            )
+        if num_constraints:
+            notes.append(
+                f"With {num_constraints} active constraint(s) the schedule has to be searched for: that can take "
+                "up to the max generation time, and the constraints may keep it from reaching range 0."
             )
         return notes
 
+    slots = num_rounds * num_courts * 4
+    if feasibility["total_theoretical_min"] > feasibility["min_games_range"]:
+        notes.append(
+            f"⚠️ {num_rounds} round(s) on {num_courts} court(s) give {slots} places in games for "
+            f"{num_players} players, so {num_players - slots} can't play at all - perfect fairness (range 0) is "
+            f"not possible, and the total range can't go below {feasibility['total_theoretical_min']}."
+        )
+        return notes
+
     notes.append(
-        f"⚠️ With {num_players} players and {num_courts} court(s), perfect fairness (range 0) is not "
-        f"mathematically possible for {num_rounds} rounds - expect a minimum total range of "
-        f"{feasibility['total_theoretical_min']}."
+        f"⚠️ {num_rounds} round(s) on {num_courts} court(s) give {slots} places in games, which can't divide "
+        f"evenly among {num_players} players - some play one game more, so perfect fairness (range 0) is not "
+        "possible and the total range can't go below 1."
     )
 
-    better_counts = []
-    for delta in (-4, -3, -2, -1, 1, 2, 3, 4):
-        candidate = num_players + delta
-        if candidate < 4:
-            continue
-        # Courts are the user's fixed physical resource, not something that
-        # scales with the candidate player count - a suggestion is only
-        # useful if it's achievable with the courts actually available.
-        candidate_feasibility = ScheduleFeasibilityAnalyzer.calculate_theoretical_minimums(
-            candidate, num_courts, num_rounds
-        )
-        if candidate_feasibility["range_0_possible"]:
-            better_counts.append(candidate)
-
-    if better_counts:
-        better_counts = sorted(set(better_counts))[:3]
-        counts_text = " or ".join(str(c) for c in better_counts)
-        notes.append(f"With {counts_text} players (same round count), range 0 becomes possible.")
+    # Courts are the user's fixed physical resource, not something that
+    # scales with the candidate player count - a suggestion is only useful
+    # if it's achievable with the courts actually available, so a candidate
+    # must fill every court.
+    even_counts = [
+        candidate
+        for candidate in (num_players + delta for delta in (-4, -3, -2, -1, 1, 2, 3, 4))
+        if candidate >= num_courts * 4 and slots % candidate == 0
+    ]
+    if even_counts:
+        counts_text = " or ".join(str(c) for c in even_counts[:3])
+        notes.append(f"With {counts_text} players (same courts and rounds), the games would divide evenly.")
 
     return notes
 
@@ -212,6 +298,17 @@ def constraint_pressure_warnings(
     return warnings
 
 
+# Characters shown with no width at all, so a name holding one looks just like
+# the name without it - pasted text often carries them.
+_ZERO_WIDTH_CHARACTERS = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"))
+
+
+def _visible_name(name: str) -> str:
+    """A name as it reads: an accent typed as a separate mark composed with its letter (NFC), and
+    zero-width characters left out. Only for comparing names - they are kept as typed."""
+    return unicodedata.normalize("NFC", name).translate(_ZERO_WIDTH_CHARACTERS)
+
+
 def find_player_name_issues(players: list[str]) -> list[str]:
     """Detect duplicate and near-duplicate names before they reach the scheduler.
 
@@ -219,7 +316,9 @@ def find_player_name_issues(players: list[str]) -> list[str]:
     multiple schedule slots, which later surfaces as a misleading "algorithm
     bug" error (impossible player assignments) instead of a clear input
     problem. Case/spacing collisions ("Bob" vs "bob") are flagged separately
-    since they are usually typos rather than intentional distinct players.
+    since they are usually typos rather than intentional distinct players, and
+    so are names that look identical but are typed differently ("José" with
+    its accent typed separately, a pasted zero-width space).
     """
     issues: list[str] = []
 
@@ -234,11 +333,16 @@ def find_player_name_issues(players: list[str]) -> list[str]:
 
     normalized_groups: dict[str, list[str]] = {}
     for name in players:
-        key = re.sub(r"\s+", " ", name.strip().lower())
+        key = re.sub(r"\s+", " ", _visible_name(name).strip().lower())
         normalized_groups.setdefault(key, []).append(name)
     for variants in normalized_groups.values():
         distinct_variants = sorted(set(variants))
-        if len(distinct_variants) > 1:
+        if len({_visible_name(name) for name in distinct_variants}) < len(distinct_variants):
+            issues.append(
+                "Names that look the same but are typed with different characters (an accent typed "
+                "separately, or an invisible character): " + ", ".join(distinct_variants)
+            )
+        elif len(distinct_variants) > 1:
             issues.append("Names that look the same but differ in case or spacing: " + ", ".join(distinct_variants))
 
     return issues
@@ -250,7 +354,7 @@ def determine_initial_player_preset(
 ) -> str:
     """Choose a useful default preset for first render without overwriting user intent."""
     preset_names = list(config.get("player_presets", {}).keys())
-    preset_options = ["Custom", "Default Names", *preset_names]
+    preset_options = [*RESERVED_PRESET_NAMES, *preset_names]
 
     custom_players = session_state.get("custom_players", "")
     has_custom_players = isinstance(custom_players, str) and bool(custom_players.strip())
@@ -285,7 +389,9 @@ def build_player_preset_options(
 ) -> list[str]:
     """Return preset options ordered so the intended selection is first."""
     preset_names = list(config.get("player_presets", {}).keys())
-    preset_options = ["Custom", "Default Names", *preset_names]
+    # A preset saved under a reserved name (before those were refused) is
+    # listed once: the reserved choice is what picking it loads.
+    preset_options = list(dict.fromkeys([*RESERVED_PRESET_NAMES, *preset_names]))
     initial_preset = determine_initial_player_preset(session_state, config)
     return [initial_preset, *[option for option in preset_options if option != initial_preset]]
 
@@ -333,15 +439,136 @@ def resolve_players_text_for_preset(
     return ""
 
 
+def build_constraint_pair_options(players: list[str], separator: str) -> dict[str, list[str]]:
+    """Map each constraint multiselect label to its pair, in roster order.
+
+    Callers map a selected label back to its pair through this dict rather
+    than re-splitting the label on ``separator``, so a player name that
+    itself contains " & " or " vs " still round-trips to the right pair.
+    Labels are unique: names like "Tom & Jerry" + "Spike" and "Tom" +
+    "Jerry & Spike" would both read "Tom & Jerry & Spike", so colliding
+    labels quote each name instead.
+    """
+    pairs = [(p1, p2) for i, p1 in enumerate(players) for p2 in players[i + 1 :]]
+    plain_counts = Counter(f"{p1}{separator}{p2}" for p1, p2 in pairs)
+    options: dict[str, list[str]] = {}
+    for index, (p1, p2) in enumerate(pairs):
+        label = f"{p1}{separator}{p2}"
+        if plain_counts[label] > 1:
+            label = f'"{p1}"{separator}"{p2}"'
+        if label in options:
+            label = f"{label} (#{index + 1})"
+        options[label] = [p1, p2]
+    return options
+
+
+def _pair_in_roster(pair: Sequence[str], roster: set[str]) -> bool:
+    return len(pair) == 2 and pair[0] in roster and pair[1] in roster
+
+
+def constraint_pairs_for_roster(constraint_pairs: Sequence[Sequence[str]], players: Sequence[str]) -> list[list[str]]:
+    """Return only the saved pairs whose two players are both on ``players``.
+
+    Saved constraints outlive any one roster (a regular who is away this
+    week keeps theirs), so everything that acts on a specific roster - the
+    scheduler, the constraint counts and warnings, the settings recorded in
+    history - must use this filtered view rather than the full saved list.
+    """
+    roster = set(players)
+    return [list(pair) for pair in constraint_pairs if _pair_in_roster(pair, roster)]
+
+
+def _fold_name(name: str) -> str:
+    return re.sub(r"\s+", "", _visible_name(name)).casefold()
+
+
+def find_constraint_name_issues(config: Mapping[str, Any], players: Sequence[str]) -> list[str]:
+    """Flag constraint names that miss a roster player only by case or spacing.
+
+    Constraints apply by exact name (constraint_pairs_for_roster), so a pair
+    saved as "alice, bob" never constrains Alice and Bob - and since a pair
+    naming someone off the roster is dropped without comment (they may just
+    be away this week), nothing else would say so. Closer guesses are left
+    alone: "Dan" may be a typo for Dana, or a different player who is away.
+    """
+    roster = set(players)
+    by_folded: dict[str, str] = {}
+    for name in players:
+        by_folded.setdefault(_fold_name(name), name)
+
+    issues: list[str] = []
+    for pair in [*config["constraints"]["do_not_pair"], *config["constraints"]["do_not_oppose"]]:
+        for name in pair:
+            suggestion = None if name in roster else by_folded.get(_fold_name(name))
+            if suggestion is not None:
+                issues.append(
+                    f"No player is named exactly '{name}' - did you mean '{suggestion}'? "
+                    f"Constraints naming '{name}' won't be applied."
+                )
+    return list(dict.fromkeys(issues))
+
+
 def build_constraint_multiselect_defaults(
     constraint_pairs: list[list[str]],
     players: list[str],
     separator: str,
+    pair_options: Mapping[str, list[str]] | None = None,
 ) -> list[str]:
-    """Format saved constraints into multiselect labels for the current player list."""
-    return [
-        f"{first}{separator}{second}" for first, second in constraint_pairs if first in players and second in players
+    """Format saved constraints into multiselect labels for the current player list.
+
+    Labels come from the same mapping as the options, whatever order the
+    pair was saved in: Streamlit raises if a default is not one of the
+    options, so a pair saved as [Bob, Alice] (as quick-add, the Configuration
+    tab or an import can store it) must still render as "Alice & Bob" when
+    Alice is listed first. A caller that already has
+    build_constraint_pair_options(players, separator) passes it as
+    ``pair_options`` rather than having every pair built again.
+    """
+    if pair_options is None:
+        pair_options = build_constraint_pair_options(players, separator)
+    label_for_pair = {frozenset(pair): label for label, pair in pair_options.items()}
+    labels = [
+        label_for_pair[frozenset(pair)]
+        for pair in constraint_pairs_for_roster(constraint_pairs, players)
+        if frozenset(pair) in label_for_pair
     ]
+    return list(dict.fromkeys(labels))
+
+
+def merge_roster_constraint_selection(
+    saved_pairs: Sequence[Sequence[str]],
+    selected_labels: Sequence[str],
+    label_to_pair: Mapping[str, list[str]],
+    players: Sequence[str],
+) -> list[list[str]]:
+    """Combine the constraint multiselect's selection with the saved pairs it can't show.
+
+    The multiselect only offers pairs where both players are on the current
+    roster, so its value says nothing about any other saved constraint:
+    those are kept unchanged. Saved pairs inside the roster are kept only
+    while still selected, and newly selected pairs are appended. Saved order
+    is preserved so an unchanged selection writes back an identical list.
+    """
+    roster = set(players)
+    selected_pairs = [label_to_pair[label] for label in selected_labels if label in label_to_pair]
+    selected_keys = {frozenset(pair) for pair in selected_pairs}
+
+    merged: list[list[str]] = []
+    kept_keys: set[frozenset[str]] = set()
+    for pair in saved_pairs:
+        if _pair_in_roster(pair, roster):
+            key = frozenset(pair)
+            if key not in selected_keys or key in kept_keys:
+                continue
+            kept_keys.add(key)
+        merged.append(list(pair))
+
+    for pair in selected_pairs:
+        key = frozenset(pair)
+        if key not in kept_keys:
+            kept_keys.add(key)
+            merged.append(pair)
+    return merged
 
 
 def add_quick_constraint(
@@ -379,12 +606,31 @@ def sync_constraint_widget_state(
     session_state: Any,
     players: list[str],
     config: Mapping[str, Any],
+    pair_options: Mapping[str, list[str]] | None = None,
+    oppose_options: Mapping[str, list[str]] | None = None,
 ) -> None:
-    """Seed constraint widget state from saved config when the UI needs a resync."""
+    """Seed constraint widget state from saved config when the UI needs a resync.
+
+    Besides an explicit request (a Configuration-tab edit or save, an import,
+    quick-add), a roster change resyncs too: the multiselects keep their old
+    selection while it is still a valid subset of the new options, so a
+    returning player's saved pairs would never appear selected - and the
+    write-back would then treat them as deselected and drop them. Nothing is
+    lost by resyncing, since every run already merges the current selection
+    into config. ``pair_options`` and ``oppose_options`` are the " & " and
+    " vs " build_constraint_pair_options results, when the caller has them.
+    """
     should_sync_from_config = bool(session_state.pop("_sync_main_constraints_from_config", False))
+    roster_signature = tuple(players)
+    previous_roster = session_state.get("_constraint_widget_roster")
+    if previous_roster is not None and tuple(previous_roster) != roster_signature:
+        should_sync_from_config = True
+    session_state["_constraint_widget_roster"] = roster_signature
     do_not_pair_key, do_not_oppose_key = get_constraint_widget_keys(session_state)
-    pair_options = [f"{p1} & {p2}" for i, p1 in enumerate(players) for p2 in players[i + 1 :]]
-    oppose_options = [f"{p1} vs {p2}" for i, p1 in enumerate(players) for p2 in players[i + 1 :]]
+    if pair_options is None:
+        pair_options = build_constraint_pair_options(players, " & ")
+    if oppose_options is None:
+        oppose_options = build_constraint_pair_options(players, " vs ")
 
     current_pair_selection = session_state.get(do_not_pair_key)
     if (
@@ -396,6 +642,7 @@ def sync_constraint_widget_state(
             config["constraints"]["do_not_pair"],
             players,
             " & ",
+            pair_options,
         )
 
     current_oppose_selection = session_state.get(do_not_oppose_key)
@@ -408,7 +655,83 @@ def sync_constraint_widget_state(
             config["constraints"]["do_not_oppose"],
             players,
             " vs ",
+            oppose_options,
         )
+
+
+def history_unavailable_message(exc: BaseException) -> str:
+    """Explain a schedule history database that couldn't be opened, and what still works."""
+    if isinstance(exc, sqlite3.DatabaseError) and not isinstance(exc, sqlite3.OperationalError):
+        cause = (
+            "The database file looks damaged. It has not been changed: restore it from a backup, or move it "
+            "aside to start a new, empty history."
+        )
+    else:
+        cause = (
+            "Another program may be using the database file, or it may be read-only. The app tries again "
+            "each time the page updates."
+        )
+    return (
+        f"❌ Couldn't open the schedule history ({exc}). {cause} Until then you can still generate "
+        "schedules, but History, score entry and the Leaderboard are unavailable."
+    )
+
+
+def unsaved_schedule(session_state: Any) -> dict | None:
+    """The failed history save of the schedule on screen, or None if it is saved (or none is shown).
+
+    Matched to the schedule object itself, so it never applies to a schedule
+    generated or loaded since.
+    """
+    unsaved = session_state.get(UNSAVED_SCHEDULE_KEY)
+    if (
+        unsaved is None
+        or session_state.get("current_schedule_id") is not None
+        or unsaved["schedule"] is not session_state.get("current_schedule")
+    ):
+        return None
+    return unsaved
+
+
+def save_schedule_to_history(session_state: Any, schedule, players, settings, algorithm) -> int | None:
+    """Save the schedule on screen to history and point score entry at it.
+
+    Returns the new history id, or None if it couldn't be saved (including
+    when the history database couldn't be opened at all). A failed save is
+    kept under UNSAVED_SCHEDULE_KEY so it can be retried: until it is saved,
+    the schedule's scores can't be entered.
+    """
+    history_manager = session_state.get("history_manager")
+    schedule_id = (
+        history_manager.save_schedule(schedule, players, settings, algorithm=algorithm)
+        if history_manager is not None
+        else None
+    )
+    session_state.current_schedule_id = schedule_id
+    if schedule_id is None:
+        session_state[UNSAVED_SCHEDULE_KEY] = {
+            "schedule": schedule,
+            "players": players,
+            "settings": settings,
+            "algorithm": algorithm,
+        }
+    else:
+        session_state.pop(UNSAVED_SCHEDULE_KEY, None)
+    return schedule_id
+
+
+# Warnings and errors left for the next run, as (level, text) pairs: see queue_status_notice.
+STATUS_NOTICES_KEY = "_status_notices"
+
+
+def queue_status_notice(session_state: Any, level: str, text: str) -> None:
+    """Show text as a "warning" or an "error" at the top of the page on the next run.
+
+    For a handler that calls st.rerun(): the rerun clears whatever the
+    handler drew itself. These show above the tabs, under the success
+    message it leaves in global_status_message.
+    """
+    session_state.setdefault(STATUS_NOTICES_KEY, []).append((level, text))
 
 
 def render_enhanced_scheduler_page(
@@ -427,14 +750,30 @@ def render_enhanced_scheduler_page(
     elo_manager_cls=None,
 ):
     """Render the top-level scheduler page with tabs."""
+    history_error = None
     if "history_manager" not in st_module.session_state:
-        st_module.session_state.history_manager = history_manager_cls()
+        try:
+            st_module.session_state.history_manager = history_manager_cls()
+        except (sqlite3.Error, OSError) as exc:
+            # Scheduling doesn't need the history, so keep the rest of the app
+            # usable. Nothing is stored, so the next run tries again - another
+            # program's lock on the file is often brief.
+            logger.exception("Could not open the schedule history database")
+            history_error = exc
     if "config_manager" not in st_module.session_state:
         st_module.session_state.config_manager = config_manager_cls()
     if skill_manager_cls is not None and "skill_manager" not in st_module.session_state:
         st_module.session_state.skill_manager = skill_manager_cls()
     if elo_manager_cls is not None and "elo_manager" not in st_module.session_state:
         st_module.session_state.elo_manager = elo_manager_cls()
+    # Notices above the tabs render into slots that exist on every run, even
+    # when empty. st.tabs is identified by its position on the page, so a
+    # banner that appears on one run and not the next shifts the tabs, which
+    # remounts them and snaps the user back to the first tab - e.g. right
+    # after "Save Configuration" or "Import CSV" on a later tab.
+    repair_notices = st_module.container()
+    if history_error is not None:
+        repair_notices.error(history_unavailable_message(history_error))
     if "app_config" not in st_module.session_state:
         CONFIG_REPAIR_MESSAGES_KEY = import_module_with_fallback("app_managers").CONFIG_REPAIR_MESSAGES_KEY
 
@@ -442,20 +781,32 @@ def render_enhanced_scheduler_page(
         repair_messages = loaded_config.pop(CONFIG_REPAIR_MESSAGES_KEY, None)
         st_module.session_state.app_config = loaded_config
         for message in repair_messages or []:
-            st_module.warning(f"⚠️ {message}")
+            repair_notices.warning(f"⚠️ {escape_markdown(message)}")
 
     col1, col2 = st_module.columns([1, 0.2])
     with col1:
         st_module.title("🎾 Pickleball Scheduler")
     with col2:
-        if st_module.button("Logout"):
+        # No logout_fn when no password is set: there is no login page to go to.
+        if logout_fn is not None and st_module.button("Logout"):
             logout_fn()
 
     st_module.markdown("*Complete scheduling with analytics and history*")
 
+    status_slot = st_module.empty()
     global_status_message = st_module.session_state.pop("global_status_message", None)
+    status_notices = st_module.session_state.pop(STATUS_NOTICES_KEY, None)
+    if status_notices:
+        status_slot = status_slot.container()  # an empty slot holds just one element
     if isinstance(global_status_message, str) and global_status_message:
-        st_module.success(global_status_message)
+        status_slot.success(global_status_message)
+    for level, text in status_notices or []:
+        (status_slot.error if level == "error" else status_slot.warning)(text)
+    interrupted_run_slot = st_module.empty()
+    # Drawn before the tabs, so they don't jump while each run draws them.
+    interrupted_run = _interrupted_run_marker(st_module.session_state)
+    if interrupted_run is not None:
+        _render_interrupted_run_notice(st_module, interrupted_run_slot, interrupted_run)
 
     tab_labels = [
         "🎯 Main Scheduler",
@@ -480,9 +831,191 @@ def render_enhanced_scheduler_page(
 
     tabs = st_module.tabs(tab_labels)
 
+    queued_runs: list = []
+    st_module.session_state[QUEUED_SCHEDULER_RUNS_KEY] = queued_runs
     for tab, tab_fn in zip(tabs, tab_fns):
         with tab:
             tab_fn()
+    st_module.session_state.pop(QUEUED_SCHEDULER_RUNS_KEY, None)
+
+    # The notice goes once a tab has changed the schedule on screen, or when
+    # a Generate or replan starts below and so replaces the interrupted one.
+    if interrupted_run is not None and (
+        queued_runs or _interrupted_run_marker(st_module.session_state) is not interrupted_run
+    ):
+        interrupted_run_slot.empty()
+    # A save on this run (or on the run a st.rerun cut short) may have replaced
+    # a config file it couldn't read; say so, naming the kept copy, in the
+    # notice slot above the tabs. A queued run that saves reruns the page, so
+    # its notice shows on that rerun.
+    for message in st_module.session_state.config_manager.pop_notices():
+        repair_notices.warning(f"⚠️ {escape_markdown(message)}")
+    for run in queued_runs:
+        run()
+
+
+# Held in session_state while a Generate or replan run works. The GA runs on
+# the script thread, and Streamlit stops that run - when the user changes a
+# widget, clicks a button, presses Stop or the connection drops - by raising a
+# BaseException out of the next st call (the progress callback), which none of
+# the `except Exception` handlers here see, so nothing gets saved. The marker
+# outlives such a run, which lets the next run say what happened.
+SCHEDULER_RUN_MARKER_KEY = "_scheduler_run_in_progress"
+DISMISS_INTERRUPTED_RUN_KEY = "dismiss_interrupted_run"
+# The list render_enhanced_scheduler_page starts queued Generate and replan
+# runs from, once every tab is drawn (see _start_after_the_tabs).
+QUEUED_SCHEDULER_RUNS_KEY = "_queued_scheduler_runs"
+# How the last Generate went, for the rerun that draws its schedule.
+GENERATION_OUTCOME_KEY = "_generation_outcome"
+
+_RUN_CANCEL_CAPTION = (
+    "⏳ Changing anything on the page while this runs (a setting, a button, a score), pressing Stop or "
+    "losing the connection cancels it and leaves the schedule as it was."
+)
+_INTERRUPTED_RUN_MESSAGES = {
+    "generation": (
+        "⚠️ The last schedule generation was interrupted before it finished, so no new schedule was saved and "
+        "any schedule shown is still the previous one. This happens when something on the page is changed or "
+        "clicked, Stop is pressed, or the connection drops while it runs. Click '🎯 Generate Schedule' to run "
+        "it again."
+    ),
+    "replan": (
+        "⚠️ The last mid-session replan was interrupted before it finished, so the remaining rounds were not "
+        "changed. This happens when something on the page is changed or clicked, Stop is pressed, or the "
+        "connection drops while it runs. Click '🔁 Replan remaining rounds' to run it again."
+    ),
+}
+
+
+# How many generations (Generate, replan, a Stress Test sweep) are running in
+# this server process, across every session. They are threads of one process
+# sharing the processor, so with two running each searches about half the
+# generations it would alone within its time limit.
+_running_generations = 0
+_running_generations_lock = threading.Lock()
+_SHARED_SERVER_NOTICE = (
+    "ℹ️ Another schedule is being generated on this server right now. They share the processor, so this run may "
+    "search fewer generations than usual in its time limit."
+)
+
+
+@contextmanager
+def counted_generation(st_module) -> Iterator[None]:
+    """Count a generation as running while the block runs, first saying so on
+    the page if another one already is."""
+    global _running_generations
+    with _running_generations_lock:
+        already_running = _running_generations
+        _running_generations += 1
+    try:
+        if already_running:
+            st_module.info(_SHARED_SERVER_NOTICE)
+        yield
+    finally:
+        # Also when Streamlit stops the run part-way: the generation stops with it.
+        with _running_generations_lock:
+            _running_generations -= 1
+
+
+def _start_scheduler_run(session_state: Any, kind: str) -> dict:
+    marker = {"kind": kind, "schedule": session_state.get("current_schedule")}
+    session_state[SCHEDULER_RUN_MARKER_KEY] = marker
+    return marker
+
+
+def _end_scheduler_run(session_state: Any, marker: dict) -> None:
+    # Only this run's own marker: a run that ends late must not clear the
+    # marker of the run that replaced it.
+    if session_state.get(SCHEDULER_RUN_MARKER_KEY) is marker:
+        session_state.pop(SCHEDULER_RUN_MARKER_KEY, None)
+
+
+@contextmanager
+def _scheduler_run(session_state: Any, kind: str) -> Iterator[None]:
+    """Mark a Generate or replan run in progress, clearing the mark when it
+    ends in any way except being interrupted by Streamlit."""
+    marker = _start_scheduler_run(session_state, kind)
+    try:
+        yield
+    except Exception:
+        _end_scheduler_run(session_state, marker)
+        raise
+    _end_scheduler_run(session_state, marker)
+
+
+def _interrupted_run_marker(session_state: Any) -> dict | None:
+    """The marker a Generate or replan left when Streamlit interrupted it, kept
+    until the schedule on screen changes (a new run, a History load) or the
+    user dismisses the notice about it."""
+    marker = session_state.get(SCHEDULER_RUN_MARKER_KEY)
+    if not isinstance(marker, dict):
+        return None
+    if session_state.get("current_schedule") is not marker.get("schedule"):
+        session_state.pop(SCHEDULER_RUN_MARKER_KEY, None)
+        return None
+    return marker
+
+
+def _render_interrupted_run_notice(st_module, slot, marker: dict) -> None:
+    notice = slot.container()
+    notice.warning(_INTERRUPTED_RUN_MESSAGES[marker["kind"]])
+    notice.button(
+        "Dismiss",
+        key=DISMISS_INTERRUPTED_RUN_KEY,
+        on_click=st_module.session_state.pop,
+        args=(SCHEDULER_RUN_MARKER_KEY, None),
+    )
+
+
+def _start_after_the_tabs(st_module, slot, run) -> None:
+    """Start a Generate or replan run, drawing into slot, once every tab is drawn.
+
+    Streamlit stops a run part-way when the user interacts, presses Stop or
+    the connection drops, and the browser then clears everything that run had
+    not drawn yet. A long run started inside the first tab took the schedule
+    below it, every other tab and any unsaved score entry with it.
+    """
+
+    def run_in_slot():
+        with slot.container():
+            run()
+
+    queued_runs = st_module.session_state.get(QUEUED_SCHEDULER_RUNS_KEY)
+    if isinstance(queued_runs, list):
+        queued_runs.append(run_in_slot)
+    else:  # the tab drawn on its own, outside render_enhanced_scheduler_page
+        run_in_slot()
+
+
+def _render_generation_outcome(st_module, slot, warnings: list) -> None:
+    """Show how the last Generate went, on the rerun that draws its schedule."""
+    # Left collapsed, the box would hide its warnings behind a bare "Done".
+    label = "⚠️ Done - see the warnings below" if warnings else "✅ Done"
+    with slot.container(), st_module.status(label, state="complete", expanded=bool(warnings)):
+        st_module.success("✅ Schedule generated!")
+        for warning in warnings:
+            st_module.warning(warning)
+
+
+def _generation_progress(progress_data, max_time, replay_generations=None) -> tuple[float, str]:
+    """The progress bar fraction and status line for one GA progress update.
+
+    A run is bounded by max_time, so its progress is the time used. A replay
+    ignores the clock (see generate_schedule), so its progress is the
+    generations done out of replay_generations.
+    """
+    elapsed = float(progress_data.get("elapsed_time", 0.0))
+    generation = progress_data.get("generation", 0)
+    total_range = progress_data.get("total_range", "?")
+    if replay_generations:
+        return (
+            max(0.0, min(1.0, generation / replay_generations)),
+            f"Replaying generation {generation} of {replay_generations} - best range {total_range} - "
+            f"{elapsed:.0f}s elapsed",
+        )
+    budget = float(progress_data.get("max_time") or max_time or 1.0)
+    fraction = max(0.0, min(1.0, elapsed / budget)) if budget else 0.0
+    return fraction, f"Generation {generation} - best range {total_range} - {elapsed:.0f}s elapsed"
 
 
 def _handle_generate_schedule_click(
@@ -496,47 +1029,59 @@ def _handle_generate_schedule_click(
     scheduler_cls,
     schedule_analytics_cls,
     validate_schedule_integrity_fn,
+    replay_generations=None,
 ) -> None:
     """Handle the "Generate Schedule" button: build the scheduler,
     generate and validate a schedule, and persist it to session_state/history.
 
-    The caller always falls through to rendering the persistent schedule
-    view afterward, on every outcome (success, no schedule returned, an
-    invalid schedule, or an exception) - a failed attempt must never hide a
-    schedule already on screen from a previous successful generation.
+    The run is bounded by max_time ("Max generation time"), not a generation
+    count - unless replay_generations is given with generation_seed, which
+    replays that earlier run exactly (see generate_schedule).
+
+    It runs once every tab is drawn (see _start_after_the_tabs), so on every
+    outcome the page already shows whatever schedule was on screen before -
+    a failed attempt must never hide one from a previous successful
+    generation. A new schedule is drawn by the rerun that ends a successful
+    run, which also shows the outcome kept under GENERATION_OUTCOME_KEY.
     """
-    with st_module.status("Generating schedule...", expanded=True) as status_box:
+    generated = False
+    status = st_module.status("Generating schedule...", expanded=True)
+    with _scheduler_run(st_module.session_state, "generation"), status as status_box:
+        cancel_caption = st_module.empty()
+        cancel_caption.caption(_RUN_CANCEL_CAPTION)
         progress_bar = st_module.progress(0)
         progress_text = st_module.empty()
 
         def _on_progress(progress_data, _bar=progress_bar, _text=progress_text, _max_time=max_time):
             try:
-                elapsed = float(progress_data.get("elapsed_time", 0.0))
-                budget = float(progress_data.get("max_time") or _max_time or 1.0)
-                fraction = max(0.0, min(1.0, elapsed / budget)) if budget else 0.0
+                fraction, text = _generation_progress(progress_data, _max_time, replay_generations)
                 _bar.progress(fraction)
-                generation = progress_data.get("generation", 0)
-                total_range = progress_data.get("total_range", "?")
-                _text.text(f"Generation {generation} - best range {total_range} - {elapsed:.0f}s elapsed")
+                _text.text(text)
             except Exception:
                 logger.debug("Progress callback failed", exc_info=True)
 
         import time as _time
 
+        active_constraints = {
+            "do_not_pair": constraint_pairs_for_roster(config["constraints"]["do_not_pair"], players),
+            "do_not_oppose": constraint_pairs_for_roster(config["constraints"]["do_not_oppose"], players),
+        }
         generation_started_at = _time.time()
         logger.info(
             "Generation start: players=%d rounds=%d courts=%d " "pair_constraints=%d oppose_constraints=%d seed=%s",
             len(players),
             num_rounds,
             courts,
-            len(config["constraints"]["do_not_pair"]),
-            len(config["constraints"]["do_not_oppose"]),
+            len(active_constraints["do_not_pair"]),
+            len(active_constraints["do_not_oppose"]),
             generation_seed,
         )
 
         try:
+            warnings = []
             if not st_module.session_state.config_manager.save_config(config):
-                st_module.warning("⚠️ Could not save configuration before generating - continuing anyway.")
+                warnings.append("⚠️ Could not save configuration before generating - continuing anyway.")
+                st_module.warning(warnings[-1])
 
             scheduler = scheduler_cls(
                 players=players,
@@ -544,10 +1089,9 @@ def _handle_generate_schedule_click(
                 num_rounds=num_rounds,
                 use_desktop_params=True,
                 max_runtime=max_time,
-                max_generations=max(2000, int(max_time * 70)),
             )
 
-            constraints = config["constraints"]
+            constraints = active_constraints
             if constraints["do_not_pair"] or constraints["do_not_oppose"]:
                 scheduler.add_constraints(
                     pair_constraints=[
@@ -558,11 +1102,13 @@ def _handle_generate_schedule_click(
                     ],
                 )
 
-            result = scheduler.generate_schedule(
-                max_time=max_time,
-                seed=generation_seed,
-                progress_callback=_on_progress,
-            )
+            with counted_generation(st_module):
+                result = scheduler.generate_schedule(
+                    max_time=max_time,
+                    seed=generation_seed,
+                    progress_callback=_on_progress,
+                    generations=replay_generations,
+                )
 
             if not (isinstance(result, dict) and "schedule" in result):
                 logger.warning(
@@ -570,7 +1116,7 @@ def _handle_generate_schedule_click(
                     _time.time() - generation_started_at,
                 )
                 st_module.error("❌ Could not generate schedule. Try adjusting parameters.")
-                status_box.update(label="❌ Generation failed", state="error")
+                status_box.update(label="❌ Generation failed", state="error", expanded=True)
                 return
 
             schedule_data = result["schedule"]
@@ -585,19 +1131,17 @@ def _handle_generate_schedule_click(
                 st_module.error("🚨 **CRITICAL ERROR: Invalid schedule generated!**")
                 st_module.error("**The algorithm has bugs that generated impossible player assignments!**")
                 for error in schedule_errors:
-                    st_module.error(f"❌ {error}")
+                    st_module.error(f"❌ {escape_markdown(error)}")
                 st_module.error("**🛑 This indicates serious bugs in the scheduling algorithm!**")
                 st_module.info("Please report this bug with the exact player configuration.")
-                status_box.update(label="❌ Invalid schedule generated", state="error")
+                status_box.update(label="❌ Invalid schedule generated", state="error", expanded=True)
                 return
 
             progress_bar.progress(1.0)
-            status_box.update(label="✅ Done", state="complete")
-            st_module.success("✅ Schedule generated!")
 
             constraint_violations = result.get("constraint_violations", 0)
             if constraint_violations:
-                st_module.warning(
+                warnings.append(
                     f"⚠️ {constraint_violations} game(s) in this schedule violate a requested "
                     "'do not pair' or 'do not oppose' constraint - your constraints may not be "
                     "fully satisfiable together with this many players/courts/rounds."
@@ -608,6 +1152,7 @@ def _handle_generate_schedule_click(
                 num_players=len(players),
                 num_rounds=num_rounds,
                 num_courts=courts,
+                players=players,
             )
 
             logger.info(
@@ -629,6 +1174,11 @@ def _handle_generate_schedule_click(
             st_module.session_state.current_players = players
             st_module.session_state.current_metrics = metrics
             st_module.session_state.current_seed = result.get("seed")
+            # With the seed, the generation count replays this exact schedule -
+            # unless a repair ran out of time (see generate_schedule).
+            st_module.session_state.current_generations = (
+                result.get("generations") if result.get("replayable") else None
+            )
             st_module.session_state.current_round_times = round_times
             # A fresh generation uses one roster for every round - clear any
             # per-round roster segmentation left over from a previous
@@ -639,30 +1189,37 @@ def _handle_generate_schedule_click(
                 "num_rounds": num_rounds,
                 "courts": courts,
                 "max_time": max_time,
-                "constraints": config["constraints"],
+                "constraints": active_constraints,
                 "seed": result.get("seed"),
             }
             # generations == 0 means the constructive fast path produced this
             # schedule directly, without running the GA search at all.
             algorithm = "constructive" if result.get("generations") == 0 else "genetic"
-            st_module.session_state.current_schedule_id = st_module.session_state.history_manager.save_schedule(
-                schedule_data, players, settings, algorithm=algorithm
-            )
-            if st_module.session_state.current_schedule_id is None:
-                st_module.warning("⚠️ Schedule generated but could not be saved to history.")
+            # A failed save is reported (with a retry) above the schedule - see
+            # _render_unsaved_schedule_notice.
+            save_schedule_to_history(st_module.session_state, schedule_data, players, settings, algorithm)
+
+            st_module.session_state[GENERATION_OUTCOME_KEY] = warnings
+            generated = True
 
         except MemoryError:
             logger.exception("Generation end: status=exception elapsed=%.1fs", _time.time() - generation_started_at)
             st_module.error("❌ Ran out of memory while generating the schedule. Try fewer players or rounds.")
-            status_box.update(label="❌ Out of memory", state="error")
+            status_box.update(label="❌ Out of memory", state="error", expanded=True)
         except ValueError as exc:
             logger.exception("Generation end: status=exception elapsed=%.1fs", _time.time() - generation_started_at)
             st_module.error(f"❌ Invalid input: {exc}. Check your players and constraints.")
-            status_box.update(label="❌ Invalid input", state="error")
+            status_box.update(label="❌ Invalid input", state="error", expanded=True)
         except Exception:
             logger.exception("Generation end: status=exception elapsed=%.1fs", _time.time() - generation_started_at)
             st_module.error("❌ Schedule generation failed unexpectedly. See the server logs for details.")
-            status_box.update(label="❌ Generation error", state="error")
+            status_box.update(label="❌ Generation error", state="error", expanded=True)
+        finally:
+            cancel_caption.empty()
+
+    if generated:
+        # Every tab was drawn with the previous schedule - redraw them all.
+        st_module.rerun()
 
 
 def render_main_scheduler_tab(
@@ -681,6 +1238,12 @@ def render_main_scheduler_tab(
     # Values queued by this page's button handlers on the previous run, applied
     # here before any of the widgets they target are instantiated.
     apply_deferred_widget_values(st_module.session_state)
+    # Before a handler below can st.rerun() and drop the state of the widgets
+    # not drawn yet, here and on the later tabs, with any change the user made
+    # to them along with the click - though the browser goes on showing it.
+    remember_seeded_widget_values(st_module.session_state)
+    for key in (COURTS_KEY, MAX_TIME_KEY):
+        remember_widget_choice(st_module.session_state, key)
 
     st_module.subheader("👥 Players")
 
@@ -702,19 +1265,26 @@ def render_main_scheduler_tab(
         st_module.session_state.selected_player_preset_initialized = True
         default_players = resolve_players_text_for_preset(st_module.session_state, config, preset)
 
-        # Re-seed the textarea only when the preset selection itself changed,
-        # so it doesn't clobber in-progress manual edits under "Custom" on
-        # every unrelated rerun. (Keyed on the preset, not on default_players,
-        # because under "Custom" the latter tracks the user's own typing.)
+        # Picking a different preset replaces the roster outright, dropping any
+        # edits made under the old one (and the old roster the seed below
+        # compares against).
         if preset != previous_preset:
+            forget_widget_state(st_module.session_state, PLAYERS_INPUT_KEY)
+            st_module.session_state[PLAYERS_INPUT_KEY] = default_players
+        # A saved preset's roster can also change while it stays selected (saved
+        # in Player Management, restored from a backup). Follow it, carrying any
+        # names added or removed here by hand over onto the new roster. Custom
+        # and Default Names have nothing to follow: under Custom default_players
+        # tracks the user's own typing, and the app never writes the default
+        # names file (a failed read of it would only empty the box).
+        if preset not in RESERVED_PRESET_NAMES:
+            seed_widget_from_source(st_module.session_state, PLAYERS_INPUT_KEY, default_players, rebase_line_edits)
+        # The box takes no value= (see src/widget_state.py), so its key must
+        # be set - an st.rerun() before it renders would have dropped it.
+        if PLAYERS_INPUT_KEY not in st_module.session_state:
             st_module.session_state[PLAYERS_INPUT_KEY] = default_players
 
-        players_text = st_module.text_area(
-            "Player names (one per line):",
-            value=default_players,
-            height=150,
-            key=PLAYERS_INPUT_KEY,
-        )
+        players_text = st_module.text_area("Player names (one per line):", height=150, key=PLAYERS_INPUT_KEY)
 
         if preset == "Custom":
             st_module.session_state.custom_players = players_text
@@ -723,7 +1293,7 @@ def render_main_scheduler_tab(
         st_module.markdown("**Quick Actions**")
 
         new_player = st_module.text_input("Quick add player:", key=QUICK_ADD_KEY)
-        preset_name = st_module.text_input("Preset name:", key="preset_name")
+        preset_name = st_module.text_input("Preset name:", key=PRESET_NAME_KEY)
 
         if st_module.button("➕ Add Player"):
             if not new_player:
@@ -738,7 +1308,7 @@ def render_main_scheduler_tab(
                     defer_widget_value(st_module.session_state, QUICK_ADD_KEY, "")
                     st_module.rerun()
                 else:
-                    st_module.warning(f"⚠️ '{new_player.strip()}' is already in the player list.")
+                    st_module.warning(f"⚠️ '{escape_markdown(new_player.strip())}' is already in the player list.")
 
         if st_module.button("💾 Save as Preset"):
             if not preset_name.strip():
@@ -746,28 +1316,79 @@ def render_main_scheduler_tab(
             else:
                 preset_players = parse_players_text(players_text)
                 stripped_name = preset_name.strip()
-                if not preset_players:
+                if is_reserved_preset_name(stripped_name):
+                    st_module.error(reserved_preset_name_message(stripped_name))
+                elif not preset_players:
                     st_module.warning("⚠️ Add at least one player before saving a preset.")
+                elif len(preset_players) > MAX_PLAYERS:
+                    st_module.error(
+                        f"❌ {too_many_players_message(len(preset_players))} Remove some names before saving "
+                        "the preset."
+                    )
                 elif stripped_name in config["player_presets"]:
                     st_module.error(
-                        f"❌ A preset named '{stripped_name}' already exists. "
+                        f"❌ A preset named '{escape_markdown(stripped_name)}' already exists. "
                         "Use a different name, or edit it from the Player Management tab."
                     )
+                elif import_module_with_fallback("app_tabs").preset_saved_elsewhere(st_module, stripped_name):
+                    st_module.error(
+                        f"❌ A preset named '{escape_markdown(stripped_name)}' already exists - it was saved "
+                        "from another tab or device. Reload the page to see it, or use a different name."
+                    )
                 else:
-                    config["player_presets"][stripped_name] = preset_players
-                    if st_module.session_state.config_manager.save_config(config):
-                        st_module.success(f"Saved preset: {stripped_name}")
+                    # Save a copy and adopt it only on success: a failed save used to
+                    # leave the preset in memory, blocking a retry ("already exists")
+                    # and letting the next unrelated save persist it anyway.
+                    save_presets_change = import_module_with_fallback("app_tabs").save_presets_change
+                    if save_presets_change(
+                        st_module, lambda presets: presets.__setitem__(stripped_name, preset_players)
+                    ):
+                        config = st_module.session_state.app_config
+                        st_module.success(f"Saved preset: {escape_markdown(stripped_name)}")
                     else:
-                        st_module.error(f"❌ Failed to save preset: {stripped_name}")
+                        st_module.error(f"❌ Failed to save preset: {escape_markdown(stripped_name)}")
 
     players = parse_players_text(players_text)
+
+    def render_schedule_without_settings() -> None:
+        # A roster this tab can't schedule skips everything built from it, but
+        # the current schedule keeps showing - it comes from session_state, not
+        # from this text box - and so do its downloads and replan (whose state
+        # would be lost while not drawn). Its replan gets the time chosen under
+        # 'Max generation time', which isn't drawn, else the suggested one.
+        max_time = remember_widget_choice(st_module.session_state, MAX_TIME_KEY)
+        if max_time is None:
+            max_time = suggest_max_generation_time(len(st_module.session_state.get("current_players") or []), 0)
+        _render_persistent_schedule(
+            st_module,
+            datetime_cls,
+            json_module,
+            scheduler_cls,
+            schedule_analytics_cls,
+            validate_schedule_integrity_fn,
+            display_enhanced_schedule_fn,
+            schedule_to_csv_fn,
+            config,
+            max_time,
+        )
+
+    if len(players) > MAX_PLAYERS:
+        st_module.error(f"❌ {too_many_players_message(len(players))} Remove some names to continue.")
+        render_schedule_without_settings()
+        return
 
     if players:
         st_module.markdown("**Quick Remove Players:**")
         cols = st_module.columns(min(len(players), 4))
+        occurrences: Counter[str] = Counter()
         for i, player in enumerate(players):
+            occurrences[player] += 1
             with cols[i % 4]:
-                if st_module.button(f"❌ {player}", key=f"remove_{i}"):
+                # Keyed by name, not position: a click that arrives with an edit
+                # to the box (or after it) must remove the player it showed, not
+                # whoever has moved into that spot - and none if they're gone.
+                remove_key = f"{QUICK_REMOVE_KEY_PREFIX}{occurrences[player]}::{player}"
+                if st_module.button(f"❌ {escape_markdown(player)}", key=remove_key):
                     updated_text = remove_player_from_text(players_text, player)
                     st_module.session_state.custom_players = updated_text
                     set_player_preset(st_module.session_state, "Custom")
@@ -787,12 +1408,14 @@ def render_main_scheduler_tab(
 
     if len(players) < 4:
         st_module.warning("⚠️ Need at least 4 players")
+        render_schedule_without_settings()
         return
 
     name_issues = find_player_name_issues(players)
     if name_issues:
         for issue in name_issues:
-            st_module.error(f"❌ {issue}")
+            st_module.error(f"❌ {escape_markdown(issue)}")
+        render_schedule_without_settings()
         return
 
     st_module.info(f"📊 {len(players)} players")
@@ -800,49 +1423,66 @@ def render_main_scheduler_tab(
     st_module.subheader("🚫 Player Constraints")
 
     col1, col2 = st_module.columns(2)
-    sync_constraint_widget_state(st_module.session_state, players, config)
+    # Every possible pair, built once per run and shared by everything below.
+    pair_options = build_constraint_pair_options(players, " & ")
+    oppose_options = build_constraint_pair_options(players, " vs ")
+    sync_constraint_widget_state(st_module.session_state, players, config, pair_options, oppose_options)
     do_not_pair_key, do_not_oppose_key = get_constraint_widget_keys(st_module.session_state)
     preserve_saved_constraints = bool(st_module.session_state.pop("_preserve_saved_constraints_from_config", False))
     default_do_not_pair = build_constraint_multiselect_defaults(
         config["constraints"]["do_not_pair"],
         players,
         " & ",
+        pair_options,
     )
     default_do_not_oppose = build_constraint_multiselect_defaults(
         config["constraints"]["do_not_oppose"],
         players,
         " vs ",
+        oppose_options,
     )
 
+    # The multiselects can only show pairs inside the current roster, so
+    # their selection is merged into the saved lists rather than replacing
+    # them - otherwise every constraint involving someone not on today's
+    # roster would be dropped here and then written to disk by the next save.
+    # Their selection is seeded by sync_constraint_widget_state, so they take
+    # no default= (see src/widget_state.py).
     with col1:
         st_module.markdown("**Who should NOT play together:**")
         do_not_pair = st_module.multiselect(
             "Select player pairs that should not be on the same team:",
-            options=[f"{p1} & {p2}" for i, p1 in enumerate(players) for p2 in players[i + 1 :]],
-            default=default_do_not_pair,
+            options=list(pair_options),
             key=do_not_pair_key,
         )
 
         if preserve_saved_constraints and not do_not_pair and default_do_not_pair:
             do_not_pair = default_do_not_pair
-        config["constraints"]["do_not_pair"] = [pair.split(" & ") for pair in do_not_pair]
+        config["constraints"]["do_not_pair"] = merge_roster_constraint_selection(
+            config["constraints"]["do_not_pair"], do_not_pair, pair_options, players
+        )
 
     with col2:
         st_module.markdown("**Who should NOT play against each other:**")
         do_not_oppose = st_module.multiselect(
             "Select player pairs that should not be opponents:",
-            options=[f"{p1} vs {p2}" for i, p1 in enumerate(players) for p2 in players[i + 1 :]],
-            default=default_do_not_oppose,
+            options=list(oppose_options),
             key=do_not_oppose_key,
         )
 
         if preserve_saved_constraints and not do_not_oppose and default_do_not_oppose:
             do_not_oppose = default_do_not_oppose
-        config["constraints"]["do_not_oppose"] = [pair.split(" vs ") for pair in do_not_oppose]
+        config["constraints"]["do_not_oppose"] = merge_roster_constraint_selection(
+            config["constraints"]["do_not_oppose"], do_not_oppose, oppose_options, players
+        )
 
-    total_constraints = len(config["constraints"]["do_not_pair"]) + len(config["constraints"]["do_not_oppose"])
+    active_pair_constraints = constraint_pairs_for_roster(config["constraints"]["do_not_pair"], players)
+    active_oppose_constraints = constraint_pairs_for_roster(config["constraints"]["do_not_oppose"], players)
+    total_constraints = len(active_pair_constraints) + len(active_oppose_constraints)
     if total_constraints > 0:
         st_module.info(f"🎯 Active constraints: {total_constraints} total")
+    for issue in find_constraint_name_issues(config, players):
+        st_module.warning(f"⚠️ {escape_markdown(issue)}")
 
     with st_module.expander("🔎 Find a specific pair instead of scrolling"):
         quick_col1, quick_col2, quick_col3, quick_col4 = st_module.columns([2, 2, 2, 1])
@@ -872,54 +1512,62 @@ def render_main_scheduler_tab(
                 )
                 added, message = add_quick_constraint(config, quick_player_a, quick_player_b, constraint_key)
                 if added:
-                    if not st_module.session_state.config_manager.save_config(config):
-                        st_module.error("❌ Failed to save constraint.")
+                    if st_module.session_state.config_manager.save_config(config):
+                        st_module.session_state.global_status_message = f"✅ {escape_markdown(message)}"
+                    else:
+                        # Kept for this session, like the pairs ticked above, which Generate saves.
+                        queue_status_notice(
+                            st_module.session_state,
+                            "error",
+                            f"❌ {escape_markdown(message)}, but the configuration couldn't be saved, so the "
+                            "constraint applies to this session only until a later save works (Generate saves it "
+                            "too).",
+                        )
                     st_module.session_state.app_config = config
                     st_module.session_state._constraint_widget_version = (
                         int(st_module.session_state.get("_constraint_widget_version", 0)) + 1
                     )
                     st_module.session_state._sync_main_constraints_from_config = True
                     st_module.session_state._preserve_saved_constraints_from_config = True
-                    st_module.session_state.global_status_message = f"✅ {message}"
                     st_module.rerun()
                 else:
-                    st_module.warning(message)
+                    st_module.warning(escape_markdown(message))
 
     st_module.subheader("⚙️ Schedule Settings")
     col1, col2, col3 = st_module.columns(3)
 
     with col1:
-        num_rounds = st_module.number_input(
-            "Number of rounds:",
-            min_value=1,
-            max_value=20,
-            value=config["scheduling"]["default_rounds"],
-        )
+        # Keyed so History > Load can set it to the loaded schedule's round
+        # count; re-seeded when the configured default changes.
+        seed_widget_from_source(st_module.session_state, NUM_ROUNDS_KEY, config["scheduling"]["default_rounds"])
+        num_rounds = st_module.number_input("Number of rounds:", min_value=1, max_value=20, key=NUM_ROUNDS_KEY)
 
+    # Courts and time follow their suggested values (all the courts this
+    # roster fills, a time for its size and constraints) until the user picks
+    # their own, which is then kept as the roster changes: these widgets used
+    # to start over at the suggestion, and Generate used it, on every change
+    # to the roster or constraints, and after Quick Add or Quick Remove.
     with col2:
         max_courts = max(1, len(players) // 4)
-        courts = st_module.number_input(
-            "Courts available:",
-            min_value=1,
-            max_value=max_courts,
-            value=max_courts,
-        )
+        seed_widget_choice(st_module.session_state, COURTS_KEY, max_courts, 1, max_courts)
+        courts = st_module.number_input("Courts available:", min_value=1, max_value=max_courts, key=COURTS_KEY)
 
     with col3:
         suggested_max_time = suggest_max_generation_time(len(players), total_constraints)
+        seed_widget_choice(st_module.session_state, MAX_TIME_KEY, suggested_max_time, 10, 300)
         max_time = st_module.number_input(
             "Max generation time (seconds):",
             min_value=10,
             max_value=300,
-            value=suggested_max_time,
+            key=MAX_TIME_KEY,
             help=(
-                f"Suggested for {len(players)} players and {total_constraints} constraint(s) - "
-                "harder setups (more players, more do-not-pair/oppose constraints) suggest more "
+                f"{suggested_max_time} seconds is suggested for {len(players)} players and {total_constraints} "
+                "constraint(s) - harder setups (more players, more do-not-pair/oppose constraints) suggest more "
                 "time. Adjust as needed."
             ),
         )
 
-    feasibility_notes = build_feasibility_notes(len(players), courts, num_rounds)
+    feasibility_notes = build_feasibility_notes(len(players), courts, num_rounds, total_constraints)
     # build_feasibility_notes exists specifically so a user isn't surprised
     # after waiting up to the full max-time budget for a result that was
     # never going to reach range 0 - defeats the purpose if the one note
@@ -932,16 +1580,28 @@ def render_main_scheduler_tab(
 
     for warning_text in constraint_pressure_warnings(
         players,
-        config["constraints"]["do_not_pair"],
-        config["constraints"]["do_not_oppose"],
+        active_pair_constraints,
+        active_oppose_constraints,
     ):
-        st_module.warning(f"⚠️ {warning_text}")
+        st_module.warning(f"⚠️ {escape_markdown(warning_text)}")
 
     with st_module.expander("🎲 Advanced: reproducible generation"):
         seed_text = st_module.text_input(
             "Random seed (optional):",
             key="generation_seed",
-            help="Reuse the seed shown under a generated schedule to replay that generation run.",
+            help=(
+                "Reuse the seed shown under a generated schedule. With its generation count too, that run "
+                "is replayed exactly. A seed alone sets where the search starts, but the search stops on "
+                "Max generation time, so on a busier computer it can end with a different schedule."
+            ),
+        )
+        generations_text = st_module.text_input(
+            "Generations (optional):",
+            key="generation_count",
+            help=(
+                "The generation count shown with the seed. The run then does exactly that many "
+                "generations, however long they take, instead of stopping on Max generation time."
+            ),
         )
     generation_seed = None
     seed_text = (seed_text or "").strip()
@@ -950,6 +1610,28 @@ def render_main_scheduler_tab(
             generation_seed = int(seed_text)
         except ValueError:
             st_module.warning("Seed must be a whole number - ignoring it for this run.")
+    replay_generations = None
+    generations_text = (generations_text or "").strip()
+    if generations_text:
+        # Parsed like the seed: str.isdigit() also accepts characters such as
+        # "²" that int() rejects.
+        try:
+            parsed_generations = int(generations_text)
+        except ValueError:
+            parsed_generations = 0
+        if parsed_generations < 1:
+            st_module.warning("Generations must be a whole number of at least 1 - ignoring it for this run.")
+        elif generation_seed is None:
+            st_module.warning("Generations only replay a run together with its seed - ignoring them for this run.")
+        else:
+            replay_generations = parsed_generations
+            # Both inputs keep their values, so say so wherever Generate is:
+            # a leftover count would otherwise silently replace the time limit.
+            st_module.info(
+                f"🎲 Generate will replay seed {generation_seed} for exactly {replay_generations} generations, "
+                "however long they take - Max generation time doesn't apply. Clear Generations under "
+                "'🎲 Advanced: reproducible generation' to search normally."
+            )
 
     if st_module.session_state.get("current_schedule"):
         st_module.caption(
@@ -958,19 +1640,32 @@ def render_main_scheduler_tab(
             "want to adjust the remaining rounds."
         )
 
-    if st_module.button("🎯 Generate Schedule", type="primary"):
-        _handle_generate_schedule_click(
+    generate_clicked = st_module.button("🎯 Generate Schedule", type="primary")
+    # On every run, so the schedule below never shifts: a running Generate
+    # draws here, and so does its outcome on the rerun that follows it.
+    generation_slot = st_module.empty()
+    if generate_clicked:
+        _start_after_the_tabs(
             st_module,
-            config,
-            players,
-            num_rounds,
-            courts,
-            max_time,
-            generation_seed,
-            scheduler_cls,
-            schedule_analytics_cls,
-            validate_schedule_integrity_fn,
+            generation_slot,
+            lambda: _handle_generate_schedule_click(
+                st_module,
+                config,
+                players,
+                num_rounds,
+                courts,
+                max_time,
+                generation_seed,
+                scheduler_cls,
+                schedule_analytics_cls,
+                validate_schedule_integrity_fn,
+                replay_generations,
+            ),
         )
+    else:
+        generation_outcome = st_module.session_state.pop(GENERATION_OUTCOME_KEY, None)
+        if isinstance(generation_outcome, list):
+            _render_generation_outcome(st_module, generation_slot, generation_outcome)
 
     _render_persistent_schedule(
         st_module,
@@ -982,6 +1677,7 @@ def render_main_scheduler_tab(
         display_enhanced_schedule_fn,
         schedule_to_csv_fn,
         config,
+        max_time,
     )
 
 
@@ -995,6 +1691,7 @@ def _render_persistent_schedule(
     display_enhanced_schedule_fn,
     schedule_to_csv_fn,
     config,
+    max_time,
 ):
     """Re-render the last generated schedule from session_state on every run.
 
@@ -1009,14 +1706,28 @@ def _render_persistent_schedule(
     players = st_module.session_state.get("current_players", [])
     metrics = st_module.session_state.get("current_metrics", {})
     seed = st_module.session_state.get("current_seed")
+    generations = st_module.session_state.get("current_generations")
     round_times = st_module.session_state.get("current_round_times") or None
     roster_by_round = st_module.session_state.get("current_roster_by_round")
 
-    if seed is not None:
+    if seed is not None and generations == 0:
+        # The instant constructive design: no search, so the seed alone replays it.
         st_module.caption(
-            f"🎲 Seed: {seed} - enter it under '🎲 Advanced: reproducible " "generation' to replay this generation run."
+            f"🎲 Seed: {seed} - with the same players and settings, enter it under '🎲 Advanced: reproducible "
+            "generation' to get this exact schedule again."
+        )
+    elif seed is not None and generations is not None:
+        st_module.caption(
+            f"🎲 Seed: {seed} · Generations: {generations} - with the same players and settings, enter both "
+            "under '🎲 Advanced: reproducible generation' to get this exact schedule again."
+        )
+    elif seed is not None:
+        st_module.caption(
+            f"🎲 Seed: {seed} - the search stops on a time limit, so the same seed can end with a different "
+            "schedule, especially on a busier computer."
         )
 
+    _render_unsaved_schedule_notice(st_module)
     _render_metric_summary(st_module, metrics, players)
     _render_optimality_status(st_module, metrics, players)
 
@@ -1038,18 +1749,88 @@ def _render_persistent_schedule(
             roster_by_round,
         )
 
-    _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players, config)
+    _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players, config, max_time)
 
 
-def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players, config):
+def _render_unsaved_schedule_notice(st_module):
+    """Offer to retry a failed history save of the schedule on screen - until it
+    is saved, its scores can't be entered and it can't be loaded again."""
+    unsaved = unsaved_schedule(st_module.session_state)
+    if unsaved is None:
+        return
+    st_module.warning(
+        "⚠️ This schedule isn't saved to history yet, so its scores can't be entered and it can't be "
+        "loaded again later."
+    )
+    if st_module.button("💾 Retry saving to history"):
+        if save_schedule_to_history(st_module.session_state, **unsaved) is None:
+            st_module.error(
+                "❌ Still couldn't save this schedule to history. If this keeps happening, the history "
+                "database may be damaged or read-only - see the server logs."
+            )
+        else:
+            st_module.session_state.global_status_message = "✅ Schedule saved to history."
+            st_module.rerun()
+
+
+def _scored_rounds_message(scored_rounds) -> str:
+    return (
+        f"❌ Round(s) {', '.join(map(str, scored_rounds))} already have recorded scores, so they can't be "
+        f"replanned. Set 'Rounds already played' to at least {max(scored_rounds)}, or clear those scores "
+        "on the Leaderboard tab first."
+    )
+
+
+def _replan_not_saved_message(result) -> str:
+    """Explain why update_schedule_after_replan refused or failed (see ReplanSaveResult)."""
+    if result.status == "scored":
+        return _scored_rounds_message(result.scored_rounds)
+    if result.status == "missing":
+        return (
+            "❌ This schedule was deleted from History, so a replan of it can't be saved. Restore it "
+            "from History > Recently deleted, or generate a new schedule."
+        )
+    if result.status == "changed":
+        return (
+            "❌ This schedule was changed in another session since you opened it, so nothing was "
+            "replanned. Load it again from History and replan from there."
+        )
+    return "❌ Could not save the replanned rounds to history, so the schedule was left unchanged. Please try again."
+
+
+def find_replan_name_issues(remaining_players: list[str], locked_roster_by_round: Sequence[Sequence[str]]) -> list[str]:
+    """find_player_name_issues for a replan's roster, which also flags a
+    newcomer whose name differs from a player of the rounds kept only in case
+    or spacing: one person would otherwise be two players of the schedule, in
+    its history and standings.
+
+    Variants already among the rounds kept (saved before this check existed)
+    aren't flagged again, so they can't block every later replan.
+    """
+    issues = find_player_name_issues(remaining_players)
+    if issues:
+        return issues
+    locked_players = sorted({player for roster in locked_roster_by_round for player in roster})
+    known_issues = set(find_player_name_issues(locked_players))
+    return [
+        f"{issue} - counting the players of the rounds already played. Use the same spelling for the same player."
+        for issue in find_player_name_issues(sorted(set(locked_players) | set(remaining_players)))
+        if issue not in known_issues
+    ]
+
+
+def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players, config, max_time):
     """Let the user regenerate only the not-yet-played rounds, optionally with a
-    changed player list (someone left early / showed up late) - without losing
-    the rounds already played.
+    changed player list (someone left early / showed up late) or court count -
+    without losing the rounds already played.
 
     The replanned rounds are optimized for fairness among themselves only; they
     do not account for who already played together in the locked rounds, since
     that would require the scheduler's fitness function to accept pre-existing
     partner/opponent/game counts, which it does not currently support.
+
+    A replan runs for up to max_time, the "Max generation time" the user set
+    under Schedule Settings.
     """
     total_rounds = len(schedule_data)
     if total_rounds < 2:
@@ -1060,31 +1841,54 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
             "Regenerate the rounds that haven't been played yet - useful if a player "
             "leaves early or joins late. Rounds already played are never changed. The "
             "replanned rounds are freshly fair among themselves, not aware of who "
-            "already played together in the rounds you keep."
+            "already played together in the rounds you keep. A replan takes up to the "
+            "'Max generation time' set under Schedule Settings above."
         )
 
-        # Re-seed whenever the current schedule's players change (new
-        # generation, history load, completed replan), preserving in-progress
-        # edits otherwise. "Rounds already played" is specific to whichever
-        # schedule is on screen, so it must reset too - otherwise a stale
-        # count from a previous schedule/replan can silently lock rounds of
-        # a brand-new, entirely unplayed schedule out of re-optimization.
-        roster_text = "\n".join(players)
-        roster_changed = seed_widget_from_source(st_module.session_state, "replan_players_input", roster_text)
-        if roster_changed:
-            st_module.session_state["replan_played_rounds"] = 0
+        # Each round's roster, once a replan has changed it. Who is playing
+        # now is then its last round's roster: `players` is everyone the
+        # schedule has had, including anyone who left.
+        tracked_rosters = st_module.session_state.get("current_roster_by_round")
+        if not tracked_rosters or len(tracked_rosters) != total_rounds:
+            tracked_rosters = None
+        roster_text = "\n".join(tracked_rosters[-1] if tracked_rosters else players)
+        current_courts = max(1, len(schedule_data[-1].get("games", [])))
+        # Set the inputs up for each new schedule on screen (Generate, History
+        # load), keeping in-progress edits otherwise. Keyed on the schedule
+        # itself, not its roster: a new schedule of the same players must not
+        # inherit a "Rounds already played" count that would lock rounds
+        # nobody has played. A replan sets them for the schedule it makes
+        # (see _run_replan).
+        if st_module.session_state.get(REPLAN_INPUTS_SCHEDULE_KEY) is not schedule_data:
+            st_module.session_state[REPLAN_INPUTS_SCHEDULE_KEY] = schedule_data
+            for key in ("replan_played_rounds", "replan_players_input", "replan_courts"):
+                forget_widget_state(st_module.session_state, key)
+        # Seeded, not assigned: an st.rerun() before they render (Quick Add,
+        # say) drops their state, and this puts back what they showed.
+        seed_widget_from_source(st_module.session_state, "replan_played_rounds", 0)
+        seed_widget_from_source(st_module.session_state, "replan_players_input", roster_text)
+        seed_widget_from_source(st_module.session_state, "replan_courts", current_courts)
 
+        # Set through session_state above, so none takes value= (see src/widget_state.py).
         played_rounds = st_module.number_input(
             "Rounds already played:",
             min_value=0,
             max_value=total_rounds - 1,
-            value=0,
             key="replan_played_rounds",
         )
         remaining_players_text = st_module.text_area(
             "Players for the remaining rounds (edit to reflect who's still here):",
-            value=roster_text,
             key="replan_players_input",
+        )
+        requested_courts = st_module.number_input(
+            "Courts for remaining rounds:",
+            min_value=1,
+            max_value=MAX_PLAYERS // 4,
+            key="replan_courts",
+            help=(
+                "The courts this schedule uses now. Raise it if late arrivals let you open another court - "
+                "each court needs 4 players."
+            ),
         )
 
         if st_module.button("🔁 Replan remaining rounds"):
@@ -1092,112 +1896,193 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
             if len(remaining_players) < 4:
                 st_module.warning("⚠️ Need at least 4 players for the remaining rounds.")
                 return
-
-            locked_rounds, remaining_round_count = split_schedule_at_round(schedule_data, played_rounds)
-            # schedule_data[0] is the original schedule's first round, which is
-            # always present regardless of played_rounds - unlike locked_rounds[0],
-            # which is empty exactly when played_rounds == 0 and would otherwise
-            # silently fall back to courts=1.
-            courts = len(schedule_data[0].get("games", []))
-            # The remaining roster may be too small for the original court
-            # count (players left without replacements) - reduce courts to
-            # fit rather than letting the scheduler constructor raise, which
-            # would otherwise surface as an opaque "failed unexpectedly".
-            max_courts_for_remaining = len(remaining_players) // 4
-            if max_courts_for_remaining < courts:
-                st_module.warning(
-                    f"⚠️ Only {len(remaining_players)} players remain, which supports "
-                    f"{max_courts_for_remaining} court(s) instead of the original {courts} - "
-                    "using the reduced court count for the remaining rounds."
-                )
-                courts = max_courts_for_remaining
-
-            constraints = config["constraints"]
-            pair_constraints = [tuple(pair) if isinstance(pair, list) else pair for pair in constraints["do_not_pair"]]
-            oppose_constraints = [
-                tuple(pair) if isinstance(pair, list) else pair for pair in constraints["do_not_oppose"]
-            ]
-            total_constraints = len(pair_constraints) + len(oppose_constraints)
-            max_time = suggest_max_generation_time(len(remaining_players), total_constraints)
-
-            with st_module.status("Replanning remaining rounds...", expanded=True) as status_box:
-                progress_bar = st_module.progress(0)
-                progress_text = st_module.empty()
-
-                def _on_progress(progress_data, _bar=progress_bar, _text=progress_text, _max_time=max_time):
-                    try:
-                        elapsed = float(progress_data.get("elapsed_time", 0.0))
-                        budget = float(progress_data.get("max_time") or _max_time or 1.0)
-                        fraction = max(0.0, min(1.0, elapsed / budget)) if budget else 0.0
-                        _bar.progress(fraction)
-                        generation = progress_data.get("generation", 0)
-                        total_range = progress_data.get("total_range", "?")
-                        _text.text(f"Generation {generation} - best range {total_range} - {elapsed:.0f}s elapsed")
-                    except Exception:
-                        logger.debug("Progress callback failed", exc_info=True)
-
-                try:
-                    scheduler = scheduler_cls(
-                        players=remaining_players,
-                        num_courts=courts,
-                        num_rounds=remaining_round_count,
-                        use_desktop_params=True,
-                        max_runtime=max_time,
-                        max_generations=max(2000, int(max_time * 70)),
-                    )
-                    if pair_constraints or oppose_constraints:
-                        scheduler.add_constraints(
-                            pair_constraints=pair_constraints,
-                            oppose_constraints=oppose_constraints,
-                        )
-                    result = scheduler.generate_schedule(max_time=max_time, progress_callback=_on_progress)
-                except Exception:
-                    logger.exception("Mid-session replan failed")
-                    st_module.error("❌ Replan failed unexpectedly. See the server logs for details.")
-                    status_box.update(label="❌ Replan failed", state="error")
-                    return
-
-                if not (isinstance(result, dict) and "schedule" in result):
-                    st_module.error("❌ Could not replan the remaining rounds. Try adjusting the player list.")
-                    status_box.update(label="❌ Replan failed", state="error")
-                    return
-
-                status_box.update(label="✅ Replan complete", state="complete")
-
-            replan_constraint_violations = result.get("constraint_violations", 0)
-            if replan_constraint_violations:
-                st_module.warning(
-                    f"⚠️ {replan_constraint_violations} game(s) in the replanned rounds violate a "
-                    "requested 'do not pair' or 'do not oppose' constraint - your constraints may "
-                    "not be fully satisfiable with the remaining players/courts/rounds."
-                )
+            if len(remaining_players) > MAX_PLAYERS:
+                st_module.warning(f"⚠️ {too_many_players_message(len(remaining_players))}")
+                return
 
             # Track which roster was actually in effect for each round, so
             # "sitting out" can be computed per-round instead of against the
-            # union below - which would otherwise show departed players as
-            # still sitting out in every future round, and incoming players
+            # union of everyone - which would otherwise show departed players
+            # as still sitting out in every future round, and incoming players
             # as already sitting out in rounds before they joined. Reuse the
             # previous replan's per-round tracking for the still-locked
             # portion (a second replan must not flatten it back to `players`,
             # which is only correct for a schedule that's never been
             # replanned before).
-            previous_roster_by_round = st_module.session_state.get("current_roster_by_round")
-            if previous_roster_by_round and len(previous_roster_by_round) == total_rounds:
-                locked_roster_by_round = previous_roster_by_round[:played_rounds]
+            if tracked_rosters:
+                locked_roster_by_round = tracked_rosters[:played_rounds]
             else:
                 locked_roster_by_round = [players] * played_rounds
-            st_module.session_state.current_roster_by_round = (
-                locked_roster_by_round + [remaining_players] * remaining_round_count
-            )
+            # A name given twice would put one person on court twice.
+            name_issues = find_replan_name_issues(remaining_players, locked_roster_by_round)
+            if name_issues:
+                for issue in name_issues:
+                    st_module.error(f"❌ {escape_markdown(issue)}")
+                return
 
-            st_module.session_state.current_schedule = splice_schedules(locked_rounds, result["schedule"])
-            st_module.session_state.current_players = sorted(set(players) | set(remaining_players))
-            # The metrics and seed shown belong to the pre-replan schedule;
-            # after splicing they no longer describe what's on screen.
-            st_module.session_state.current_metrics = {}
-            st_module.session_state.current_seed = result.get("seed")
-            st_module.session_state.global_status_message = f"✅ Replanned rounds {played_rounds + 1}-{total_rounds}."
-            st_module.rerun()
+            # Rounds being replaced must not hold recorded results: their games
+            # are about to change, and the scores would otherwise be credited to
+            # the wrong teams (or silently dropped).
+            schedule_id = st_module.session_state.get("current_schedule_id")
+            history_manager = st_module.session_state.get("history_manager")
+            # (Checked again, atomically, when the replan is saved - this early
+            # check just avoids running the scheduler for a replan that can't be.)
+            if schedule_id is not None and history_manager is not None:
+                scored_rounds = history_manager.rounds_with_results(schedule_id, played_rounds + 1)
+                if scored_rounds is None:
+                    st_module.error("❌ Could not check this schedule's recorded scores, so nothing was replanned.")
+                    return
+                if scored_rounds:
+                    st_module.error(_scored_rounds_message(scored_rounds))
+                    return
+
+            locked_rounds, remaining_round_count = split_schedule_at_round(schedule_data, played_rounds)
+            courts = requested_courts
+            # Shown again above the tabs once the replan reruns the page.
+            replan_warnings: list[str] = []
+            # The remaining roster may be too small for the courts asked for
+            # (players left without replacements) - reduce courts to fit
+            # rather than letting the scheduler constructor raise, which
+            # would otherwise surface as an opaque "failed unexpectedly".
+            max_courts_for_remaining = len(remaining_players) // 4
+            if max_courts_for_remaining < courts:
+                replan_warnings.append(
+                    f"⚠️ Only {len(remaining_players)} players remain, which supports "
+                    f"{max_courts_for_remaining} court(s) instead of {courts} - "
+                    "using the reduced court count for the remaining rounds."
+                )
+                st_module.warning(replan_warnings[-1])
+                courts = max_courts_for_remaining
+
+            constraints = config["constraints"]
+            pair_constraints = [
+                tuple(pair) for pair in constraint_pairs_for_roster(constraints["do_not_pair"], remaining_players)
+            ]
+            oppose_constraints = [
+                tuple(pair) for pair in constraint_pairs_for_roster(constraints["do_not_oppose"], remaining_players)
+            ]
+
+            # The replan starts once every tab is drawn, and draws here.
+            replan_slot = st_module.empty()
+
+            def _run_replan():
+                run_marker = _start_scheduler_run(st_module.session_state, "replan")
+                with st_module.status("Replanning remaining rounds...", expanded=True) as status_box:
+                    cancel_caption = st_module.empty()
+                    cancel_caption.caption(_RUN_CANCEL_CAPTION)
+                    progress_bar = st_module.progress(0)
+                    progress_text = st_module.empty()
+
+                    def _on_progress(progress_data, _bar=progress_bar, _text=progress_text, _max_time=max_time):
+                        try:
+                            elapsed = float(progress_data.get("elapsed_time", 0.0))
+                            budget = float(progress_data.get("max_time") or _max_time or 1.0)
+                            fraction = max(0.0, min(1.0, elapsed / budget)) if budget else 0.0
+                            _bar.progress(fraction)
+                            generation = progress_data.get("generation", 0)
+                            total_range = progress_data.get("total_range", "?")
+                            _text.text(f"Generation {generation} - best range {total_range} - {elapsed:.0f}s elapsed")
+                        except Exception:
+                            logger.debug("Progress callback failed", exc_info=True)
+
+                    try:
+                        scheduler = scheduler_cls(
+                            players=remaining_players,
+                            num_courts=courts,
+                            num_rounds=remaining_round_count,
+                            use_desktop_params=True,
+                            max_runtime=max_time,
+                        )
+                        if pair_constraints or oppose_constraints:
+                            scheduler.add_constraints(
+                                pair_constraints=pair_constraints,
+                                oppose_constraints=oppose_constraints,
+                            )
+                        with counted_generation(st_module):
+                            result = scheduler.generate_schedule(max_time=max_time, progress_callback=_on_progress)
+                    except Exception:
+                        logger.exception("Mid-session replan failed")
+                        st_module.error("❌ Replan failed unexpectedly. See the server logs for details.")
+                        status_box.update(label="❌ Replan failed", state="error", expanded=True)
+                        _end_scheduler_run(st_module.session_state, run_marker)
+                        return
+                    finally:
+                        cancel_caption.empty()
+
+                    if not (isinstance(result, dict) and "schedule" in result):
+                        st_module.error("❌ Could not replan the remaining rounds. Try adjusting the player list.")
+                        status_box.update(label="❌ Replan failed", state="error", expanded=True)
+                        _end_scheduler_run(st_module.session_state, run_marker)
+                        return
+
+                    status_box.update(label="✅ Replan complete", state="complete")
+
+                replan_constraint_violations = result.get("constraint_violations", 0)
+                if replan_constraint_violations:
+                    replan_warnings.append(
+                        f"⚠️ {replan_constraint_violations} game(s) in the replanned rounds violate a "
+                        "requested 'do not pair' or 'do not oppose' constraint - your constraints may "
+                        "not be fully satisfiable with the remaining players/courts/rounds."
+                    )
+                    st_module.warning(replan_warnings[-1])
+
+                roster_by_round = locked_roster_by_round + [remaining_players] * remaining_round_count
+                replanned_schedule = splice_schedules(locked_rounds, result["schedule"])
+                # Everyone on a round's roster, not everyone the session ever
+                # had: a name left out of every round kept (a typo corrected by
+                # replanning from the same round again) is no longer a player.
+                all_players = sorted({player for roster in roster_by_round for player in roster})
+
+                # Save to history before showing it: a replan that lives only in
+                # this session is lost on reload, and scores entered against it
+                # would end up credited to the original teams.
+                if schedule_id is not None and history_manager is not None:
+                    saved = history_manager.update_schedule_after_replan(
+                        schedule_id, schedule_data, replanned_schedule, all_players, played_rounds + 1, roster_by_round
+                    )
+                    if not saved.saved:
+                        st_module.error(_replan_not_saved_message(saved))
+                        _end_scheduler_run(st_module.session_state, run_marker)
+                        return
+
+                unsaved = unsaved_schedule(st_module.session_state)  # read before current_schedule changes below
+                st_module.session_state.current_roster_by_round = roster_by_round
+                st_module.session_state.current_schedule = replanned_schedule
+                st_module.session_state.current_players = all_players
+                # The metrics and seed shown belong to the pre-replan schedule;
+                # after splicing they no longer describe what's on screen. (The
+                # replan's own seed can't replay it either: the generator would
+                # schedule every round for the whole roster with it.)
+                st_module.session_state.current_metrics = {}
+                st_module.session_state.current_seed = None
+                st_module.session_state.current_generations = None
+                if unsaved is not None:
+                    # The schedule never made it into history: save the replanned
+                    # one now, or keep it as what a retry will save.
+                    settings = dict(
+                        unsaved["settings"],
+                        roster_by_round=[list(roster) for roster in roster_by_round],
+                        replanned_from_round=played_rounds + 1,
+                    )
+                    save_schedule_to_history(
+                        st_module.session_state, replanned_schedule, all_players, settings, unsaved["algorithm"]
+                    )
+                # Keep the inputs as entered for the replanned schedule, so the
+                # rounds this replan kept still count as played. The roster box
+                # shows the names as scheduled (blank lines and outer spaces
+                # dropped), and the courts the ones actually used (capped above).
+                st_module.session_state[REPLAN_INPUTS_SCHEDULE_KEY] = replanned_schedule
+                defer_widget_value(st_module.session_state, "replan_players_input", "\n".join(remaining_players))
+                defer_widget_value(st_module.session_state, "replan_courts", courts)
+                st_module.session_state.global_status_message = (
+                    f"✅ Replanned rounds {played_rounds + 1}-{total_rounds}."
+                )
+                for warning in replan_warnings:
+                    queue_status_notice(st_module.session_state, "warning", warning)
+                _end_scheduler_run(st_module.session_state, run_marker)
+                st_module.rerun()
+
+            _start_after_the_tabs(st_module, replan_slot, _run_replan)
 
 
 def _render_metric_summary(st_module, metrics, players):
@@ -1213,7 +2098,7 @@ def _render_metric_summary(st_module, metrics, players):
         fairness_label = "Fairness Score"
         if is_optimal is True:
             fairness_label += " ✅"
-        elif is_optimal is False and metrics.get("theoretical_optimum") is not None:
+        elif is_optimal is False and metrics.get("total_range_floor") is not None:
             fairness_label += " ⚠️"
         st_module.metric(fairness_label, f"{fairness_score:.1f}/10")
     with col2:
@@ -1226,28 +2111,73 @@ def _render_metric_summary(st_module, metrics, players):
         st_module.metric("Courts Range", metrics.get("courts_range", 0))
 
 
+def _partner_repeat_note(metrics, players) -> str:
+    """A factual aside for the "balanced" banners when some pair partners more
+    often than an even spread would need: the ranges count each player's
+    different partners, so a pair teaming up again and again doesn't show in
+    them. A player's games are spread over len(players) - 1 possible
+    partners, so the player with the most games must partner someone at
+    least ceil(most games / (len(players) - 1)) times; with nobody sitting
+    out that is ceil(rounds / (len(players) - 1))."""
+    most_partnered = metrics.get("most_partnered")
+    rounds = metrics.get("total_rounds")
+    if not most_partnered or not rounds or len(players) < 2:
+        return ""
+    games_played = [stats.get("games_played", 0) for stats in (metrics.get("player_stats") or {}).values()]
+    most_games = max(games_played, default=rounds)
+    if most_partnered <= math.ceil(most_games / (len(players) - 1)):
+        return ""
+    return (
+        " The balance counts different partners, not repeats: some pairs are partners "
+        f"{most_partnered} times in {rounds} rounds."
+    )
+
+
 def _render_optimality_status(st_module, metrics, players):
-    """Render optimality messaging for the generated schedule."""
-    if metrics.get("theoretical_optimum") is None:
+    """Say how balanced the schedule is - claiming "optimal" only when it's proven.
+
+    games_range_floor and total_range_floor are proven lower bounds (see
+    calculate_fairness_metrics), so a schedule at total_range_floor is
+    optimal. Above it, nothing says how much lower is actually possible.
+    """
+    games_floor = metrics.get("games_range_floor")
+    if games_floor is None:
         return
 
     total_range = metrics.get("total_range", 0)
-    theoretical_optimum = metrics.get("theoretical_optimum")
-    is_optimal = metrics.get("is_mathematically_optimal", False)
+    games_range = metrics.get("games_range", 0)
+    floor = metrics.get("total_range_floor")
+    if floor is None:
+        floor = games_floor
 
-    if is_optimal:
-        st_module.success(
-            "✅ **Mathematically Optimal!** Achieved the theoretical minimum "
-            f"range of {theoretical_optimum} for {len(players)} players."
-        )
+    if total_range <= floor:
+        if floor == 0:
+            message = (
+                "✅ **Perfectly balanced:** every player has the same number of games, partners, "
+                "opponents and courts."
+            )
+        elif floor == games_floor:
+            message = (
+                f"✅ **As balanced as possible:** the games can't divide evenly among {len(players)} "
+                "players, so some play one more; partners, opponents and courts are even."
+            )
+        else:
+            message = (
+                f"✅ **As balanced as possible:** there are fewer places in the games than the {len(players)} "
+                "players, so some can't play at all - no schedule can be more even than this."
+            )
+        st_module.success(message + _partner_repeat_note(metrics, players))
         return
 
-    excess = total_range - theoretical_optimum
-    st_module.info(
-        "⚠️ **Near Optimal:** "
-        f"Current range {total_range}, theoretical minimum {theoretical_optimum} "
-        f"(excess: +{excess}). This is good performance!"
-    )
+    if games_range > games_floor:
+        evenly = "an even split is possible" if games_floor == 0 else "the smallest possible difference is 1"
+        st_module.warning(f"⚠️ **Uneven games:** some players play {games_range} more game(s) than others; {evenly}.")
+
+    if floor == 0:
+        bound = "Nothing rules out a perfectly fair schedule here, though one may not exist"
+    else:
+        bound = f"No schedule for this configuration can go below {floor}, though that may not be reachable"
+    st_module.info(f"Total range {total_range}. {bound} - generating again, or allowing more time, may improve it.")
 
 
 def _render_download_buttons(
@@ -1294,7 +2224,17 @@ def _render_download_buttons(
             "text/plain",
         )
     with col4:
-        xlsx_data = schedule_to_xlsx(schedule_data, players, round_times, roster_by_round=roster_by_round)
+        # The results recorded so far for this schedule go in as a Scores sheet.
+        schedule_id = st_module.session_state.get("current_schedule_id")
+        history_manager = st_module.session_state.get("history_manager")
+        scores = (
+            history_manager.get_game_scores(schedule_id)
+            if schedule_id is not None and history_manager is not None
+            else None
+        )
+        xlsx_data = schedule_to_xlsx(
+            schedule_data, players, round_times, scores=scores, roster_by_round=roster_by_round
+        )
         st_module.download_button(
             "📊 Download Excel",
             xlsx_data,

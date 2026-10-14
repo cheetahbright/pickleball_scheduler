@@ -233,9 +233,15 @@ data/default_player_names.backup.json
 
 # Mutable local app state under data/
 /data/app_config.json
-/data/schedule_history.db
+/data/app_config.json.unreadable-*
+# The database plus SQLite's -wal/-shm/-journal sidecars, which hold player data too.
+/data/schedule_history.db*
+# save_json's atomic-write temp files, left behind if the app is killed mid-write.
+/data/.*.tmp
 /data/player_skills.json
+/data/player_skills.json.unreadable-*
 /data/player_elo.json
+/data/full_backup_before_restore_*.zip
 
 # Local app history/stats artifacts
 /pickleball_history.json

@@ -32,12 +32,13 @@ try:
         migrate_config,
         normalize_config_constraints,
         normalize_constraint_pairs,
+        parse_constraint_text,
         serialize_constraint_pairs,
         validate_config_shape,
     )
     from src.managers.elo_rating import EloRatingManager
     from src.managers.history import HistoryManager
-    from src.managers.player import PlayerManager, validate_player_names
+    from src.managers.player import PlayerManager
     from src.managers.skill_rating import SkillRatingManager
 except ImportError:
     from managers.config import (
@@ -51,12 +52,13 @@ except ImportError:
         migrate_config,
         normalize_config_constraints,
         normalize_constraint_pairs,
+        parse_constraint_text,
         serialize_constraint_pairs,
         validate_config_shape,
     )
     from managers.elo_rating import EloRatingManager
     from managers.history import HistoryManager
-    from managers.player import PlayerManager, validate_player_names
+    from managers.player import PlayerManager
     from managers.skill_rating import SkillRatingManager
 
 __all__ = [
@@ -76,8 +78,8 @@ __all__ = [
     "normalize_config_constraints",
     "normalize_constraint_pairs",
     "os",
+    "parse_constraint_text",
     "serialize_constraint_pairs",
     "sqlite3",
     "validate_config_shape",
-    "validate_player_names",
 ]

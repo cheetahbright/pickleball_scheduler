@@ -1,0 +1,25 @@
+# Streamlit runtime configuration.
+#
+# enableStaticServing exposes the `static/` folder that sits alongside the
+# Streamlit entrypoint (src/main_app.py -> src/static/) at the URL path
+# `/app/static/<filename>`. This is what makes the PWA manifest, icons, and
+# service worker (see src/static/ and src/pwa.py) reachable by the browser.
+# See issue #146.
+#
+# disconnectedSessionTTL keeps a session (sign-in, current schedule, typed
+# but unsaved scores) alive for 2 hours after its browser disconnects. At
+# Streamlit's default of 120 seconds, a phone locked between rounds came back
+# to a page that looked live, but its next tap landed in a fresh, signed-out
+# session and dropped everything typed.
+#
+# maxUploadSize (in MB) caps how much of a request body the server buffers.
+# The uploaders take a config file under 1 MB (MAX_CONFIG_UPLOAD_BYTES in
+# src/managers/config.py) and a full backup ZIP (src/managers/backup.py),
+# about 1 to 3 KB per saved schedule, so roughly 250 KB per year of weekly
+# 16-player sessions that generate three times each; at the default of 200 MB,
+# anyone, signed in or not, could make the server hold 200 MB per request
+# before rejecting it.
+[server]
+enableStaticServing = true
+disconnectedSessionTTL = 7200
+maxUploadSize = 1

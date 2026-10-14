@@ -58,8 +58,15 @@ def build_scheduler_result(
     algorithm: str = "Genetic Algorithm",
     seed: int | None = None,
     constraint_violations: int = 0,
+    round_search_budget_reached: bool = False,
 ) -> dict[str, Any]:
-    """Build the backward-compatible scheduler result payload."""
+    """Build the backward-compatible scheduler result payload.
+
+    round_search_budget_reached is True when the arrangement search ran out
+    of budget before it could finish, so the repeated rounds or constraint
+    violations its pool forces may be avoidable: a longer max runtime
+    searches further.
+    """
     raw_metrics = {key: int(final_metrics[key]) for key in RANGE_METRIC_KEYS}
     total_range = sum_range_metrics(raw_metrics)
     score = 100 - min(100, total_range * 10)
@@ -85,6 +92,7 @@ def build_scheduler_result(
         "avoidable_duplicate_rounds": avoidable_duplicate_rounds,
         "minimum_duplicate_rounds": minimum_duplicate_rounds,
         "max_unique_rounds": max_unique_rounds,
+        "round_search_budget_reached": round_search_budget_reached,
         "games_range": raw_metrics["games_range"],
         "partners_range": raw_metrics["partners_range"],
         "opponents_range": raw_metrics["opponents_range"],
@@ -107,6 +115,7 @@ def build_scheduler_failure_result(
     max_unique_rounds: int,
     error: str = "No valid solution found",
     algorithm: str = "Genetic Algorithm",
+    round_search_budget_reached: bool = False,
 ) -> dict[str, Any]:
     """Build a dict-shaped failure result that matches the maintained scheduler contract."""
     return {
@@ -125,6 +134,7 @@ def build_scheduler_failure_result(
         "avoidable_duplicate_rounds": 0,
         "minimum_duplicate_rounds": minimum_duplicate_rounds,
         "max_unique_rounds": max_unique_rounds,
+        "round_search_budget_reached": round_search_budget_reached,
         "games_range": None,
         "partners_range": None,
         "opponents_range": None,
@@ -141,24 +151,46 @@ def print_scheduler_start_banner(
     absolute_min_runtime: float,
     perfect_stop_runtime: float,
     max_runtime: float,
-    partner_range0_possible: bool,
     optimal_partner_range: int,
     range0_possible: bool,
     optimal_total_range: int,
     max_unique_rounds: int,
     minimum_duplicate_rounds: int,
     seed: int,
+    max_generations: int | None = None,
+    round_search_budget_reached: bool = False,
 ) -> None:
-    """Print the runtime/feasibility banner for a scheduler run."""
-    printer(f"🕐 GA Starting with ENFORCED minimum runtime: {absolute_min_runtime}s")
-    printer(f"   Perfect-stop runtime floor: {perfect_stop_runtime}s")
+    """Print the runtime/feasibility banner for a scheduler run.
+
+    The ranges are proven lower bounds (see
+    ScheduleFeasibilityAnalyzer.calculate_theoretical_minimums), not targets
+    known to be reachable. max_generations is the run's generation cap, None
+    when there is none.
+
+    round_search_budget_reached is True when the arrangement search ran out
+    of budget, so max_unique_rounds is only how many distinct rounds it found.
+    """
+    if max_generations is not None:
+        printer(
+            f"🕐 GA Starting - generation cap {max_generations} applies after minimum runtime: "
+            f"{absolute_min_runtime}s"
+        )
+    else:
+        printer("🕐 GA Starting - no generation cap, the run is bounded by time")
+    printer(
+        "   Perfect-stop runtime floor (while violations are unavoidable or partnerships could spread "
+        f"more evenly): {perfect_stop_runtime}s"
+    )
     printer(f"   Maximum runtime: {max_runtime}s")
-    printer(f"   Partner Range 0 possible: {partner_range0_possible}")
-    printer(f"   Optimal partner range: {optimal_partner_range}")
-    printer(f"   Overall Range 0 possible: {range0_possible}")
-    printer(f"   Theoretical total range minimum: {optimal_total_range}")
-    printer(f"   Canonical round patterns available: {max_unique_rounds}")
-    printer(f"   Minimum duplicate rounds required: {minimum_duplicate_rounds}")
+    printer(f"   Partner range lower bound: {optimal_partner_range}")
+    printer(f"   Range 0 ruled out: {not range0_possible}")
+    printer(f"   Proven total range lower bound: {optimal_total_range}")
+    if round_search_budget_reached:
+        printer(f"   Canonical round patterns found: {max_unique_rounds} (search budget reached - more may exist)")
+        printer(f"   Duplicate rounds the patterns found force: {minimum_duplicate_rounds}")
+    else:
+        printer(f"   Canonical round patterns available: {max_unique_rounds}")
+        printer(f"   Minimum duplicate rounds required: {minimum_duplicate_rounds}")
     printer(f"   Random seed: {seed} (different each run for variety)")
 
 
@@ -170,13 +202,21 @@ def print_scheduler_final_report(
     duplicate_rounds: int,
     avoidable_duplicate_rounds: int,
     minimum_duplicate_rounds: int,
-    partner_range0_possible: bool,
-    optimal_partner_range: int,
     optimal_total_range: int,
     num_players: int,
     max_unique_rounds: int,
+    constraint_violations: int = 0,
+    round_search_budget_reached: bool = False,
 ) -> None:
-    """Print the final report and optimality assessment for a scheduler run."""
+    """Print the final report and optimality assessment for a scheduler run.
+
+    optimal_total_range is the proven lower bound on the total range, so a
+    schedule is called optimal only when it reaches it - and breaks no
+    constraint and repeats no round it could have avoided.
+
+    round_search_budget_reached is True when the arrangement search ran out
+    of budget, so the rounds it found may force repeats a longer search avoids.
+    """
     total_range = sum_range_metrics(final_metrics)
 
     printer(f"\n📊 FINAL RESULTS after {elapsed_seconds:.1f}s:")
@@ -192,20 +232,29 @@ def print_scheduler_final_report(
         f"avoidable excess: {avoidable_duplicate_rounds})"
     )
 
-    if partner_range0_possible and int(final_metrics["partners_range"]) > optimal_partner_range:
-        printer("\n⚠️ WARNING: Partner Range 0 was mathematically possible but NOT achieved!")
-        printer("   This schedule is SUBOPTIMAL and should have continued optimizing!")
-    elif total_range == optimal_total_range:
-        printer(f"\n✅ OPTIMAL: Achieved the theoretical minimum for {num_players} players!")
-        if minimum_duplicate_rounds > 0:
+    if constraint_violations or avoidable_duplicate_rounds:
+        printer(
+            f"\n⚠️ NOT OPTIMAL: {constraint_violations} constraint violation(s) and "
+            f"{avoidable_duplicate_rounds} avoidable duplicate round(s)"
+        )
+    elif total_range <= optimal_total_range:
+        printer(f"\n✅ OPTIMAL: Reached the proven minimum total range for {num_players} players!")
+        if minimum_duplicate_rounds > 0 and not round_search_budget_reached:
             printer(
                 "   Round repeats are expected here because only "
                 f"{max_unique_rounds} canonical round patterns exist."
             )
-    elif total_range > optimal_total_range:
-        printer(f"\n⚠️ SUBOPTIMAL: Could be improved further (target Range {optimal_total_range})")
+        elif minimum_duplicate_rounds > 0:
+            printer(
+                "   Rounds repeat because the round search found only "
+                f"{max_unique_rounds} distinct valid rounds before its budget ran out - "
+                "a longer max runtime searches further."
+            )
     else:
-        printer("\n🏆 PERFECT: Exceeded the current theoretical estimate for this player count!")
+        printer(
+            f"\n⚠️ Total range {total_range} is above the proven lower bound of {optimal_total_range} - "
+            "it may or may not be possible to get closer."
+        )
 
 
 def invoke_progress_callback(

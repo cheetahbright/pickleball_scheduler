@@ -23,12 +23,5 @@ def extract_game_teams(game: Any) -> tuple[list, list, Any]:
 
 
 def games_in_round(round_data: Any) -> list:
-    """Return the games list for one round.
-
-    round_data is normally a round dict (`{"games": [...]}`), but some
-    callers pass a schedule that is just a flat list of bare games with no
-    round wrapper - in that case treat round_data itself as the one game.
-    """
-    if hasattr(round_data, "get"):
-        return round_data.get("games", [])
-    return [round_data]
+    """Return the games list for one round dict (`{"games": [...]}`)."""
+    return round_data.get("games", [])

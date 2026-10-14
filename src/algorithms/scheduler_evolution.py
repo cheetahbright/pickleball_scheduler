@@ -130,7 +130,12 @@ def super_aggressive_mutate(
     """SUPER aggressive mutation for breaking out of local optima.
 
     Applies one of seven mutation strategies at random, several of which
-    enforce arrangement diversity within the individual.
+    enforce arrangement diversity within the individual. Strategies 1, 3
+    and 4 only reorder genes, and no fitness term depends on round order, so
+    they leave the child's fitness as crossover made it. Replacing them with
+    moves that change the rounds, or with no move at all, did not beat this
+    mix in seeded benchmarks (several shapes ended with a larger range), so
+    they stay.
 
     Args:
         ind: Current individual (tuple of arrangement indices).
@@ -257,18 +262,22 @@ def tournament_select(
     """Tournament selection with configurable tournament size.
 
     Args:
-        population: Current population list.
-        fitness_scores: Parallel list of (individual, fitness) pairs.
+        population: Current population list (only its size is used).
+        fitness_scores: (individual, fitness) pairs for the same population.
         rng: Seeded random instance.
         k: Number of contestants in each tournament.
 
     Returns:
         The individual with the lowest fitness among the tournament contestants.
+
+    Contestants are drawn from the (individual, fitness) pairs themselves,
+    never by pairing population[i] with fitness_scores[i]: the evolution loop
+    sorts fitness_scores in place for elitism, so the two lists are not in
+    the same order, and indexing both would rank each contestant by another
+    individual's fitness.
     """
     tournament_indices = rng.sample(range(len(population)), min(k, len(population)))
-    tournament = [(population[i], fitness_scores[i][1]) for i in tournament_indices]
-    tournament.sort(key=lambda x: x[1])
-    return tournament[0][0]
+    return min((fitness_scores[i] for i in tournament_indices), key=lambda pair: pair[1])[0]
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +293,11 @@ def inject_diversity(
 ) -> List[Individual]:
     """Replace a fraction of the population with freshly generated individuals.
 
-    Operates in-place and returns the same list for convenience.
+    Operates in-place and returns the same list for convenience. Positions
+    are drawn from the whole population, the elites in its first slots
+    included. The evolution loop tracks its best individual separately, so
+    the schedule returned never loses it; keeping the elites (or just the
+    best) out of the draw did not beat this in seeded benchmarks.
 
     Args:
         population: Current population (mutated in-place).
@@ -312,7 +325,7 @@ def compute_general_stop_threshold(
     num_rounds: int,
     min_runtime: float,
 ) -> float:
-    """Return the minimum elapsed time before a non-perfect early stop is allowed.
+    """Return the minimum elapsed time before the generation cap may end a run.
 
     Args:
         num_players: Number of players in the tournament.
@@ -320,8 +333,8 @@ def compute_general_stop_threshold(
         min_runtime: Configured minimum runtime (may be 0.0).
 
     Returns:
-        Minimum elapsed seconds required before the main loop may exit on a
-        non-Range-0 convergence condition.
+        Minimum elapsed seconds before the main loop may stop at
+        scheduler.max_generations.
     """
     if os.environ.get("E2E_TEST") in ("1", "true", "True"):
         return 0.5
@@ -336,7 +349,12 @@ def compute_perfect_stop_threshold(
     min_runtime: float,
     max_runtime: float,
 ) -> float:
-    """Return the minimum elapsed time before a perfect (Range-0) stop is confirmed.
+    """Return how long a run whose best schedule is perfect keeps looking
+    before it stops.
+
+    Only reached when every schedule breaks a constraint, or while an equally
+    fair schedule could still repeat partnerships less; a perfect schedule
+    that leaves nothing to find ends the run at once (see _is_unbeatable).
 
     Args:
         num_players: Number of players in the tournament.
@@ -345,7 +363,7 @@ def compute_perfect_stop_threshold(
         max_runtime: Configured maximum runtime budget.
 
     Returns:
-        Minimum elapsed seconds to confirm a perfect result before stopping.
+        Minimum elapsed seconds before that perfect result ends the run.
     """
     if os.environ.get("E2E_TEST") in ("1", "true", "True"):
         return 0.5
@@ -359,12 +377,38 @@ def _evaluate_current_best(scheduler, individual):
     sequence needs: schedule, metrics, duplicate-round signature, and the
     duplicate-round count beyond the mathematical minimum."""
     schedule = scheduler._decode_cached(individual)
-    metrics = scheduler._evaluate_metrics_cached(schedule, individual)
-    signature = scheduler._get_duplicate_signature_cached(individual, schedule)
+    metrics = scheduler._individual_metrics(individual)
+    signature = scheduler._individual_signature(individual)
     avoidable_duplicate_rounds = avoidable_duplicate_rounds_from_signature(
         signature, scheduler.minimum_duplicate_rounds
     )
     return schedule, metrics, signature, avoidable_duplicate_rounds
+
+
+def _is_perfect(scheduler, total_range, avoidable_duplicate_rounds, metrics):
+    """Whether the current best can't be improved: its total range is at the
+    proven lower bound (scheduler.optimal_total_range - 0 unless range 0 is
+    ruled out), no avoidable duplicate round, and no more constraint
+    violations than the arrangement pool forces (scheduler.minimum_violations
+    - 0 unless the constraints can't be met in any round). A schedule with an
+    avoidable violation is not perfect, so it must not end the search early."""
+    return (
+        total_range <= scheduler.optimal_total_range
+        and avoidable_duplicate_rounds == 0
+        and metrics["violations"] <= scheduler.minimum_violations
+    )
+
+
+def _is_unbeatable(scheduler, metrics, spread_best_individual):
+    """Whether a perfect best (see _is_perfect) leaves the search nothing to
+    find: it breaks no constraint, and the schedule the run would return
+    repeats partnerships no more than the evenest spread possible
+    (scheduler._partner_repeat_floor). Short of that, the search may still
+    find an equally fair schedule whose partnerships are spread better."""
+    return (
+        metrics["violations"] == 0
+        and scheduler._partner_repeat_score_cached(spread_best_individual) <= scheduler._partner_repeat_floor
+    )
 
 
 def run_evolution_loop(
@@ -380,11 +424,26 @@ def run_evolution_loop(
     printer,
     invoke_progress,
     seed_individuals=None,
+    generation_budget=None,
 ):
     """Run the main GA evolution loop extracted from GeneticPickleballScheduler.
 
+    A run stops as soon as its best schedule is perfect (_is_perfect), breaks
+    no constraint and spreads partnerships as evenly as possible
+    (_is_unbeatable) - nothing can beat it. A perfect best short of that keeps
+    looking until perfect_stop_runtime. Otherwise a run stops at
+    scheduler.max_runtime, at scheduler.max_generations (once
+    absolute_min_runtime has passed), or once it has converged late in the
+    run. generation_budget replays a run instead: it runs exactly that many
+    generations, ignoring the clock, and every stop happens at the top of an
+    iteration, so a run that reported N generations replays as N.
+
     Takes the scheduler as a duck-typed context for fitness/decode/operator
-    access and returns (best_individual, best_fitness, generations_run).
+    access and returns (best_individual, best_fitness, generations_run,
+    spread_best_individual). spread_best_individual ties best_individual on
+    every fitness term but repeats partnerships least among the individuals
+    seen at that fitness (scheduler._spreads_partners_better); it is tracked
+    beside best_individual, never instead of it, so the search is unchanged.
     Seeded runs with an injected clock are fully reproducible, which is the
     equivalence check used when this code was moved out of generate_schedule.
 
@@ -399,9 +458,11 @@ def run_evolution_loop(
     # Initialize tracking
     best_individual = None
     best_fitness = float("inf")
+    spread_best_individual = None
     best_ranges = None
     generations_run = 0
     generations_without_improvement = 0
+    converged = False
 
     # Track if we've logged progress recently
     last_progress_log = 0
@@ -470,37 +531,45 @@ def run_evolution_loop(
                     printer(f"Progress callback failed: {e}")
                 last_callback_time = elapsed
 
-            # Check stopping conditions - RUN FOR FULL TIME FOR QUALITY
-            if total_range == 0 and avoidable_duplicate_rounds == 0:
-                if elapsed >= perfect_stop_runtime:
+            # Check stopping conditions. A perfect schedule that leaves the
+            # search nothing to find ends the run at once. Any other perfect
+            # schedule keeps looking until perfect_stop_runtime: for fewer
+            # violations, or for an equally fair schedule that repeats
+            # partnerships less (spread_best_individual).
+            if _is_perfect(scheduler, total_range, avoidable_duplicate_rounds, metrics) and (
+                _is_unbeatable(scheduler, metrics, spread_best_individual)
+                or (generation_budget is None and elapsed >= perfect_stop_runtime)
+            ):
+                can_stop = True
+                stop_reason = "PROVEN MINIMUM TOTAL RANGE ACHIEVED! 🎉"
+            elif generation_budget is not None:
+                # Replaying a run: exactly its generations, whatever the clock says.
+                if generations_run >= generation_budget:
                     can_stop = True
-                    stop_reason = "PERFECT TOTAL RANGE ACHIEVED! 🎉"
-                else:
-                    can_stop = False
-            elif scheduler.range0_possible and total_range > 0:
-                # Continue trying for Range 0 but respect time limits
-                if elapsed >= scheduler.max_runtime:
-                    can_stop = True
+                    stop_reason = f"Replayed all {generation_budget} generations"
+            elif converged:
+                can_stop = True
+                stop_reason = "Convergence reached"
+            elif elapsed >= scheduler.max_runtime:
+                can_stop = True
+                if scheduler.range0_possible and total_range > 0:
                     stop_reason = (
                         f"Max runtime {scheduler.max_runtime}s reached - "
                         f"Range 0 not achieved (current: {total_range})"
                     )
-            elif elapsed >= scheduler.max_runtime:
-                can_stop = True
-                stop_reason = f"Max runtime {scheduler.max_runtime}s reached - FORCING STOP"
-            elif elapsed < absolute_min_runtime:
-                # Continue until minimum runtime unless Range 0
-                can_stop = False
-                # Minimal logging every 5 seconds only
-                if int(elapsed) % 5 == 0 and elapsed > 0 and int(elapsed) != int(elapsed - 0.1):
-                    printer(f"⏳ Optimizing... {absolute_min_runtime - elapsed:.1f}s remaining")
-            elif generations_run >= scheduler.max_generations and elapsed >= absolute_min_runtime:
-                # Only stop for max generations AFTER minimum runtime
+                else:
+                    stop_reason = f"Max runtime {scheduler.max_runtime}s reached - FORCING STOP"
+            elif (
+                scheduler.max_generations is not None
+                and generations_run >= scheduler.max_generations
+                and elapsed >= absolute_min_runtime
+            ):
+                # A real cap for every roster shape, once the minimum runtime has passed
                 can_stop = True
                 stop_reason = f"Max generations {scheduler.max_generations} reached"
         else:
             # First generation
-            if elapsed >= scheduler.max_runtime:
+            if generation_budget is None and elapsed >= scheduler.max_runtime:
                 can_stop = True
                 stop_reason = "Max runtime reached (no valid solution found)"
 
@@ -519,6 +588,7 @@ def run_evolution_loop(
             if fitness < best_fitness:
                 best_fitness = fitness
                 best_individual = ind
+                spread_best_individual = ind
                 fitness_improved = True
 
                 # Only log significant improvements and limit frequency
@@ -529,8 +599,7 @@ def run_evolution_loop(
                 # Log if major improvement OR enough time passed
                 if fitness_improvement > 1000000 or time_since_log > scheduler._progress_update_interval:
 
-                    schedule = scheduler._decode_cached(ind)
-                    metrics = scheduler._evaluate_metrics_cached(schedule, ind)
+                    metrics = scheduler._individual_metrics(ind)
                     best_ranges = {
                         "games": metrics["games_range"],
                         "partners": metrics["partners_range"],
@@ -543,6 +612,8 @@ def run_evolution_loop(
 
                     scheduler._last_progress_time = current_time
                     scheduler._last_logged_fitness = fitness
+            elif fitness == best_fitness and scheduler._spreads_partners_better(ind, spread_best_individual):
+                spread_best_individual = ind
 
         # Enhanced convergence tracking for quality
         if fitness_improved:
@@ -565,15 +636,11 @@ def run_evolution_loop(
             )
 
             # Quality-focused convergence logic
-            if total_range == 0 and avoidable_duplicate_rounds == 0:  # Perfect result achieved
+            if _is_perfect(scheduler, total_range, avoidable_duplicate_rounds, metrics):  # Perfect result achieved
                 if verbose:
-                    printer(f"✅ Found optimal solution (Range 0) at generation {generations_run}")
-                # DON'T STOP - let main loop handle timing constraints
-                if elapsed >= perfect_stop_runtime and generations_without_improvement > 30:
-                    if verbose:
-                        printer("🏁 Range 0 confirmed stable after sufficient runtime - stopping")
-                    break
-            elif generations_without_improvement >= scheduler.convergence_patience:
+                    printer(f"✅ Found optimal solution (Range {total_range}) at generation {generations_run}")
+                # The stop checks at the top of the loop decide when the run ends
+            elif generation_budget is None and generations_without_improvement >= scheduler.convergence_patience:
                 if verbose:
                     printer(f"Converged after {generations_without_improvement} generations without improvement")
                 # CRITICAL: Don't stop unless we've used most of our runtime!
@@ -584,8 +651,9 @@ def run_evolution_loop(
                     # Reset convergence to give more time
                     generations_without_improvement = scheduler.convergence_patience - 50
                 else:
-                    printer("🏁 Convergence reached - stopping")
-                    break
+                    # Stopped at the top of the next iteration, like every
+                    # other stop, so the reported generation count replays it.
+                    converged = True
         fitness_scores.sort(key=lambda x: x[1])
 
         # Create next generation
@@ -642,4 +710,4 @@ def run_evolution_loop(
 
         generations_run += 1
 
-    return best_individual, best_fitness, generations_run
+    return best_individual, best_fitness, generations_run, spread_best_individual

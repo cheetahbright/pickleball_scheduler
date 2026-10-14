@@ -156,15 +156,16 @@ def launch_gui(enhanced: bool = False) -> None:
         if not isinstance(safe_gui_path, str) or not safe_gui_path:
             safe_gui_path = str(gui_path)
 
+        # The server runs until it is stopped, so no timeout: it ends with Ctrl+C.
         subprocess.run(  # noqa: S603
             [sys.executable, "-m", "streamlit", "run", safe_gui_path, "--server.port", port],
             check=True,
-            timeout=10,
         )
+    except KeyboardInterrupt:
+        # Ctrl+C reaches Streamlit as well, which stops the server.
+        _console_print("\n👋 Pickleball Scheduler stopped.")
     except SecurityError as e:
         _handle_error(e, f"🚫 Security error: {e}", {"port": port, "gui_path": str(gui_path)}, 1)
-    except subprocess.TimeoutExpired as e:
-        _handle_error(e, "⏰ Streamlit launch timed out", {"port": port})
     except subprocess.CalledProcessError as e:
         _handle_error(e, f"❌ Failed to launch streamlit: {e}", {"port": port, "return_code": e.returncode}, 1)
     except OSError as e:
@@ -185,6 +186,11 @@ def launch_cli() -> None:
         from src.utils.schedule_shapes import games_in_round
     except ImportError:
         from utils.schedule_shapes import games_in_round
+
+    try:
+        from src.app_scheduler_flow import find_player_name_issues
+    except ImportError:
+        from app_scheduler_flow import find_player_name_issues
 
     try:
         _console_print("🏓 Pickleball Scheduler - Enhanced Command Line Interface")
@@ -235,22 +241,35 @@ def launch_cli() -> None:
             if is_single_char and player_name.lower() not in valid_commands:
                 _console_print(f"❌ Unknown command '{player_name}'. Type 'h' for help.")
                 continue
+            # The same checks as the app: one person can't take two places in a round.
+            name_issues = find_player_name_issues([*player_names, player_name])
+            if name_issues:
+                for issue in name_issues:
+                    _console_print(f"❌ {issue} - enter a different name.")
+                continue
             player_names.append(player_name)
 
         if len(player_names) < 4:
             _console_print("❌ Need at least 4 players!")
             return
 
-        # Get courts
+        # Get courts - each needs 4 players, so more than players // 4 leaves no valid round
+        max_courts = max(1, len(player_names) // 4)
         try:
-            courts = int(input("\nNumber of courts (default 4): ") or "4")
+            courts = int(input(f"\nNumber of courts (default {max_courts}): ") or str(max_courts))
         except ValueError:
-            courts = 4
+            courts = max_courts
+        if not 1 <= courts <= max_courts:
+            _console_print(f"⚠️ {len(player_names)} players can fill 1 to {max_courts} court(s) - using {max_courts}.")
+            courts = max_courts
 
         # Get rounds
         try:
             rounds = int(input("Number of rounds (default 4): ") or "4")
         except ValueError:
+            rounds = 4
+        if rounds < 1:
+            _console_print("⚠️ At least 1 round is needed - using 4.")
             rounds = 4
 
         # Generate schedule using genetic algorithm

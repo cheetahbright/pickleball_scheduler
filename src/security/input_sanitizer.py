@@ -1,4 +1,9 @@
-"""Minimal security helpers used by the launcher and JSON utilities."""
+"""Path containment check for the launcher.
+
+Its only caller is src/main.py, which checks that its own Streamlit entry point
+lies inside the project folder. Nothing passes user input through it: names,
+uploads and exports are guarded where they are used, not here.
+"""
 
 from __future__ import annotations
 

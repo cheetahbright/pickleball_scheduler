@@ -6,12 +6,14 @@
  * HTML/JSON payload that can be cached and safely replayed offline without
  * risking a stale or broken UI. Trying to cache that traffic here would
  * silently break live scheduling. Instead this worker's job is intentionally
- * narrow: it only caches the handful of *static* files needed for
- * installability (the manifest + icons + itself), and it is registered from
- * inside src/static/, which limits its default service-worker "scope" to the
- * /app/static/ path - it physically cannot intercept requests for the
- * dynamic Streamlit app shell, websocket traffic, or API calls, since those
- * live outside its scope.
+ * narrow: it only caches the handful of *static* files (the manifest + icons
+ * + itself), and it is registered from inside src/static/, which limits its
+ * default service-worker "scope" to the /app/static/ path - it physically
+ * cannot intercept requests for the dynamic Streamlit app shell, websocket
+ * traffic, or API calls, since those live outside its scope. For the same
+ * reason it never controls the app page itself, so the page's own requests
+ * never reach it either: it gives the app no offline support, and installing
+ * the app does not need it.
  *
  * KNOWN LIMITATION (verified empirically, see src/pwa.py docstring for the
  * full writeup): Streamlit's static-file server force-serves this file with
@@ -19,9 +21,10 @@
  * extensions eligible for content-type sniffing. Strict browsers (e.g.
  * Chrome) require a JavaScript MIME type on the service worker script
  * response and will refuse to register this file until that's fixed
- * upstream or via a reverse proxy. The registration is still attempted
- * (guarded by a .catch()) since manifest.json and the icons ARE served with
- * correct types and already provide real "Install app" value on their own.
+ * upstream or via a reverse proxy. src/pwa.py therefore registers it only
+ * when a HEAD request finds it served as JavaScript; manifest.json and the
+ * icons ARE served with correct types and give the "Install app" prompt on
+ * their own.
  */
 
 // The trailing hex suffix is a content hash of manifest.json + both icons

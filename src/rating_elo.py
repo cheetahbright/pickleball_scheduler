@@ -3,11 +3,11 @@
 
 Like SkillRatingManager's static 1-5 ratings (#124), this is deliberately
 NOT wired into the genetic scheduler's fitness function - see that class's
-docstring in app_managers.py for the same rationale (#124/#126 discussion:
-feeding a rating into scheduling would need dedicated algorithm design and
-verification work). This module only computes the math; EloRatingManager
-(app_managers.py) persists it and replays recorded scores to keep it
-reproducible.
+docstring in managers/skill_rating.py for the same rationale (#124/#126
+discussion: feeding a rating into scheduling would need dedicated algorithm
+design and verification work). This module only computes the math;
+EloRatingManager (managers/elo_rating.py) persists it and replays recorded
+scores to keep it reproducible.
 """
 
 from __future__ import annotations
