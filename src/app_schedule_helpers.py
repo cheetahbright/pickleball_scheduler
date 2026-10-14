@@ -267,12 +267,18 @@ def recorded_result(row) -> tuple[int, int] | None:
 
     A row missing a score is no result, and neither is 0-0: an older Save
     Scores wrote 0-0 for every unplayed game (see history._result_row_condition).
+    Nor is a score that isn't a number (SQLite keeps 'abc' as text in the
+    INTEGER column): a hand-edited or badly restored row mustn't raise here,
+    on every run, and stop the Leaderboard tab rendering.
     """
-    if not row or row.get("team1_score") is None or row.get("team2_score") is None:
+    if not row:
         return None
-    if row["team1_score"] == 0 and row["team2_score"] == 0:
+    scores = (row.get("team1_score"), row.get("team2_score"))
+    if any(isinstance(score, bool) or not isinstance(score, (int, float)) for score in scores):
         return None
-    return (row["team1_score"], row["team2_score"])
+    if scores == (0, 0):
+        return None
+    return scores
 
 
 def blank_score_sheet_csv(games: List[dict]) -> str:
@@ -451,14 +457,20 @@ def schedule_to_xlsx(schedule, all_players=None, round_times=None, scores=None, 
         for cell in scores_sheet[1]:
             cell.font = header_font
         for row in results:
-            # Read as the score entry reads them: a hand-edited or damaged row
-            # mustn't raise here, on every run, and stop the page rendering.
+            # Read as the score entry reads them (app_tabs._recorded_for_game): a
+            # damaged row's team cell may hold anything JSON can (None, a number,
+            # a string), and mustn't raise here, on every run, and stop the page
+            # rendering. Anything but a list of players is written as no players.
+            team1, team2 = (
+                " & ".join(map(str, team)) if isinstance(team, list) else ""
+                for team in (row.get("team1_players"), row.get("team2_players"))
+            )
             scores_sheet.append(
                 [
                     row["round_num"],
                     row["court"],
-                    text_cell(" & ".join(map(str, row.get("team1_players") or []))),
-                    text_cell(" & ".join(map(str, row.get("team2_players") or []))),
+                    text_cell(team1),
+                    text_cell(team2),
                     row.get("team1_score"),
                     row.get("team2_score"),
                 ]

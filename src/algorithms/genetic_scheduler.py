@@ -6,7 +6,7 @@ import os
 import random
 import sys
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
 
 try:
     from src.algorithms.scheduler_reporting import (
@@ -258,6 +258,11 @@ class GeneticPickleballScheduler:
         self.num_players = len(self._names)
         if self.num_players == 0:
             raise ValueError("players list cannot be empty")
+        # Who sat out each round played before the schedule this run makes,
+        # oldest first: a mid-session replan sets it to its locked rounds'
+        # sitters, so order_rounds_for_rest measures sit-out streaks across
+        # that boundary. No fitness term reads it.
+        self.preceding_sit_outs: Sequence[Collection[str]] = ()
 
         # num_courts is always the caller's explicit choice (physical courts
         # available cannot be inferred from player count alone - a club with
@@ -582,9 +587,10 @@ class GeneticPickleballScheduler:
             best_fitness = self._fitness(spread_best_individual)
 
         # The last tiebreak, below the partner-repetition one above: put the
-        # rounds in the order that spreads each player's sit-outs out most.
+        # rounds in the order that spreads each player's sit-outs out most,
+        # counting on from the rounds already played before these, if any.
         # Nothing reported above depends on round order.
-        final_schedule = order_rounds_for_rest(final_schedule, self._names)
+        final_schedule = order_rounds_for_rest(final_schedule, self._names, preceding_sit_outs=self.preceding_sit_outs)
 
         constraint_violations = sum(
             0 if self._game_valid(game) else 1 for round_games in final_schedule for game in round_games

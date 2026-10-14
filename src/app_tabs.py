@@ -274,6 +274,21 @@ def _history_time(timestamp, time_zone: tzinfo | None) -> str:
         return str(timestamp)[:16].replace("T", " ")
 
 
+def _history_fairness(fairness_score) -> str:
+    """A stored fairness_score as "N.N/10", or "?" when the cell doesn't hold a number.
+
+    The app always writes a number, but the schema can't insist on one (the
+    column is a nullable REAL, and SQLite keeps text in it as text) and a
+    restore checks only that the columns exist, so a hand-edited or foreign
+    database can carry such a row in. Formatting it used to raise on every
+    run, which also left every tab drawn after History - Configuration, with
+    the Restore that would replace the database, included - undrawn.
+    """
+    if isinstance(fairness_score, bool) or not isinstance(fairness_score, (int, float)):
+        return "?"
+    return f"{fairness_score:.1f}/10"
+
+
 _ELO_NOT_UPDATED_WARNING = (
     "⚠️ Couldn't update the ELO ratings, so they don't include this change yet. Use '🔄 Recompute ELO ratings' "
     "on the Leaderboard tab to try again."
@@ -335,7 +350,7 @@ def render_history_tab(st_module, pd_module, json_module):
                     "Players": entry["num_players"],
                     "Rounds": entry["num_rounds"],
                     "Algorithm": entry["algorithm"],
-                    "Fairness": f"{entry['fairness_score']:.1f}/10",
+                    "Fairness": _history_fairness(entry["fairness_score"]),
                 }
             )
 
@@ -811,7 +826,7 @@ def render_configuration_tab(st_module):
     edited = deepcopy(config)
 
     st_module.markdown("### 🎚️ Objective Weights")
-    st_module.info("Adjust the importance of different scheduling objectives")
+    st_module.info("Saved with the configuration; schedule generation doesn't use these weights yet.")
 
     for obj_name, obj_data in config["objectives"].items():
         col1, col2 = st_module.columns([3, 1])
@@ -1204,7 +1219,6 @@ def render_player_management_tab(st_module, player_manager_cls):
                     f"- **First Half Players**: Available for rounds 1-{substitution_round}",
                     f"- **Second Half Players**: Available for rounds {substitution_round + 1}-end",
                     "- **Overlap**: Players in both lists can play throughout",
-                    "- **Scheduling**: Algorithm ensures smooth transitions",
                 ]
             )
         )
@@ -1396,8 +1410,15 @@ def refresh_score_widgets(session_state, schedule_id) -> None:
 
 
 def _recorded_for_game(row, game) -> bool:
-    """Whether a game_scores row names this game's teams, in the same team1/team2 order."""
-    recorded = [sorted(map(str, row.get(team) or [])) for team in ("team1_players", "team2_players")]
+    """Whether a game_scores row names this game's teams, in the same team1/team2 order.
+
+    A damaged row's team cell may hold anything JSON can (None, a number, a
+    string): read as "no players", so it doesn't raise mid-render.
+    """
+    recorded = [
+        sorted(map(str, team)) if isinstance(team, list) else []
+        for team in (row.get("team1_players"), row.get("team2_players"))
+    ]
     return recorded == [sorted(game["team1"]), sorted(game["team2"])]
 
 
@@ -1485,19 +1506,32 @@ def render_leaderboard_tab(st_module, pd_module):
                 f"(anything already typed is kept). {_READ_FAILED_HINT}"
             )
         # Saving refuses a schedule deleted from History; say so before any
-        # scores are typed, not only when Save is pressed.
+        # scores are typed, not only when Save is pressed, and don't take
+        # scores that can't be saved.
         schedule_entry = history_manager.get_schedule(schedule_id)
-        if schedule_entry is not None and schedule_entry.get("deleted_at"):
+        schedule_deleted = schedule_entry is not None and bool(schedule_entry.get("deleted_at"))
+        # Not there, while the database reads fine: purged after it was deleted.
+        schedule_purged = schedule_entry is None and stored_scores is not None
+        if schedule_deleted:
             st_module.warning(
                 "⚠️ This schedule was deleted from History, so its scores can't be saved. Restore it first, "
-                "with ↩️ Undo Delete or from Recently deleted on the History tab, then enter its scores."
+                "here or from the History tab, then enter its scores."
             )
-        elif schedule_entry is None and stored_scores is not None:
-            # Not there, while the database reads fine: purged after it was deleted.
+            if st_module.button("↩️ Restore this schedule", key=f"leaderboard_restore_{schedule_id}"):
+                if history_manager.restore_schedule(schedule_id):
+                    _update_elo_ratings(st_module.session_state, history_manager)
+                    st_module.session_state.global_status_message = "↩️ Schedule restored."
+                    # This session changed the History list itself: no "list changed" note there.
+                    st_module.session_state.pop(_HISTORY_TICKED_TABLE_KEY, None)
+                    st_module.rerun()
+                else:
+                    st_module.error("Failed to restore schedule.")
+        elif schedule_purged:
             st_module.warning(
                 "⚠️ This schedule is no longer in History (it was deleted and then purged), so its scores "
                 "can't be saved."
             )
+        entry_disabled = scores_unreadable or schedule_deleted or schedule_purged
         _schedule_helpers = import_module_with_fallback("app_schedule_helpers")
         list_games_for_scoring = _schedule_helpers.list_games_for_scoring
         blank_score_sheet_csv = _schedule_helpers.blank_score_sheet_csv
@@ -1516,9 +1550,9 @@ def render_leaderboard_tab(st_module, pd_module):
             csv_text = st_module.text_area(
                 "Paste filled-in CSV (round,court,team1,team2,team1_score,team2_score)",
                 key="score_csv_import",
-                disabled=scores_unreadable,
+                disabled=entry_disabled,
             )
-            if st_module.button("📥 Import CSV", disabled=scores_unreadable):
+            if st_module.button("📥 Import CSV", disabled=entry_disabled):
                 if not csv_text:
                     st_module.warning("⚠️ Paste CSV data first.")
                 else:
@@ -1599,7 +1633,7 @@ def render_leaderboard_tab(st_module, pd_module):
                             "replaces it."
                         )
                         remove_stored = st_module.checkbox(
-                            f"Remove the stored {stored} when saving", key=remove_key, disabled=scores_unreadable
+                            f"Remove the stored {stored} when saving", key=remove_key, disabled=entry_disabled
                         )
                         recorded = None
                     elif recorded is not None and min(recorded) < 0:
@@ -1611,7 +1645,7 @@ def render_leaderboard_tab(st_module, pd_module):
                             "though it still counts in the standings. Saving this game's score replaces it."
                         )
                         remove_stored = st_module.checkbox(
-                            f"Remove the stored {stored} when saving", key=remove_key, disabled=scores_unreadable
+                            f"Remove the stored {stored} when saving", key=remove_key, disabled=entry_disabled
                         )
                         recorded = None
                     seed = seeds.setdefault(game_id, recorded or (None, None))
@@ -1630,7 +1664,7 @@ def render_leaderboard_tab(st_module, pd_module):
                             value=None,
                             placeholder="not played",
                             key=team1_key,
-                            disabled=scores_unreadable,
+                            disabled=entry_disabled,
                         )
                     with col2:
                         team2_score = st_module.number_input(
@@ -1640,11 +1674,11 @@ def render_leaderboard_tab(st_module, pd_module):
                             value=None,
                             placeholder="not played",
                             key=team2_key,
-                            disabled=scores_unreadable,
+                            disabled=entry_disabled,
                         )
                     score_inputs.append((game, (team1_score, team2_score), seed, remove_stored))
 
-                if st_module.form_submit_button("💾 Save Scores", disabled=scores_unreadable):
+                if st_module.form_submit_button("💾 Save Scores", disabled=entry_disabled):
                     to_save, invalid_games = _changed_scores(score_inputs)
                     if invalid_games:
                         st_module.error(
@@ -1681,7 +1715,8 @@ def render_leaderboard_tab(st_module, pd_module):
         if st_module.button("🔄 Recompute ELO ratings", disabled=leaderboard is None):
             try:
                 elo_manager.recompute_from_history(history_manager)
-            except RuntimeError:
+            except Exception:  # a read/persist failure, or a damaged row the replay choked on: either way, say so
+                logger.exception("Could not recompute the ELO ratings")
                 st_module.error("❌ Couldn't recompute the ELO ratings, so they were left unchanged. Please try again.")
             else:
                 st_module.session_state.global_status_message = "✅ ELO ratings recomputed!"

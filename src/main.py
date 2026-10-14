@@ -6,7 +6,6 @@ Simple, effective tournament scheduling with genetic optimization.
 
 Usage:
     python main.py                    # Launch GUI
-    python main.py --enhanced         # Launch legacy enhanced GUI (if available)
     python main.py --cli             # Command line interface
     python main.py --test            # Run validation tests
     python main.py --help            # Show help and exit
@@ -18,13 +17,10 @@ Features:
     • Clean, intuitive interface
 """
 
-import builtins
-import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
 
 try:
     from src._compat import import_module_with_fallback
@@ -33,49 +29,10 @@ except ImportError:
 
 project_root = Path(__file__).parent.parent
 
-
-class _FallbackInputSanitizer:
-    """Fallback input sanitizer that passes through unchanged."""
-
-    @staticmethod
-    def sanitize_file_path(path: str, _base_dir: str | None = None) -> str:
-        """Return path unchanged when security module unavailable."""
-        return path
-
-
-def _fallback_setup_logging(level: str = "INFO"):
-    """Create a basic logger when logging_config module unavailable."""
-    logger = logging.getLogger("pickleball_scheduler")
-    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
-    return logger
-
-
-def _fallback_log_error(logger, error, message, context=None):
-    """No-op when logging_config module unavailable."""
-
-
-SecurityError: type[Exception] = Exception
-InputSanitizer: Any = _FallbackInputSanitizer
-setup_logging = _fallback_setup_logging
-log_error_with_context = _fallback_log_error
-logger = None
-
-try:
-    _security = import_module_with_fallback("security.input_sanitizer")
-    SecurityError = _security.SecurityError
-    InputSanitizer = _security.InputSanitizer
-except (ImportError, AttributeError):
-    pass
-
-try:
-    _logging = import_module_with_fallback("utils.logging_config")
-    setup_logging = _logging.setup_logging
-    log_error_with_context = _logging.log_error_with_context
-    logger = setup_logging(level="INFO")
-    if logger:
-        logger.info("Pickleball Scheduler V2 starting", extra={"version": "2.0.0"})
-except (ImportError, AttributeError):
-    builtins.print("Warning: Could not initialize logging/security")
+_logging_config = import_module_with_fallback("utils.logging_config")
+log_error_with_context = _logging_config.log_error_with_context
+logger = _logging_config.setup_logging(level="INFO")
+logger.info("Pickleball Scheduler V2 starting", extra={"version": "2.0.0"})
 
 
 def _console_print(message: object = "") -> None:
@@ -89,34 +46,16 @@ def _console_print(message: object = "") -> None:
 def _handle_error(
     error: BaseException, user_msg: str, context: dict | None = None, exit_code: int | None = None
 ) -> None:
-    """Print error to console and log with context if logger available."""
+    """Print error to console and log it with context."""
     _console_print(user_msg)
-    if logger:
-        log_error_with_context(logger, error, user_msg, context or {})
+    log_error_with_context(logger, error, user_msg, context or {})
     if exit_code is not None:
         sys.exit(exit_code)
 
 
-def _resolve_gui_path(enhanced: bool = False) -> tuple[Path, bool]:
-    """Resolve the GUI entry point, falling back when legacy files drift."""
-    standard_gui_path = project_root / "src" / "main_app.py"
-    enhanced_gui_path = project_root / "src" / "gui" / "multi_algorithm_gui.py"
-
-    if not enhanced:
-        return standard_gui_path, False
-
-    try:
-        if enhanced_gui_path.exists() and enhanced_gui_path.stat().st_size > 0:
-            return enhanced_gui_path, True
-    except OSError:
-        pass
-
-    return standard_gui_path, False
-
-
-def launch_gui(enhanced: bool = False) -> None:
+def launch_gui() -> None:
     """Launch the Pickleball Scheduler GUI."""
-    gui_path, using_enhanced_gui = _resolve_gui_path(enhanced=enhanced)
+    gui_path = project_root / "src" / "main_app.py"
 
     # Get port from environment with validation and fallback
     env_port = os.environ.get("PORT", "8501")
@@ -131,41 +70,19 @@ def launch_gui(enhanced: bool = False) -> None:
     except (ValueError, AttributeError):
         _console_print(f"⚠️ Invalid PORT '{env_port}', using default 8501")
 
-    if enhanced and not using_enhanced_gui:
-        _console_print("ℹ️ Enhanced GUI entry point not available; launching standard GUI instead.")
-
-    message = "🚀 Launching Pickleball Scheduler Application..."
-    if using_enhanced_gui:
-        message = "🚀 Launching Pickleball Scheduler Enhanced Application..."
-
-    if logger:
-        logger.info(
-            "Launching GUI",
-            extra={
-                "port": port,
-                "gui_path": str(gui_path),
-                "enhanced_requested": enhanced,
-                "enhanced_active": using_enhanced_gui,
-            },
-        )
-    _console_print(message)
+    logger.info("Launching GUI", extra={"port": port, "gui_path": str(gui_path)})
+    _console_print("🚀 Launching Pickleball Scheduler Application...")
     _console_print(f"🌐 Opening at: http://localhost:{port}")
 
     try:
-        safe_gui_path = InputSanitizer.sanitize_file_path(str(gui_path), str(project_root))
-        if not isinstance(safe_gui_path, str) or not safe_gui_path:
-            safe_gui_path = str(gui_path)
-
         # The server runs until it is stopped, so no timeout: it ends with Ctrl+C.
         subprocess.run(  # noqa: S603
-            [sys.executable, "-m", "streamlit", "run", safe_gui_path, "--server.port", port],
+            [sys.executable, "-m", "streamlit", "run", str(gui_path), "--server.port", port],
             check=True,
         )
     except KeyboardInterrupt:
         # Ctrl+C reaches Streamlit as well, which stops the server.
         _console_print("\n👋 Pickleball Scheduler stopped.")
-    except SecurityError as e:
-        _handle_error(e, f"🚫 Security error: {e}", {"port": port, "gui_path": str(gui_path)}, 1)
     except subprocess.CalledProcessError as e:
         _handle_error(e, f"❌ Failed to launch streamlit: {e}", {"port": port, "return_code": e.returncode}, 1)
     except OSError as e:
@@ -218,25 +135,20 @@ def launch_cli() -> None:
                 _console_print("  • Press Enter when done adding players")
                 _console_print("  • Type 'h' or 'help' for this help message")
                 _console_print("  • Type 'g' or 'gui' to launch GUI")
-                _console_print("  • Type 'e' or 'enhanced' for enhanced GUI")
                 _console_print("  • Type 't' or 'test' to run tests")
                 _console_print("  • Type 'q' or 'quit' to exit")
                 _console_print("  • Minimum 4 players required\n")
                 continue
             if player_name.lower() in ["g", "gui"]:
                 _console_print("🚀 Launching GUI...")
-                launch_gui(enhanced=False)
-                return
-            if player_name.lower() in ["e", "enhanced"]:
-                _console_print("🚀 Launching enhanced GUI...")
-                launch_gui(enhanced=True)
+                launch_gui()
                 return
             if player_name.lower() in ["t", "test"]:
                 _console_print("🧪 Running tests...")
                 run_tests()
                 return
             # Check for single letter commands that might be invalid
-            valid_commands = ["g", "e", "t", "h", "q"]
+            valid_commands = ["g", "t", "h", "q"]
             is_single_char = len(player_name) == 1
             if is_single_char and player_name.lower() not in valid_commands:
                 _console_print(f"❌ Unknown command '{player_name}'. Type 'h' for help.")
@@ -306,16 +218,14 @@ def launch_cli() -> None:
 
     except KeyboardInterrupt:
         _console_print("\n\n👋 Goodbye!")
-        if logger:
-            logger.info("CLI operation cancelled by user")
+        logger.info("CLI operation cancelled by user")
     except (ImportError, AttributeError, RuntimeError, Exception) as e:
         _handle_error(e, f"❌ Scheduler failed with error: {e}", {"component": "cli_launcher"}, 1)
 
 
 def run_tests() -> bool:
     """Run validation tests using pytest."""
-    if logger:
-        logger.info("Starting validation tests")
+    logger.info("Starting validation tests")
 
     _console_print("🧪 Running validation tests...")
 
@@ -331,13 +241,11 @@ def run_tests() -> bool:
 
         if result.returncode == 0:
             _console_print("✅ All tests passed!")
-            if logger:
-                logger.info("All validation tests passed")
+            logger.info("All validation tests passed")
             return True
 
         _console_print(f"❌ Tests failed with return code {result.returncode}")
-        if logger:
-            logger.error(f"Tests failed with return code {result.returncode}")
+        logger.error(f"Tests failed with return code {result.returncode}")
         return False
 
     except subprocess.TimeoutExpired as e:
@@ -349,9 +257,8 @@ def run_tests() -> bool:
 
 
 def main() -> None:
-    """Main entry point with enhanced multi-algorithm support."""
-    if logger:
-        logger.info("Main entry point called", extra={"command_args": sys.argv})
+    """Main entry point."""
+    logger.info("Main entry point called", extra={"command_args": sys.argv})
 
     try:
         if len(sys.argv) > 1:
@@ -361,19 +268,17 @@ def main() -> None:
             elif arg == "--test":
                 sys.exit(0 if run_tests() else 1)
             elif arg == "--gui":
-                launch_gui(enhanced=False)
-            elif arg == "--enhanced":
-                launch_gui(enhanced=True)
+                launch_gui()
             elif arg == "--help":
                 _console_print(__doc__)
                 sys.exit(0)
             else:
                 _console_print(f"Unknown argument: {arg}")
-                _console_print("Available options: --gui, --enhanced, --cli, --test, --help")
+                _console_print("Available options: --gui, --cli, --test, --help")
                 sys.exit(1)
         else:
             _console_print("🎾 Pickleball Scheduler V2\n" + "=" * 30 + "\nLaunching GUI...")
-            launch_gui(enhanced=False)
+            launch_gui()
 
     except (ImportError, OSError, RuntimeError) as e:
         _handle_error(e, f"❌ Critical error: {e}", {"operation": "main"}, 1)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 import time
 from collections import Counter, defaultdict
-from typing import Callable, Sequence, cast
+from typing import Callable, Collection, Sequence, cast
 
 try:
     from src.algorithms.scheduler_metrics import GameTuple, round_signature
@@ -457,32 +457,56 @@ def apply_targeted_repairs(
     return current_schedule
 
 
-def sitout_streak_key(sitting_out: Sequence[int]) -> tuple[int, int]:
+def _sitout_runs(runs: list[int], mask: int) -> list[int]:
+    """The sit-out runs after one more round whose sitters are mask.
+
+    runs[k] is a bit mask of the players who sat out each of the last k + 1
+    rounds; each entry is a subset of the one before, so the list ends at
+    the first empty one.
+    """
+    runs = [mask] + [run & mask for run in runs]
+    while runs and not runs[-1]:
+        runs.pop()
+    return runs
+
+
+def _runs_after(preceding: Sequence[int]) -> list[int]:
+    """The sit-out runs left by the rounds in preceding, oldest first."""
+    runs: list[int] = []
+    for mask in preceding:
+        runs = _sitout_runs(runs, mask)
+    return runs
+
+
+def sitout_streak_key(sitting_out: Sequence[int], preceding: Sequence[int] = ()) -> tuple[int, int]:
     """Score how rounds in this order bunch up sit-outs; lower is better.
 
     sitting_out holds, per round, a bit mask of the players who sit it out.
     Returns (most rounds in a row any one player sits out, how many times a
     player sits out two rounds in a row), compared in that order.
+
+    preceding holds the same masks for rounds already played before these,
+    oldest first. A sit-out streak that runs on from them into sitting_out
+    counts in full, but streaks that end inside preceding count for nothing:
+    no order of sitting_out can change them.
     """
     longest = back_to_back = 0
-    # runs[k]: the players who sat out each of the last k + 1 rounds; each
-    # entry is a subset of the one before, so the list ends at the first empty one.
-    runs: list[int] = []
+    runs = _runs_after(preceding)
     for mask in sitting_out:
-        runs = [mask] + [run & mask for run in runs]
-        while runs and not runs[-1]:
-            runs.pop()
+        runs = _sitout_runs(runs, mask)
         longest = max(longest, len(runs))
         if len(runs) > 1:
             back_to_back += bin(runs[1]).count("1")
     return longest, back_to_back
 
 
-def _exact_round_order(sitting_out: Sequence[int], bound: tuple[int, int], node_limit: int) -> list[int] | None:
+def _exact_round_order(
+    sitting_out: Sequence[int], bound: tuple[int, int], node_limit: int, preceding: Sequence[int] = ()
+) -> list[int] | None:
     """Depth-first branch and bound over round orders: the first order found
-    whose sitout_streak_key beats bound, then better ones, until the search
-    is exhausted or has visited node_limit partial orders. Returns the best
-    order found, or None if none beat bound."""
+    whose sitout_streak_key (after preceding) beats bound, then better ones,
+    until the search is exhausted or has visited node_limit partial orders.
+    Returns the best order found, or None if none beat bound."""
     best: list = [bound, None]
     nodes = 0
 
@@ -500,9 +524,7 @@ def _exact_round_order(sitting_out: Sequence[int], bound: tuple[int, int], node_
             if index in order or mask in tried:
                 continue
             tried.add(mask)  # rounds with the same sitters are interchangeable
-            next_runs = [mask] + [run & mask for run in runs]
-            while next_runs and not next_runs[-1]:
-                next_runs.pop()
+            next_runs = _sitout_runs(runs, mask)
             order.append(index)
             extend(
                 order,
@@ -512,12 +534,23 @@ def _exact_round_order(sitting_out: Sequence[int], bound: tuple[int, int], node_
             )
             order.pop()
 
-    extend([], [], 0, 0)
+    extend([], _runs_after(preceding), 0, 0)
     return best[1]
 
 
+def _players_mask(players: Collection[object], bits: dict[str, int]) -> int:
+    """A bit mask of the players named; anyone not in bits is left out."""
+    mask = 0
+    for player in players:
+        mask |= bits.get(str(player), 0)
+    return mask
+
+
 def order_rounds_for_rest(
-    schedule: list[list[GameTuple]], players: Sequence[str], node_limit: int = 100_000
+    schedule: list[list[GameTuple]],
+    players: Sequence[str],
+    node_limit: int = 100_000,
+    preceding_sit_outs: Sequence[Collection[str]] = (),
 ) -> list[list[GameTuple]]:
     """Reorder whole rounds so nobody sits out more rounds in a row than needed.
 
@@ -530,6 +563,14 @@ def order_rounds_for_rest(
     improves the key; then, if someone still sits out twice in a row, a
     branch and bound capped at node_limit partial orders looks for a strictly
     better order. Both are deterministic, and ties keep the earlier order.
+
+    preceding_sit_outs names who sat out each round played before schedule,
+    oldest first (a mid-session replan's locked rounds), so a sit-out streak
+    is measured across that boundary: a player who sat out the last of those
+    rounds is not sat out again in the first round here when another order
+    of these rounds does better. Names not in players (someone who has left)
+    are ignored, and streaks that ended before schedule starts count for
+    nothing, since no order of these rounds can change them.
     """
     bits = {str(player): 1 << index for index, player in enumerate(players)}
     everyone = (1 << len(bits)) - 1
@@ -537,12 +578,12 @@ def order_rounds_for_rest(
     for round_games in schedule:
         playing = 0
         for game in round_games:
-            for player in game:
-                playing |= bits.get(str(player), 0)
+            playing |= _players_mask(game, bits)
         sitting_out.append(everyone & ~playing)
+    preceding = [_players_mask(sitters, bits) for sitters in preceding_sit_outs]
 
     order = list(range(len(schedule)))
-    best = sitout_streak_key(sitting_out)
+    best = sitout_streak_key(sitting_out, preceding)
     # No one sitting out two rounds in a row means no streak can get shorter.
     improved = best[1] > 0
     while improved:
@@ -559,9 +600,9 @@ def order_rounds_for_rest(
                     swapped[i], swapped[j] = swapped[j], swapped[i]
                     candidates.append(swapped)
                 for candidate in candidates:
-                    key = sitout_streak_key([sitting_out[index] for index in candidate])
+                    key = sitout_streak_key([sitting_out[index] for index in candidate], preceding)
                     if key < best:
                         order, best, improved = candidate, key, True
     if best[1] > 0:
-        order = _exact_round_order(sitting_out, best, node_limit) or order
+        order = _exact_round_order(sitting_out, best, node_limit, preceding) or order
     return [list(schedule[index]) for index in order]

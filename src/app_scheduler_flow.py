@@ -24,6 +24,11 @@ except ImportError:
     from app_schedule_helpers import escape_markdown
 
 try:
+    from src.utils.schedule_shapes import extract_game_teams, games_in_round
+except ImportError:
+    from utils.schedule_shapes import extract_game_teams, games_in_round
+
+try:
     from src.widget_state import (
         apply_deferred_widget_values,
         defer_widget_value,
@@ -130,6 +135,24 @@ def split_schedule_at_round(schedule: list, played_rounds: int) -> tuple[list, i
     """
     played_rounds = max(0, min(played_rounds, len(schedule)))
     return list(schedule[:played_rounds]), len(schedule) - played_rounds
+
+
+def sit_outs_by_round(rounds: Sequence[Any], roster_by_round: Sequence[Sequence[str]]) -> list[set[str]]:
+    """Who sat out each round: its roster minus everyone in one of its games.
+
+    rounds and roster_by_round run in step (a mid-session replan's locked
+    rounds and their rosters), so a player who left before a round is not
+    counted as sitting it out, and one who joined later is not either.
+    """
+    sit_outs: list[set[str]] = []
+    for round_data, roster in zip(rounds, roster_by_round):
+        on_court: set[str] = set()
+        for game in games_in_round(round_data):
+            team1, team2, _court = extract_game_teams(game)
+            on_court.update(str(player) for player in team1)
+            on_court.update(str(player) for player in team2)
+        sit_outs.append({str(player) for player in roster} - on_court)
+    return sit_outs
 
 
 def splice_schedules(locked_rounds: list, new_rounds: list) -> list:
@@ -296,6 +319,48 @@ def constraint_pressure_warnings(
             )
 
     return warnings
+
+
+# The round search's time budget is the max runtime clamped to this range (see
+# GeneticPickleballScheduler._search_arrangements), and the Max generation time
+# widget stops at the top of it.
+ROUND_SEARCH_MIN_SECONDS = 20
+MAX_GENERATION_TIME_SECONDS = 300
+
+
+def constraint_violation_warning(
+    violations: int, budget_reached: bool, *, replan: bool = False, max_time: float | None = None
+) -> str:
+    """The warning for a schedule that breaks a do-not-pair/do-not-oppose constraint.
+
+    When no round in the search meets every constraint, the GA keeps the
+    unconstrained arrangement pool (with penalties), and the result's
+    round_search_budget_reached says how that search ended. False: it visited
+    every arrangement and none works, so no schedule can meet the constraints
+    with this roster and court count. True: it ran out of budget before it
+    could tell, which proves nothing - a longer max runtime searches further,
+    unless max_time is already at the widget's ceiling, when the only remedy
+    left is a different roster, court count or constraint. Each needs its own
+    wording: blaming the constraints for a search that merely ran out of time
+    sends the user off loosening constraints that may be fine.
+    """
+    where = "the replanned rounds" if replan else "this schedule"
+    prefix = f"⚠️ {violations} game(s) in {where} violate a requested 'do not pair' or 'do not oppose' constraint"
+    scope = "with the remaining players and courts" if replan else "with these players and courts"
+    remedy = "loosen a constraint or change the roster or court count"
+    if not budget_reached:
+        return (
+            f"{prefix} - the round search checked every arrangement and none meets every constraint {scope}; {remedy}."
+        )
+    ran_out = f"{prefix} - the round search ran out of time before it could tell whether they can all be met {scope}"
+    if max_time is not None and max_time >= MAX_GENERATION_TIME_SECONDS:
+        return f"{ran_out}, even at the longest max runtime; {remedy}."
+    if max_time is not None and max_time < ROUND_SEARCH_MIN_SECONDS:
+        return (
+            f"{ran_out}; a longer max runtime ({ROUND_SEARCH_MIN_SECONDS} s or more, up to "
+            f"{MAX_GENERATION_TIME_SECONDS} s) searches further."
+        )
+    return f"{ran_out}; a longer max runtime (up to {MAX_GENERATION_TIME_SECONDS} s) searches further."
 
 
 # Characters shown with no width at all, so a name holding one looks just like
@@ -1142,9 +1207,11 @@ def _handle_generate_schedule_click(
             constraint_violations = result.get("constraint_violations", 0)
             if constraint_violations:
                 warnings.append(
-                    f"⚠️ {constraint_violations} game(s) in this schedule violate a requested "
-                    "'do not pair' or 'do not oppose' constraint - your constraints may not be "
-                    "fully satisfiable together with this many players/courts/rounds."
+                    constraint_violation_warning(
+                        constraint_violations,
+                        bool(result.get("round_search_budget_reached", False)),
+                        max_time=max_time,
+                    )
                 )
 
             metrics = schedule_analytics_cls.calculate_fairness_metrics(
@@ -1554,11 +1621,11 @@ def render_main_scheduler_tab(
 
     with col3:
         suggested_max_time = suggest_max_generation_time(len(players), total_constraints)
-        seed_widget_choice(st_module.session_state, MAX_TIME_KEY, suggested_max_time, 10, 300)
+        seed_widget_choice(st_module.session_state, MAX_TIME_KEY, suggested_max_time, 10, MAX_GENERATION_TIME_SECONDS)
         max_time = st_module.number_input(
             "Max generation time (seconds):",
             min_value=10,
-            max_value=300,
+            max_value=MAX_GENERATION_TIME_SECONDS,
             key=MAX_TIME_KEY,
             help=(
                 f"{suggested_max_time} seconds is suggested for {len(players)} players and {total_constraints} "
@@ -1827,7 +1894,9 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
     The replanned rounds are optimized for fairness among themselves only; they
     do not account for who already played together in the locked rounds, since
     that would require the scheduler's fitness function to accept pre-existing
-    partner/opponent/game counts, which it does not currently support.
+    partner/opponent/game counts, which it does not currently support. Their
+    order does look back: it carries on from who sat out the locked rounds, so
+    a sit-out streak does not run on across the boundary unnecessarily.
 
     A replan runs for up to max_time, the "Max generation time" the user set
     under Schedule Settings.
@@ -1998,6 +2067,12 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
                                 pair_constraints=pair_constraints,
                                 oppose_constraints=oppose_constraints,
                             )
+                        # Who sat out each locked round, so the new rounds are
+                        # ordered to carry on from the last one: a player who
+                        # sat out the last round played is not sat out again
+                        # in the first replanned round when another order of
+                        # the new rounds avoids it (first-review finding 56).
+                        scheduler.preceding_sit_outs = sit_outs_by_round(locked_rounds, locked_roster_by_round)
                         with counted_generation(st_module):
                             result = scheduler.generate_schedule(max_time=max_time, progress_callback=_on_progress)
                     except Exception:
@@ -2020,9 +2095,12 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
                 replan_constraint_violations = result.get("constraint_violations", 0)
                 if replan_constraint_violations:
                     replan_warnings.append(
-                        f"⚠️ {replan_constraint_violations} game(s) in the replanned rounds violate a "
-                        "requested 'do not pair' or 'do not oppose' constraint - your constraints may "
-                        "not be fully satisfiable with the remaining players/courts/rounds."
+                        constraint_violation_warning(
+                            replan_constraint_violations,
+                            bool(result.get("round_search_budget_reached", False)),
+                            replan=True,
+                            max_time=max_time,
+                        )
                     )
                     st_module.warning(replan_warnings[-1])
 

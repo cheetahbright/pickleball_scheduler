@@ -10,6 +10,7 @@ import logging
 import re
 import sqlite3
 import tempfile
+import weakref
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
@@ -41,6 +42,11 @@ logger = logging.getLogger(__name__)
 # A game_scores row that records an actual result. 0-0 is excluded because no
 # pickleball game ends 0-0: those rows were written by an earlier "Save Scores"
 # that stored every unplayed game as 0-0, and must not count as played ties.
+# This is the SQL half of the test. A row that passes it can still be damaged
+# (a text score, a team cell that isn't a list of names), which only Python
+# can tell, so every reader also applies _scored_row to the rows it returns -
+# the Leaderboard, the ELO replay and the replan guard must agree on which
+# games have a result.
 def _result_row_condition(prefix: str) -> str:
     return (
         f"{prefix}team1_score IS NOT NULL AND {prefix}team2_score IS NOT NULL "
@@ -51,6 +57,60 @@ def _result_row_condition(prefix: str) -> str:
 # A module constant with no input in it, so Bandit's B608 (SQL injection) is
 # suppressed where queries splice it in; their values are all bound as ?.
 _RESULT_ROW_SQL = _result_row_condition("gs.")
+
+
+def _team_cells(team1_json, team2_json) -> tuple[Any, Any] | None:
+    """A game_scores row's two team cells read as JSON, or None if either isn't JSON.
+
+    The schema can't enforce it (the cells are TEXT), so a restored backup or
+    a hand edit can leave a cell that isn't JSON at all. Every reader of
+    game_scores parses its team cells here, so they all skip the same rows.
+    """
+    try:
+        return json.loads(team1_json), json.loads(team2_json)
+    except (TypeError, ValueError, RecursionError):  # not JSON, not even text, or nested too deep
+        return None
+
+
+def _scored_row(team1_json, team2_json, team1_score, team2_score) -> tuple[List[str], List[str], int, int] | None:
+    """The (team1, team2, team1_score, team2_score) a game_scores row records, or None if the row is damaged.
+
+    The schema can't enforce it (the team cells are TEXT, and SQLite keeps a
+    text score in an INTEGER column as text), so a restored backup or a hand
+    edit can leave a team cell that isn't JSON, or is JSON of the wrong shape
+    ('null', '7', '[]', '[1, 2]', '[["A"]]'), or a score of 'abc'. Each of
+    those used to raise somewhere past json.loads - and one such row took
+    down the whole Leaderboard tab and everything drawn after it.
+    """
+    teams = _team_cells(team1_json, team2_json)
+    if teams is None:
+        return None
+    team1, team2 = teams
+    for team in (team1, team2):
+        if not isinstance(team, list) or not team or not all(isinstance(player, str) for player in team):
+            return None
+    for score in (team1_score, team2_score):
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            return None
+    return team1, team2, team1_score, team2_score
+
+
+def _rounds_with_results(conn: sqlite3.Connection | sqlite3.Cursor, schedule_id: int, from_round: int) -> List[int]:
+    """Round numbers >= from_round whose game_scores rows record a result for this schedule.
+
+    Judged the way the Leaderboard and the ELO replay judge it: a row counts
+    only if it passes _RESULT_ROW_SQL and _scored_row. A damaged row is no
+    result - those readers skip it and the Leaderboard shows its game as not
+    played, with nothing to clear - so the replan guard must not refuse to
+    replace that round as "already scored".
+    """
+    rows = conn.execute(
+        "SELECT gs.round_num, gs.team1_players, gs.team2_players, gs.team1_score, gs.team2_score "
+        "FROM game_scores gs "
+        f"WHERE gs.schedule_id = ? AND gs.round_num >= ? AND {_RESULT_ROW_SQL}",  # nosec B608
+        (schedule_id, from_round),
+    ).fetchall()
+    return sorted({round_num for round_num, *row in rows if _scored_row(*row) is not None})
 
 
 @dataclass(frozen=True)
@@ -242,6 +302,49 @@ def _sheet_names_teams(sheet_teams: Sequence[str], teams: Sequence) -> bool:
     return all(not cell or _team_cell_matches(cell, team) for cell, team in zip(sheet_teams, teams))
 
 
+class _Connection(sqlite3.Connection):
+    """A connection whose close() really releases the database file.
+
+    sqlite3.Connection.close() leaves the file open until every statement a
+    cursor prepared on it is finalized, which only happens when the cursor is
+    closed or garbage-collected. A cursor outlives its `with` block whenever a
+    traceback keeps the frame it was a local of alive - a logged exception's
+    does, for as long as the log record is held (e.g. by a test's log
+    capture). On Windows that open file then can't be deleted. Closing the
+    cursors first means close() finishes the job.
+
+    Only cursors obtained through cursor() are tracked: the C implementations
+    of execute()/executemany()/executescript() create theirs without calling
+    this class's cursor(), and routing them through it turned out to leave an
+    AppTest's data directory undeletable on Windows. HistoryManager only ever
+    uses those shortcuts for throwaway cursors, so nothing holds them.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._cursors: weakref.WeakSet[sqlite3.Cursor] = weakref.WeakSet()
+
+    # The base method is overloaded on an optional cursor factory, which
+    # HistoryManager never passes, so one plain signature can't match both arms.
+    def cursor(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:  # type: ignore[override]
+        cursor = super().cursor(*args, **kwargs)
+        self._cursors.add(cursor)
+        return cursor
+
+    def close(self) -> None:
+        cursors = list(self._cursors)
+        self._cursors.clear()
+        try:
+            for cursor in cursors:
+                try:
+                    cursor.close()
+                except sqlite3.ProgrammingError:
+                    pass  # already closed, or the database went away first
+        finally:
+            # Like the base class, a second close() is a no-op.
+            super().close()
+
+
 class HistoryManager:
     """Manage schedule history and persistence."""
 
@@ -268,7 +371,9 @@ class HistoryManager:
         """Open a connection that commits/rolls back on exit (sqlite3.Connection's
         own context-manager behavior) and is always explicitly closed afterward,
         rather than relying on CPython refcounting to close it."""
-        with closing(sqlite3.connect(self.db_path, timeout=self._BUSY_TIMEOUT_SECONDS)) as raw_conn:
+        with closing(
+            sqlite3.connect(self.db_path, timeout=self._BUSY_TIMEOUT_SECONDS, factory=_Connection)
+        ) as raw_conn:
             raw_conn.execute("PRAGMA journal_mode=WAL")
             with raw_conn as conn:
                 yield conn
@@ -436,18 +541,14 @@ class HistoryManager:
     def rounds_with_results(self, schedule_id: int, from_round: int) -> List[int] | None:
         """Round numbers >= from_round that have a recorded result for this schedule.
 
-        Returns None if the scores can't be read, so callers can refuse to
-        act rather than assume there are none.
+        A result is what the Leaderboard counts as one (see _rounds_with_results),
+        so a damaged row never blocks a replan of a round the Leaderboard shows
+        as unplayed. Returns None if the scores can't be read, so callers can
+        refuse to act rather than assume there are none.
         """
         try:
             with self._connect() as conn:
-                rows = conn.execute(
-                    "SELECT DISTINCT gs.round_num FROM game_scores gs "
-                    f"WHERE gs.schedule_id = ? AND gs.round_num >= ? AND {_RESULT_ROW_SQL} "  # nosec B608
-                    "ORDER BY gs.round_num",
-                    (schedule_id, from_round),
-                ).fetchall()
-            return [row[0] for row in rows]
+                return _rounds_with_results(conn, schedule_id, from_round)
         except Exception:
             logger.exception("Failed to read scored rounds for schedule_id=%s", schedule_id)
             return None
@@ -475,16 +576,17 @@ class HistoryManager:
         - "changed": the stored schedule no longer matches previous_schedule,
           the one this replan was computed from (another session replanned
           or the row was otherwise rewritten since this session loaded it);
-        - "scored": a round being replaced now has a recorded result.
+        - "scored": a round being replaced now has a recorded result (judged
+          as the Leaderboard judges it, see _rounds_with_results).
 
-        Score rows for the replaced rounds that hold no result (blank, or the
-        0-0 an older Save Scores wrote for every unplayed game) are deleted,
-        since the games they name no longer exist. The replanned rounds' pairs
-        are added to the partner_history table, which keeps the replaced
-        rounds' pairs too, because it doesn't record which schedule a pair
-        came from. Weekly Partner History doesn't read that table:
-        get_weekly_partners works the pairs out from the schedules, so the
-        replaced rounds leave it.
+        Score rows for the replaced rounds, which by then hold no result
+        (blank, the 0-0 an older Save Scores wrote for every unplayed game, or
+        damaged), are deleted, since the games they name no longer exist. The
+        replanned rounds' pairs are added to the partner_history table, which
+        keeps the replaced rounds' pairs too, because it doesn't record which
+        schedule a pair came from. Weekly Partner History doesn't read that
+        table: get_weekly_partners works the pairs out from the schedules, so
+        the replaced rounds leave it.
         """
         try:
             serializable_schedule = serialize_schedule_for_json(schedule)
@@ -510,15 +612,7 @@ class HistoryManager:
                     logger.warning("Replan not saved: schedule_id=%s changed since it was loaded", schedule_id)
                     return ReplanSaveResult("changed")
 
-                scored_rounds = tuple(
-                    row[0]
-                    for row in cursor.execute(
-                        "SELECT DISTINCT gs.round_num FROM game_scores gs "
-                        f"WHERE gs.schedule_id = ? AND gs.round_num >= ? AND {_RESULT_ROW_SQL} "  # nosec B608
-                        "ORDER BY gs.round_num",
-                        (schedule_id, replanned_from_round),
-                    ).fetchall()
-                )
+                scored_rounds = tuple(_rounds_with_results(cursor, schedule_id, replanned_from_round))
                 if scored_rounds:
                     logger.warning("Replan not saved: schedule_id=%s rounds %s have scores", schedule_id, scored_rounds)
                     return ReplanSaveResult("scored", scored_rounds)
@@ -545,9 +639,12 @@ class HistoryManager:
                         schedule_id,
                     ),
                 )
+                # The check above found no result from this round on, so every
+                # row left there is a blank, 0-0 or damaged one naming a game the
+                # replan has just removed: delete them all, in this same
+                # transaction, by the judgement the check used.
                 cursor.execute(
-                    "DELETE FROM game_scores WHERE schedule_id = ? AND round_num >= ? "
-                    f"AND NOT ({_result_row_condition('')})",  # nosec B608
+                    "DELETE FROM game_scores WHERE schedule_id = ? AND round_num >= ?",
                     (schedule_id, replanned_from_round),
                 )
                 try:
@@ -780,6 +877,15 @@ class HistoryManager:
     def get_game_scores(self, schedule_id: int) -> List[Dict] | None:
         """Return every recorded score for a schedule, ordered by round then court.
 
+        A row whose team cell isn't JSON (a restored backup, a hand edit) is
+        skipped with a warning, as get_leaderboard and get_all_scored_games
+        skip it, rather than failing the whole read: that made the Leaderboard
+        tab's score entry for the schedule read-only, blaming a file lock, with
+        no way in the app to replace the row. Rows holding JSON of the wrong
+        shape, or a text score, are returned as stored - the score entry and
+        the Excel export read those for themselves (app_tabs._recorded_for_game,
+        app_schedule_helpers.recorded_result) and offer to remove them.
+
         Returns None if the scores can't be read, so the UI can say so rather
         than show the games as unplayed.
         """
@@ -792,13 +898,30 @@ class HistoryManager:
                 )
                 columns = [desc[0] for desc in cursor.description]
                 rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
-            for row in rows:
-                row["team1_players"] = json.loads(row["team1_players"])
-                row["team2_players"] = json.loads(row["team2_players"])
-            return rows
         except Exception:
             logger.exception("Failed to read game scores for schedule_id=%s", schedule_id)
             return None
+
+        scores: List[Dict] = []
+        for row in rows:
+            teams = _team_cells(row["team1_players"], row["team2_players"])
+            if teams is None:
+                # One damaged row must not disable score entry for the whole
+                # schedule (or drop the Scores sheet from its Excel download) -
+                # skip it and keep returning the rest. Saving that game's score
+                # replaces the row.
+                logger.warning(
+                    "Skipping damaged game_scores row id=%s (schedule_id=%s round=%s court=%s): "
+                    "a team cell isn't JSON",
+                    row["id"],
+                    schedule_id,
+                    row["round_num"],
+                    row["court"],
+                )
+                continue
+            row["team1_players"], row["team2_players"] = teams
+            scores.append(row)
+        return scores
 
     def get_leaderboard(self) -> List[Dict] | None:
         """Aggregate wins/losses/win-rate per player across every recorded score.
@@ -812,7 +935,8 @@ class HistoryManager:
             with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT gs.team1_players, gs.team2_players, gs.team1_score, gs.team2_score "
+                    "SELECT gs.team1_players, gs.team2_players, gs.team1_score, gs.team2_score, "
+                    "gs.schedule_id, gs.round_num, gs.court "
                     "FROM game_scores gs JOIN schedule_history sh ON sh.id = gs.schedule_id "
                     f"WHERE {_RESULT_ROW_SQL} "  # nosec B608
                     "AND sh.deleted_at IS NULL"
@@ -827,15 +951,19 @@ class HistoryManager:
         def _player_stats(name: str) -> Dict[str, int]:
             return stats.setdefault(name, {"wins": 0, "losses": 0, "games_played": 0})
 
-        for team1_json, team2_json, team1_score, team2_score in rows:
-            try:
-                team1 = json.loads(team1_json)
-                team2 = json.loads(team2_json)
-            except (TypeError, json.JSONDecodeError):
-                # One corrupted row must not take down the whole leaderboard -
+        for *row, schedule_id, round_num, court in rows:
+            scored = _scored_row(*row)
+            if scored is None:
+                # One damaged row must not take down the whole leaderboard -
                 # skip it and keep aggregating the rest.
-                logger.exception("Skipping unparseable leaderboard row")
+                logger.warning(
+                    "Skipping damaged game_scores row (schedule_id=%s round=%s court=%s) in the leaderboard",
+                    schedule_id,
+                    round_num,
+                    court,
+                )
                 continue
+            team1, team2, team1_score, team2_score = scored
 
             for player in team1 + team2:
                 _player_stats(player)["games_played"] += 1
@@ -882,7 +1010,8 @@ class HistoryManager:
             with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT gs.team1_players, gs.team2_players, gs.team1_score, gs.team2_score, gs.recorded_at "
+                    "SELECT gs.team1_players, gs.team2_players, gs.team1_score, gs.team2_score, gs.recorded_at, "
+                    "gs.schedule_id, gs.round_num, gs.court "
                     "FROM game_scores gs JOIN schedule_history sh ON sh.id = gs.schedule_id "
                     f"WHERE {_RESULT_ROW_SQL} "  # nosec B608
                     "AND sh.deleted_at IS NULL "
@@ -894,15 +1023,19 @@ class HistoryManager:
             return None
 
         games = []
-        for team1_json, team2_json, team1_score, team2_score, recorded_at in rows:
-            try:
-                team1_players = json.loads(team1_json)
-                team2_players = json.loads(team2_json)
-            except (TypeError, json.JSONDecodeError):
-                # One corrupted row must not take down ELO recompute for
+        for *row, recorded_at, schedule_id, round_num, court in rows:
+            scored = _scored_row(*row)
+            if scored is None:
+                # One damaged row must not take down ELO recompute for
                 # every other schedule - skip it and keep replaying the rest.
-                logger.exception("Skipping unparseable scored-game row")
+                logger.warning(
+                    "Skipping damaged game_scores row (schedule_id=%s round=%s court=%s) in the ELO replay",
+                    schedule_id,
+                    round_num,
+                    court,
+                )
                 continue
+            team1_players, team2_players, team1_score, team2_score = scored
             games.append(
                 {
                     "team1_players": team1_players,

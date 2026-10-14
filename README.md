@@ -10,10 +10,7 @@
 - **History Tracking**: Database storage, weekly partner history, soft-delete with undo
 - **Leaderboard & Ratings**: Score entry (with CSV bulk import), all-time win/loss standings, and ELO ratings
 - **Player Management**: Custom presets, skill ratings
-- **Mobile-Friendly & Installable**: Responsive layout and PWA support
-- **Professional Quality**: Security, testing, and development standards
-
-**Perfect for**: Individuals, clubs, leagues, tournaments - any pickleball group!
+- **Mobile-Friendly & Installable**: Responsive layout and PWA support. On Streamlit Community Cloud the host page carries its own manifest and wraps the app inside it, so the browser's automatic "Install app" prompt (if any) is the host's, not the app's: install from the browser menu ("Add to Home Screen" / "Install app") instead. Running it yourself (`python -m streamlit run src/main_app.py`) gives the real prompt.
 
 > ⚠️ **The hosted app loses all its saved data on every reboot.** On Streamlit Community Cloud the schedule
 > history, scores, ratings and settings live in local files that are not in the repo, so each reboot (which every
@@ -150,40 +147,15 @@ See `SECURITY.md` for what is and isn't enforced.
 
 - **Error Handling**: Graceful failure with user-friendly messages
 - **Performance**: Optimized for fast schedule generation
-- **Logging**: Structured logging for debugging
+- **Logging**: Console logging (level, logger name, message) for debugging
 - **Backup**: Manual full backup and restore in the Configuration tab; nothing is backed up automatically
 
 ## 🏗️ **Architecture**
 
 ### **Application Structure**
 
-```
-src/
-├── main_app.py              # Main Streamlit application facade
-├── app_scheduler_flow.py    # Main Scheduler tab: roster, generation, mid-session replan
-├── app_tabs.py              # Analytics, History, Configuration, Player Management,
-│                             # Leaderboard and Stress Test tabs
-├── app_schedule_helpers.py  # Schedule display and exports
-├── app_analytics.py         # Plotly charts
-├── app_stress_test.py       # The Stress Test tab's sweep over player, round and constraint combinations
-├── app_managers.py          # Compatibility facade that re-exports managers/
-├── simple_auth.py           # Optional shared-password gate
-├── mobile_styles.py         # Mobile-responsive CSS
-├── pwa.py                   # PWA manifest/service-worker injection
-├── rating_elo.py            # Pure ELO math
-├── algorithms/
-│   ├── constructive_scheduler.py # Instant fixed designs (constructive_designs.py)
-│   ├── genetic_scheduler.py # Genetic algorithm, with do-not-pair/oppose constraints
-│   ├── scheduler_*.py       # GA evolution loop, repair passes, metrics and reporting
-│   ├── arrangement_generator.py # Round arrangements the GA searches over
-│   ├── cpsat_scheduler.py   # Exact OR-Tools solver, benchmark only
-│   └── constraint_model.py  # Scoring model for scripts/algorithm_benchmark.py; not used by the app
-├── managers/                # HistoryManager, ConfigurationManager,
-│                             # SkillRatingManager, EloRatingManager, PlayerManager
-├── utils/                   # Analytics, feasibility, and helper utilities
-├── gui/                     # Compatibility entry points
-└── main.py                  # CLI and launcher
-```
+See `docs/ARCHITECTURE.md` for the layout of `src/` (entry points, UI layer, algorithms, managers, utilities)
+and how the pieces fit together.
 
 ### **Data Management**
 
@@ -223,43 +195,11 @@ grows past it, raise `server.maxUploadSize` before the reboot that needs the res
 - **SkillRatingManager / EloRatingManager**: Player skill and ELO ratings
 - **PlayerManager**: The Player Management tab's substitution panel (not yet used by generation)
 
-## 📊 **What Makes This Different**
-
-### **Balanced Approach**
-
-- **Not too simple**: More than basic scheduling - includes analytics and history
-- **Not too complex**: No enterprise bloat - just useful features
-- **Just right**: Perfect balance for real-world pickleball groups
-
-### **User-Focused**
-
-- **Intuitive Interface**: Clean, tabbed layout with logical flow
-- **Helpful Feedback**: Clear error messages and success indicators
-- **Export Ready**: Professional CSV output for printing or sharing
-
-### **Developer-Friendly**
-
-- **Clean Code**: Well-documented, modular, testable
-- **Security First**: Built-in protection against common vulnerabilities
-- **Maintainable**: Professional development practices throughout
-
-## 🎾 **Perfect for Pickleball**
-
-Whether you're organizing games for a few friends or managing a club with dozens of players, this scheduler provides:
-
-- **Fair Game Distribution**: Advanced algorithms ensure everyone plays equally
-- **Partner Variety**: Smart pairing prevents the same people always playing together
-- **Historical Insight**: See who partnered whom in recent weeks
-- **Flexibility**: Handle late arrivals and early leavers, and do-not-pair/oppose constraints
-- **Professional Output**: Clean, printable schedules ready for game day
-
 ## 📞 **Support**
 
-- **Documentation**: Comprehensive guides in `/docs` folder
 - **Issues**: Report bugs via GitHub Issues
 - **Security**: See `SECURITY.md` for vulnerability reporting
 - **Contributing**: See `CONTRIBUTING.md` for development guidelines
-- **Backlog**: See `docs/REPO_REVAMP_TODO.md` for the living revamp plan
 
 ---
 
