@@ -19,3 +19,8 @@ idna>=3.15
 pyarrow>=23.0.1
 gitpython>=3.1.60
 click>=8.3.3
+
+# Encrypted cloud copy of the full backup (src/managers/remote_backup.py): the Postgres driver with its
+# bundled libpq (TLS with sslrootcert=system needs libpq 16 or newer) and AES-256-GCM.
+psycopg[binary]>=3.2.0
+cryptography>=46.0.0

@@ -263,6 +263,10 @@ class GeneticPickleballScheduler:
         # sitters, so order_rounds_for_rest measures sit-out streaks across
         # that boundary. No fitness term reads it.
         self.preceding_sit_outs: Sequence[Collection[str]] = ()
+        # Offsets added to players' games before the games range is taken: see
+        # the baseline_games property. Empty means plain games played.
+        self._baseline_games: Dict[str, int] = {}
+        self._game_offsets: Tuple[int, ...] = ()
 
         # num_courts is always the caller's explicit choice (physical courts
         # available cannot be inferred from player count alone - a club with
@@ -325,20 +329,7 @@ class GeneticPickleballScheduler:
                 for x in getattr(p, "do_not_oppose", []) or []:
                     self.do_not_oppose_map[name].add(str(x))
 
-        feasibility: Mapping[str, Any] = ScheduleFeasibilityAnalyzer.calculate_theoretical_minimums(
-            self.num_players,
-            self.num_courts,
-            self.num_rounds,
-        )
-
-        # Proven lower bounds: range0_possible means range 0 isn't ruled out,
-        # and optimal_total_range is the lowest total range any schedule can have.
-        self.feasibility_minimums = feasibility
-        self.range0_possible = bool(feasibility["range_0_possible"])
-        # Not read by the GA itself; kept for callers and diagnostics that report it.
-        self.partner_range0_possible = int(feasibility["min_partner_range"]) == 0
-        self.optimal_partner_range = int(feasibility["min_partner_range"])
-        self.optimal_total_range = int(feasibility["total_theoretical_min"])
+        self._set_proven_bounds()
 
         # Precompute arrangement pool (one round templates)
         search = self._search_arrangements(max_arrangements=400)
@@ -414,6 +405,55 @@ class GeneticPickleballScheduler:
             self._schedule_cache.clear()
             self._partner_repeat_cache.clear()
             self._refresh_arrangement_stats()
+
+    @property
+    def baseline_games(self) -> Mapping[str, int]:
+        """Per-player offsets added to each player's games before the games range is taken.
+
+        Empty (the default) leaves the games range as plain games played. A
+        run that carries on from rounds already played sets minus each
+        player's sit-outs so far: the games range, which the search puts
+        first, is then the range of everyone's sit-outs to date, so the
+        sitters of this run are the players who have sat out least. Players
+        not named have 0. Setting it re-derives the proven bounds that early
+        stops and repairs rely on, and drops every cached evaluation.
+        """
+        return self._baseline_games
+
+    @baseline_games.setter
+    def baseline_games(self, baseline: Mapping[str, int] | None) -> None:
+        roster = set(self._names)
+        offsets: Dict[str, int] = {}
+        for name, offset in (baseline or {}).items():
+            if int(offset) != offset:
+                raise ValueError(f"baseline_games offsets must be whole numbers (got {offset!r} for {name!r})")
+            if str(name) in roster and int(offset) != 0:
+                offsets[str(name)] = int(offset)
+        self._baseline_games = offsets
+        self._game_offsets = tuple(offsets.get(name, 0) for name in self._names) if offsets else ()
+        self._set_proven_bounds()
+        # Every cached fitness was scored against the previous offsets.
+        self._fitness_cache.clear()
+
+    def _set_proven_bounds(self) -> None:
+        """Set the proven lower bounds from the shape and the games offsets.
+
+        range0_possible means range 0 isn't ruled out, and optimal_total_range
+        is the lowest total range any schedule can have. Offsets can only move
+        the games part of that (see min_games_range_with_offsets).
+        """
+        feasibility: Mapping[str, Any] = ScheduleFeasibilityAnalyzer.calculate_theoretical_minimums(
+            self.num_players,
+            self.num_courts,
+            self.num_rounds,
+            self._game_offsets,
+        )
+        self.feasibility_minimums = feasibility
+        self.range0_possible = bool(feasibility["range_0_possible"])
+        # Not read by the GA itself; kept for callers and diagnostics that report it.
+        self.partner_range0_possible = int(feasibility["min_partner_range"]) == 0
+        self.optimal_partner_range = int(feasibility["min_partner_range"])
+        self.optimal_total_range = int(feasibility["total_theoretical_min"])
 
     def _minimum_runtime_before_general_stop(self) -> float:
         """Return the minimum runtime before non-perfect early exits are allowed."""
@@ -540,7 +580,7 @@ class GeneticPickleballScheduler:
         # they can be.
         current_total_range = sum_range_metrics(final_metrics)
         optimal_total_range = self.optimal_total_range
-        games_floor = games_range_floor(final_schedule, self.num_players)
+        games_floor = games_range_floor(final_schedule, self.num_players, self._game_offsets)
         repaired = False
         repair_seconds = 0.0
 
@@ -668,7 +708,7 @@ class GeneticPickleballScheduler:
 
         # Add feasibility analysis
         result["feasibility_analysis"] = ScheduleFeasibilityAnalyzer.assess_quality_with_feasibility(
-            final_metrics, self.num_players, self.num_courts, self.num_rounds
+            final_metrics, self.num_players, self.num_courts, self.num_rounds, self._game_offsets
         )
 
         return result
@@ -754,7 +794,7 @@ class GeneticPickleballScheduler:
         (_round_stats) and round signatures, in the GA's own order (lower is
         better): violations, avoidable duplicate rounds, then games,
         partners, courts and opponents range."""
-        metrics = evaluate_metrics_from_arrangement_stats(round_stats, self._names)
+        metrics = evaluate_metrics_from_arrangement_stats(round_stats, self._names, self._baseline_games)
         return (
             metrics["violations"],
             avoidable_duplicate_rounds_from_signature(signatures, self.minimum_duplicate_rounds),
@@ -982,6 +1022,7 @@ class GeneticPickleballScheduler:
         return evaluate_metrics_from_arrangement_stats(
             [self._arrangement_stats[idx] for idx in individual],
             self._names,
+            self._baseline_games,
         )
 
     @staticmethod
@@ -1141,6 +1182,7 @@ class GeneticPickleballScheduler:
             player_names=self._names,
             do_not_pair_map=self.do_not_pair_map,
             do_not_oppose_map=self.do_not_oppose_map,
+            baseline_games=self._baseline_games,
         )
 
     def _apply_targeted_repairs(
@@ -1164,6 +1206,7 @@ class GeneticPickleballScheduler:
             games_repair=self._repair_games_balance,
             num_players=self.num_players,
             games_max_time=max(max_time * 0.5, self.max_runtime * 0.1),
+            game_offsets=self._game_offsets,
         )
 
     def _repair_games_balance(
@@ -1177,6 +1220,7 @@ class GeneticPickleballScheduler:
             evaluate_metrics=self._evaluate_metrics,
             printer=print,
             clock=getattr(self, "_run_clock", None),
+            baseline_games=self._baseline_games,
         )
 
     def _repair_partner_imbalance(

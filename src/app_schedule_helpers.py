@@ -98,13 +98,19 @@ def compute_round_times(num_rounds: int, start_time: str, end_time: str) -> List
     return [(start + timedelta(minutes=interval * i)).strftime("%I:%M %p").lstrip("0") for i in range(num_rounds)]
 
 
-def validate_schedule_integrity(schedule: Iterable[Any], all_players: Any = None) -> List[str]:
+def validate_schedule_integrity(
+    schedule: Iterable[Any], all_players: Any = None, roster_by_round: Any = None
+) -> List[str]:
     """List what makes a schedule impossible to play, or [] if nothing does.
 
     Checks that every team has two players, that nobody plays twice in one
     round and, when all_players is given, that everyone playing is on it (the
     callers pass everyone in the session, so a replan's joiners and leavers
-    are on it too). Courts and empty rounds are not checked.
+    are on it too). With roster_by_round (each round's roster, as a replan or
+    an arrivals-and-departures plan records it), a player must also be on the
+    roster of the round they play in: someone who has not arrived yet, or has
+    left, is not playable. Rounds it has no roster for fall back to
+    all_players. Courts and empty rounds are not checked.
     """
     roster = {str(p) for p in all_players} if all_players else None
     errors: List[str] = []
@@ -112,6 +118,11 @@ def validate_schedule_integrity(schedule: Iterable[Any], all_players: Any = None
     for round_num, round_data in enumerate(schedule, 1):
         round_playing_players: List[str] = []
         games = round_data.get("games", [])
+        round_roster = (
+            {str(p) for p in roster_by_round[round_num - 1]}
+            if roster_by_round and round_num - 1 < len(roster_by_round)
+            else None
+        )
 
         for game in games:
             team1, team2, court = extract_game_teams(game)
@@ -125,10 +136,11 @@ def validate_schedule_integrity(schedule: Iterable[Any], all_players: Any = None
                     errors.append(
                         f"Round {round_num}, Court {court}: Team {team_number} has {len(team_players)} player(s), not 2"
                     )
-            if roster is not None:
-                for player in team1_players + team2_players:
-                    if player not in roster:
-                        errors.append(f"Round {round_num}, Court {court}: Player '{player}' is not in the player list")
+            for player in team1_players + team2_players:
+                if roster is not None and player not in roster:
+                    errors.append(f"Round {round_num}, Court {court}: Player '{player}' is not in the player list")
+                elif round_roster is not None and player not in round_roster:
+                    errors.append(f"Round {round_num}, Court {court}: Player '{player}' is not on this round's roster")
 
             # Duplicate/overlap checks only ever ran for attribute-style Game
             # objects historically - preserved here rather than silently
@@ -161,7 +173,7 @@ def _round_roster(all_players: Any, roster_by_round: Any, round_num: int) -> Any
     """Return the roster to compare "sitting out" against for a given round.
 
     Mid-session replan splices old-roster rounds with new-roster rounds under
-    one schedule (see splice_schedules in app_scheduler_flow.py), so a single
+    one schedule (see splice_schedules in utils/roster_rounds.py), so a single
     flat all_players list is wrong for either half: it would show players who
     already left as still sitting out, and players who haven't joined yet as
     already sitting out. roster_by_round, when supplied, is a list aligned to
@@ -181,7 +193,7 @@ def display_enhanced_schedule(
     roster_by_round: Any = None,
 ) -> None:
     """Display schedule with enhanced formatting and error checking."""
-    schedule_errors = validate_schedule_integrity(schedule, all_players)
+    schedule_errors = validate_schedule_integrity(schedule, all_players, roster_by_round)
 
     if schedule_errors:
         st_module.error("🚨 **CRITICAL SCHEDULE ERRORS DETECTED!**")

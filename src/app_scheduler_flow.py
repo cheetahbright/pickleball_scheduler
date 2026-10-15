@@ -8,6 +8,7 @@ import math
 import re
 import sqlite3
 import threading
+import time
 import unicodedata
 from collections import Counter
 from contextlib import contextmanager
@@ -24,9 +25,41 @@ except ImportError:
     from app_schedule_helpers import escape_markdown
 
 try:
-    from src.utils.schedule_shapes import extract_game_teams, games_in_round
+    from src.algorithms.attendance_planner import sit_out_baseline
 except ImportError:
-    from utils.schedule_shapes import extract_game_teams, games_in_round
+    from algorithms.attendance_planner import sit_out_baseline
+
+try:
+    from src.utils.roster_rounds import constraint_pairs_for_roster, pair_in_roster, sit_outs_by_round, splice_schedules
+except ImportError:
+    from utils.roster_rounds import constraint_pairs_for_roster, pair_in_roster, sit_outs_by_round, splice_schedules
+
+try:
+    from src.algorithms.attendance_planner import AttendanceError, plan_attendance_schedule
+    from src.app_attendance import (
+        CURRENT_ATTENDANCE_KEY,
+        QUALITY_NOTE,
+        REPLAN_NOTE,
+        attendance_error_message,
+        attendance_for_history,
+        clamp_round,
+        remember_attendance_choices,
+        render_attendance_controls,
+        render_attendance_summary,
+    )
+except ImportError:
+    from algorithms.attendance_planner import AttendanceError, plan_attendance_schedule
+    from app_attendance import (
+        CURRENT_ATTENDANCE_KEY,
+        QUALITY_NOTE,
+        REPLAN_NOTE,
+        attendance_error_message,
+        attendance_for_history,
+        clamp_round,
+        remember_attendance_choices,
+        render_attendance_controls,
+        render_attendance_summary,
+    )
 
 try:
     from src.widget_state import (
@@ -52,6 +85,8 @@ except ImportError:
     )
 
 normalize_config_constraints = import_module_with_fallback("app_managers").normalize_config_constraints
+# Read as features.<FLAG> at call time, never copied, so a patched flag takes effect.
+features = import_module_with_fallback("features")
 
 logger = logging.getLogger(__name__)
 
@@ -84,12 +119,14 @@ UNSAVED_SCHEDULE_KEY = "unsaved_schedule"
 # _render_mid_session_replan).
 REPLAN_INPUTS_SCHEDULE_KEY = "_replan_inputs_schedule"
 
-# Largest roster the scheduler accepts - 50 courts, far beyond any real session
-# (the Stress Test tab stops at 40 players). The constraint pickers offer every
-# possible pair, which grows with the square of the roster, so a pasted
-# membership list of thousands of names would otherwise stall every rerun and
-# run the shared server process out of memory.
-MAX_PLAYERS = 200
+# Largest roster the scheduler accepts - 18 full courts, well beyond any real
+# session (the Stress Test tab stops at 40 players). The constraint pickers
+# offer every possible pair, which grows with the square of the roster (2,556
+# options each at 72), so a pasted membership list of thousands of names would
+# otherwise stall every rerun and run the shared server process out of memory.
+# A preset or backup saved under the old limit of 200 can hold more: it is
+# kept as it is and refused, with too_many_players_message, when it is picked.
+MAX_PLAYERS = 72
 
 
 def is_reserved_preset_name(name: str) -> bool:
@@ -135,43 +172,6 @@ def split_schedule_at_round(schedule: list, played_rounds: int) -> tuple[list, i
     """
     played_rounds = max(0, min(played_rounds, len(schedule)))
     return list(schedule[:played_rounds]), len(schedule) - played_rounds
-
-
-def sit_outs_by_round(rounds: Sequence[Any], roster_by_round: Sequence[Sequence[str]]) -> list[set[str]]:
-    """Who sat out each round: its roster minus everyone in one of its games.
-
-    rounds and roster_by_round run in step (a mid-session replan's locked
-    rounds and their rosters), so a player who left before a round is not
-    counted as sitting it out, and one who joined later is not either.
-    """
-    sit_outs: list[set[str]] = []
-    for round_data, roster in zip(rounds, roster_by_round):
-        on_court: set[str] = set()
-        for game in games_in_round(round_data):
-            team1, team2, _court = extract_game_teams(game)
-            on_court.update(str(player) for player in team1)
-            on_court.update(str(player) for player in team2)
-        sit_outs.append({str(player) for player in roster} - on_court)
-    return sit_outs
-
-
-def splice_schedules(locked_rounds: list, new_rounds: list) -> list:
-    """Combine already-played rounds with freshly generated remaining rounds.
-
-    New rounds are renumbered to continue directly after the locked ones, so
-    a replan of rounds 4-6 (after 3 played) ends up numbered 4, 5, 6 - not
-    restarting at 1.
-    """
-    spliced = list(locked_rounds)
-    start_round = len(locked_rounds) + 1
-    for i, round_data in enumerate(new_rounds):
-        if hasattr(round_data, "get"):
-            renumbered = dict(round_data)
-            renumbered["round"] = start_round + i
-        else:
-            renumbered = round_data
-        spliced.append(renumbered)
-    return spliced
 
 
 def add_player_to_text(players_text: str, new_player: str) -> str:
@@ -527,22 +527,6 @@ def build_constraint_pair_options(players: list[str], separator: str) -> dict[st
     return options
 
 
-def _pair_in_roster(pair: Sequence[str], roster: set[str]) -> bool:
-    return len(pair) == 2 and pair[0] in roster and pair[1] in roster
-
-
-def constraint_pairs_for_roster(constraint_pairs: Sequence[Sequence[str]], players: Sequence[str]) -> list[list[str]]:
-    """Return only the saved pairs whose two players are both on ``players``.
-
-    Saved constraints outlive any one roster (a regular who is away this
-    week keeps theirs), so everything that acts on a specific roster - the
-    scheduler, the constraint counts and warnings, the settings recorded in
-    history - must use this filtered view rather than the full saved list.
-    """
-    roster = set(players)
-    return [list(pair) for pair in constraint_pairs if _pair_in_roster(pair, roster)]
-
-
 def _fold_name(name: str) -> str:
     return re.sub(r"\s+", "", _visible_name(name)).casefold()
 
@@ -621,7 +605,7 @@ def merge_roster_constraint_selection(
     merged: list[list[str]] = []
     kept_keys: set[frozenset[str]] = set()
     for pair in saved_pairs:
-        if _pair_in_roster(pair, roster):
+        if pair_in_roster(pair, roster):
             key = frozenset(pair)
             if key not in selected_keys or key in kept_keys:
                 continue
@@ -736,9 +720,10 @@ def history_unavailable_message(exc: BaseException) -> str:
             "Another program may be using the database file, or it may be read-only. The app tries again "
             "each time the page updates."
         )
+    unavailable = "History, score entry and the Leaderboard are" if features.SCORE_TRACKING else "History is"
     return (
         f"❌ Couldn't open the schedule history ({exc}). {cause} Until then you can still generate "
-        "schedules, but History, score entry and the Leaderboard are unavailable."
+        f"schedules, but {unavailable} unavailable."
     )
 
 
@@ -799,6 +784,24 @@ def queue_status_notice(session_state: Any, level: str, text: str) -> None:
     session_state.setdefault(STATUS_NOTICES_KEY, []).append((level, text))
 
 
+def _cloud_backup_before_tabs(st_module) -> None:
+    """Restore a fresh start from the encrypted cloud copy, if cloud backup is set up (see app_remote_backup)."""
+    try:
+        notice = import_module_with_fallback("app_remote_backup").before_tabs(st_module)
+        if notice:
+            queue_status_notice(st_module.session_state, "warning", notice)
+    except Exception:
+        logger.exception("Cloud backup: the start-of-run step failed")
+
+
+def _cloud_backup_after_tabs(st_module) -> None:
+    """Ask for a cloud backup if this run changed the saved data; it is sent in the background."""
+    try:
+        import_module_with_fallback("app_remote_backup").after_tabs(st_module)
+    except Exception:
+        logger.exception("Cloud backup: the end-of-run step failed")
+
+
 def render_enhanced_scheduler_page(
     st_module,
     history_manager_cls,
@@ -829,8 +832,9 @@ def render_enhanced_scheduler_page(
         st_module.session_state.config_manager = config_manager_cls()
     if skill_manager_cls is not None and "skill_manager" not in st_module.session_state:
         st_module.session_state.skill_manager = skill_manager_cls()
-    if elo_manager_cls is not None and "elo_manager" not in st_module.session_state:
+    if features.SCORE_TRACKING and elo_manager_cls is not None and "elo_manager" not in st_module.session_state:
         st_module.session_state.elo_manager = elo_manager_cls()
+    _cloud_backup_before_tabs(st_module)  # before the configuration is loaded: a restore changes it
     # Notices above the tabs render into slots that exist on every run, even
     # when empty. st.tabs is identified by its position on the page, so a
     # banner that appears on one run and not the next shifts the tabs, which
@@ -887,7 +891,7 @@ def render_enhanced_scheduler_page(
         configuration_tab_fn,
         player_management_tab_fn,
     ]
-    if leaderboard_tab_fn is not None:
+    if features.SCORE_TRACKING and leaderboard_tab_fn is not None:
         tab_labels.append("🏆 Leaderboard")
         tab_fns.append(leaderboard_tab_fn)
     if stress_test_tab_fn is not None:
@@ -917,6 +921,7 @@ def render_enhanced_scheduler_page(
         repair_notices.warning(f"⚠️ {escape_markdown(message)}")
     for run in queued_runs:
         run()
+    _cloud_backup_after_tabs(st_module)
 
 
 # Held in session_state while a Generate or replan run works. The GA runs on
@@ -933,10 +938,16 @@ QUEUED_SCHEDULER_RUNS_KEY = "_queued_scheduler_runs"
 # How the last Generate went, for the rerun that draws its schedule.
 GENERATION_OUTCOME_KEY = "_generation_outcome"
 
-_RUN_CANCEL_CAPTION = (
-    "⏳ Changing anything on the page while this runs (a setting, a button, a score), pressing Stop or "
-    "losing the connection cancels it and leaves the schedule as it was."
-)
+
+def _run_cancel_caption() -> str:
+    """What changing the page, pressing Stop or losing the connection does to a Generate or replan run."""
+    changes = "a setting, a button, a score" if features.SCORE_TRACKING else "a setting, a button"
+    return (
+        f"⏳ Changing anything on the page while this runs ({changes}), pressing Stop or "
+        "losing the connection cancels it and leaves the schedule as it was."
+    )
+
+
 _INTERRUPTED_RUN_MESSAGES = {
     "generation": (
         "⚠️ The last schedule generation was interrupted before it finished, so no new schedule was saved and "
@@ -1083,6 +1094,17 @@ def _generation_progress(progress_data, max_time, replay_generations=None) -> tu
     return fraction, f"Generation {generation} - best range {total_range} - {elapsed:.0f}s elapsed"
 
 
+def _show_invalid_schedule(st_module, status_box, schedule_errors: list) -> None:
+    """Report a generated schedule that can't be played (a player twice in a round, say) and fail the run."""
+    st_module.error("🚨 **CRITICAL ERROR: Invalid schedule generated!**")
+    st_module.error("**The algorithm has bugs that generated impossible player assignments!**")
+    for error in schedule_errors:
+        st_module.error(f"❌ {escape_markdown(error)}")
+    st_module.error("**🛑 This indicates serious bugs in the scheduling algorithm!**")
+    st_module.info("Please report this bug with the exact player configuration.")
+    status_box.update(label="❌ Invalid schedule generated", state="error", expanded=True)
+
+
 def _handle_generate_schedule_click(
     st_module,
     config,
@@ -1113,7 +1135,7 @@ def _handle_generate_schedule_click(
     status = st_module.status("Generating schedule...", expanded=True)
     with _scheduler_run(st_module.session_state, "generation"), status as status_box:
         cancel_caption = st_module.empty()
-        cancel_caption.caption(_RUN_CANCEL_CAPTION)
+        cancel_caption.caption(_run_cancel_caption())
         progress_bar = st_module.progress(0)
         progress_text = st_module.empty()
 
@@ -1193,13 +1215,7 @@ def _handle_generate_schedule_click(
                     _time.time() - generation_started_at,
                     len(schedule_errors),
                 )
-                st_module.error("🚨 **CRITICAL ERROR: Invalid schedule generated!**")
-                st_module.error("**The algorithm has bugs that generated impossible player assignments!**")
-                for error in schedule_errors:
-                    st_module.error(f"❌ {escape_markdown(error)}")
-                st_module.error("**🛑 This indicates serious bugs in the scheduling algorithm!**")
-                st_module.info("Please report this bug with the exact player configuration.")
-                status_box.update(label="❌ Invalid schedule generated", state="error", expanded=True)
+                _show_invalid_schedule(st_module, status_box, schedule_errors)
                 return
 
             progress_bar.progress(1.0)
@@ -1251,6 +1267,7 @@ def _handle_generate_schedule_click(
             # per-round roster segmentation left over from a previous
             # schedule's mid-session replan.
             st_module.session_state.current_roster_by_round = None
+            st_module.session_state[CURRENT_ATTENDANCE_KEY] = None
 
             settings = {
                 "num_rounds": num_rounds,
@@ -1289,6 +1306,189 @@ def _handle_generate_schedule_click(
         st_module.rerun()
 
 
+def _handle_attendance_generate_click(
+    st_module,
+    config,
+    players,
+    num_rounds,
+    courts,
+    max_time,
+    generation_seed,
+    scheduler_cls,
+    validate_schedule_integrity_fn,
+    windows,
+) -> None:
+    """Handle "Generate Schedule" when some players arrive late or leave early.
+
+    The attendance planner (see src/algorithms/attendance_planner.py)
+    schedules each stretch of rounds with the same players for exactly those
+    players, up to ``courts`` courts, within max_time shared out between the
+    stretches. Like _handle_generate_schedule_click it runs once every tab is
+    drawn, leaves the schedule on screen alone unless it succeeds, and ends in
+    the rerun that draws the new schedule and its outcome.
+
+    What differs is what is kept. Each round is checked against its own
+    roster; the fairness metrics and the theoretical optimum assume one
+    roster, so current_metrics is left empty (the Main tab shows who was here
+    when instead); and the seed and generation count can't replay a plan, so
+    none is kept - a seed typed by the user only starts the search.
+    """
+    generated = False
+    status = st_module.status("Generating schedule...", expanded=True)
+    with _scheduler_run(st_module.session_state, "generation"), status as status_box:
+        cancel_caption = st_module.empty()
+        cancel_caption.caption(_run_cancel_caption())
+        progress_bar = st_module.progress(0)
+        progress_text = st_module.empty()
+
+        def _on_progress(progress_data, _bar=progress_bar, _text=progress_text, _max_time=max_time):
+            try:
+                fraction, text = _generation_progress(progress_data, _max_time)
+                segments = progress_data.get("segments") or 1
+                if segments > 1:
+                    text = f"Stretch {progress_data.get('segment')} of {segments} - {text}"
+                _bar.progress(fraction)
+                _text.text(text)
+            except Exception:
+                logger.debug("Progress callback failed", exc_info=True)
+
+        active_constraints = {
+            "do_not_pair": constraint_pairs_for_roster(config["constraints"]["do_not_pair"], players),
+            "do_not_oppose": constraint_pairs_for_roster(config["constraints"]["do_not_oppose"], players),
+        }
+        generation_started_at = time.time()
+        logger.info(
+            "Generation start: players=%d rounds=%d courts=%d pair_constraints=%d oppose_constraints=%d seed=%s "
+            "attendance=%d",
+            len(players),
+            num_rounds,
+            courts,
+            len(active_constraints["do_not_pair"]),
+            len(active_constraints["do_not_oppose"]),
+            generation_seed,
+            len(windows),
+        )
+
+        try:
+            warnings = []
+            if not st_module.session_state.config_manager.save_config(config):
+                warnings.append("⚠️ Could not save configuration before generating - continuing anyway.")
+                st_module.warning(warnings[-1])
+
+            with counted_generation(st_module):
+                result = plan_attendance_schedule(
+                    players,
+                    num_rounds,
+                    courts,
+                    windows,
+                    scheduler_cls,
+                    constraints=active_constraints,
+                    max_time=max_time,
+                    seed=generation_seed,
+                    progress_callback=_on_progress,
+                )
+
+            schedule_data = result.get("schedule")
+            if not schedule_data:
+                logger.warning("Generation end: status=no_schedule elapsed=%.1fs", time.time() - generation_started_at)
+                reason = result.get("error") or "Could not generate schedule. Try adjusting parameters."
+                st_module.error(f"❌ {escape_markdown(reason)}")
+                status_box.update(label="❌ Generation failed", state="error", expanded=True)
+                return
+
+            roster_by_round = [list(roster) for roster in result["roster_by_round"]]
+            schedule_errors = validate_schedule_integrity_fn(schedule_data, players, roster_by_round=roster_by_round)
+            if schedule_errors:
+                logger.error(
+                    "Generation end: status=invalid_schedule elapsed=%.1fs errors=%d",
+                    time.time() - generation_started_at,
+                    len(schedule_errors),
+                )
+                _show_invalid_schedule(st_module, status_box, schedule_errors)
+                return
+
+            progress_bar.progress(1.0)
+
+            # Rounds that run fewer courts than asked, for want of players to fill them.
+            warnings.extend(f"⚠️ {warning}" for warning in result.get("warnings", []))
+            constraint_violations = result.get("constraint_violations", 0)
+            if constraint_violations:
+                warnings.append(
+                    constraint_violation_warning(
+                        constraint_violations,
+                        bool(result.get("round_search_budget_reached", False)),
+                        max_time=max_time,
+                    )
+                )
+
+            logger.info(
+                "Generation end: status=ok elapsed=%.1fs segments=%d",
+                time.time() - generation_started_at,
+                len(result.get("segments", [])),
+            )
+
+            compute_round_times = import_module_with_fallback("app_schedule_helpers").compute_round_times
+            scheduling_config = config.get("scheduling", {})
+            round_times = compute_round_times(
+                num_rounds,
+                scheduling_config.get("start_time"),
+                scheduling_config.get("end_time"),
+            )
+
+            # Everyone who is there for at least one round (everyone listed is).
+            attending = [player for player in players if any(player in roster for roster in roster_by_round)]
+            attendance = attendance_for_history(windows)
+            st_module.session_state.current_schedule = schedule_data
+            st_module.session_state.current_players = attending
+            st_module.session_state.current_metrics = {}
+            st_module.session_state.current_seed = None
+            st_module.session_state.current_generations = None
+            st_module.session_state.current_round_times = round_times
+            st_module.session_state.current_roster_by_round = roster_by_round
+            st_module.session_state[CURRENT_ATTENDANCE_KEY] = attendance
+
+            settings = {
+                "num_rounds": num_rounds,
+                "courts": courts,
+                "max_time": max_time,
+                "constraints": active_constraints,
+                "seed": result.get("seed"),
+                "roster_by_round": roster_by_round,
+                "attendance": attendance,
+            }
+            # A failed save is reported (with a retry) above the schedule - see
+            # _render_unsaved_schedule_notice.
+            save_schedule_to_history(st_module.session_state, schedule_data, attending, settings, "attendance")
+
+            st_module.session_state[GENERATION_OUTCOME_KEY] = warnings
+            generated = True
+
+        except AttendanceError as exc:
+            logger.warning(
+                "Generation end: status=invalid_attendance elapsed=%.1fs", time.time() - generation_started_at
+            )
+            st_module.error(attendance_error_message(exc))
+            status_box.update(label="❌ Invalid arrivals and departures", state="error", expanded=True)
+        except MemoryError:
+            logger.exception("Generation end: status=exception elapsed=%.1fs", time.time() - generation_started_at)
+            st_module.error("❌ Ran out of memory while generating the schedule. Try fewer players or rounds.")
+            status_box.update(label="❌ Out of memory", state="error", expanded=True)
+        except ValueError as exc:
+            logger.exception("Generation end: status=exception elapsed=%.1fs", time.time() - generation_started_at)
+            st_module.error(f"❌ Invalid input: {exc}. Check your players and constraints.")
+            status_box.update(label="❌ Invalid input", state="error", expanded=True)
+        except Exception:
+            logger.exception("Generation end: status=exception elapsed=%.1fs", time.time() - generation_started_at)
+            st_module.error("❌ Schedule generation failed unexpectedly. See the server logs for details.")
+            status_box.update(label="❌ Generation error", state="error", expanded=True)
+        finally:
+            cancel_caption.empty()
+
+    if generated:
+        # Every tab was drawn with the previous schedule - redraw them all.
+        st_module.rerun()
+
+
 def render_main_scheduler_tab(
     st_module,
     datetime_cls,
@@ -1311,6 +1511,7 @@ def render_main_scheduler_tab(
     remember_seeded_widget_values(st_module.session_state)
     for key in (COURTS_KEY, MAX_TIME_KEY):
         remember_widget_choice(st_module.session_state, key)
+    remember_attendance_choices(st_module.session_state)
 
     st_module.subheader("👥 Players")
 
@@ -1634,7 +1835,15 @@ def render_main_scheduler_tab(
             ),
         )
 
-    feasibility_notes = build_feasibility_notes(len(players), courts, num_rounds, total_constraints)
+    attendance = render_attendance_controls(st_module, players, num_rounds, courts)
+
+    # With players arriving late or leaving early the roster differs from round
+    # to round, which the single-roster estimates know nothing about.
+    feasibility_notes = (
+        [QUALITY_NOTE]
+        if attendance.active
+        else build_feasibility_notes(len(players), courts, num_rounds, total_constraints)
+    )
     # build_feasibility_notes exists specifically so a user isn't surprised
     # after waiting up to the full max-time budget for a result that was
     # never going to reach range 0 - defeats the purpose if the one note
@@ -1670,6 +1879,11 @@ def render_main_scheduler_tab(
                 "generations, however long they take, instead of stopping on Max generation time."
             ),
         )
+        if attendance.active:
+            st_module.caption(
+                "Arrivals and departures are set: a seed here only starts the search for each stretch of rounds, "
+                "Generations is ignored, and exact replay is not guaranteed."
+            )
     generation_seed = None
     seed_text = (seed_text or "").strip()
     if seed_text:
@@ -1690,6 +1904,11 @@ def render_main_scheduler_tab(
             st_module.warning("Generations must be a whole number of at least 1 - ignoring it for this run.")
         elif generation_seed is None:
             st_module.warning("Generations only replay a run together with its seed - ignoring them for this run.")
+        elif attendance.active:
+            st_module.info(
+                "🎲 Arrivals and departures are set, so Generations is ignored for this run: a schedule planned "
+                "around them can't be replayed from a seed and a generation count."
+            )
         else:
             replay_generations = parsed_generations
             # Both inputs keep their values, so say so wherever Generate is:
@@ -1711,7 +1930,28 @@ def render_main_scheduler_tab(
     # On every run, so the schedule below never shifts: a running Generate
     # draws here, and so does its outcome on the rerun that follows it.
     generation_slot = st_module.empty()
-    if generate_clicked:
+    if generate_clicked and attendance.error:
+        # Refused before anything runs: the same message the Arrivals and
+        # departures control shows, and the genetic algorithm never starts.
+        generation_slot.error(attendance.error)
+    elif generate_clicked and attendance.active:
+        _start_after_the_tabs(
+            st_module,
+            generation_slot,
+            lambda: _handle_attendance_generate_click(
+                st_module,
+                config,
+                players,
+                num_rounds,
+                courts,
+                max_time,
+                generation_seed,
+                scheduler_cls,
+                validate_schedule_integrity_fn,
+                attendance.windows,
+            ),
+        )
+    elif generate_clicked:
         _start_after_the_tabs(
             st_module,
             generation_slot,
@@ -1797,13 +2037,20 @@ def _render_persistent_schedule(
     _render_unsaved_schedule_notice(st_module)
     _render_metric_summary(st_module, metrics, players)
     _render_optimality_status(st_module, metrics, players)
+    if st_module.session_state.get(CURRENT_ATTENDANCE_KEY):
+        render_attendance_summary(st_module, schedule_data, roster_by_round, players)
 
     display_enhanced_schedule_fn(schedule_data, players, round_times=round_times, roster_by_round=roster_by_round)
 
     # display_enhanced_schedule_fn already showed the critical-error banner
     # above for an invalid schedule - exports must not offer to download
-    # something the app has just told the user not to use.
-    if not validate_schedule_integrity_fn(schedule_data, players):
+    # something the app has just told the user not to use. It checks each round
+    # against its own roster, so this must too.
+    if roster_by_round:
+        schedule_errors = validate_schedule_integrity_fn(schedule_data, players, roster_by_round=roster_by_round)
+    else:
+        schedule_errors = validate_schedule_integrity_fn(schedule_data, players)
+    if not schedule_errors:
         _render_download_buttons(
             st_module,
             datetime_cls,
@@ -1821,14 +2068,16 @@ def _render_persistent_schedule(
 
 def _render_unsaved_schedule_notice(st_module):
     """Offer to retry a failed history save of the schedule on screen - until it
-    is saved, its scores can't be entered and it can't be loaded again."""
+    is saved, it can't be loaded again (nor, with score tracking on, can its scores be entered)."""
     unsaved = unsaved_schedule(st_module.session_state)
     if unsaved is None:
         return
-    st_module.warning(
-        "⚠️ This schedule isn't saved to history yet, so its scores can't be entered and it can't be "
-        "loaded again later."
+    consequence = (
+        "its scores can't be entered and it can't be loaded again later"
+        if features.SCORE_TRACKING
+        else "it can't be loaded again later"
     )
+    st_module.warning(f"⚠️ This schedule isn't saved to history yet, so {consequence}.")
     if st_module.button("💾 Retry saving to history"):
         if save_schedule_to_history(st_module.session_state, **unsaved) is None:
             st_module.error(
@@ -1840,18 +2089,32 @@ def _render_unsaved_schedule_notice(st_module):
             st_module.rerun()
 
 
-def _scored_rounds_message(scored_rounds) -> str:
+def _scored_rounds_message(scored_rounds, total_rounds: int) -> str:
+    rounds = ", ".join(map(str, scored_rounds))
+    if not features.SCORE_TRACKING:
+        # Only data saved while scores were tracked (or restored from a backup) can trip this.
+        # There is no Leaderboard tab to clear them on, so the way on is to keep those rounds as played.
+        # 'Rounds already played' stops one short of the last round, so a result there can't be kept.
+        if max(scored_rounds) >= total_rounds:
+            return (
+                f"❌ Round(s) {rounds} already have recorded results, including the last round, so this "
+                "schedule can't be replanned. Generate a new schedule instead."
+            )
+        return (
+            f"❌ Round(s) {rounds} already have recorded results, so they can't be replanned. "
+            f"Set 'Rounds already played' to at least {max(scored_rounds)}."
+        )
     return (
-        f"❌ Round(s) {', '.join(map(str, scored_rounds))} already have recorded scores, so they can't be "
+        f"❌ Round(s) {rounds} already have recorded scores, so they can't be "
         f"replanned. Set 'Rounds already played' to at least {max(scored_rounds)}, or clear those scores "
         "on the Leaderboard tab first."
     )
 
 
-def _replan_not_saved_message(result) -> str:
+def _replan_not_saved_message(result, total_rounds: int) -> str:
     """Explain why update_schedule_after_replan refused or failed (see ReplanSaveResult)."""
     if result.status == "scored":
-        return _scored_rounds_message(result.scored_rounds)
+        return _scored_rounds_message(result.scored_rounds, total_rounds)
     if result.status == "missing":
         return (
             "❌ This schedule was deleted from History, so a replan of it can't be saved. Restore it "
@@ -1886,17 +2149,50 @@ def find_replan_name_issues(remaining_players: list[str], locked_roster_by_round
     ]
 
 
+def replan_default_roster(
+    players: Sequence[str],
+    tracked_rosters: Sequence[Sequence[str]] | None,
+    planned_around_attendance: bool,
+    played_rounds: int,
+) -> list[str]:
+    """The players a replan's roster box starts with: who is here for the rounds it will replan.
+
+    ``players`` is everyone the schedule has had, leavers and late arrivers
+    included, so once a replan (or a plan) has recorded each round's roster
+    the box starts from one of those instead. A schedule that was only
+    replanned is replanned for whoever was there at the end, its last round's
+    roster. One planned around arrivals and departures has a different roster
+    in nearly every round, so the box starts with the roster of the first
+    round to replan (the one after ``played_rounds``): the last round's would
+    hold a late arriver who is not here yet and miss someone who still is.
+    """
+    if not tracked_rosters:
+        return list(players)
+    if planned_around_attendance:
+        return list(tracked_rosters[max(0, min(played_rounds, len(tracked_rosters) - 1))])
+    return list(tracked_rosters[-1])
+
+
 def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players, config, max_time):
     """Let the user regenerate only the not-yet-played rounds, optionally with a
     changed player list (someone left early / showed up late) or court count -
     without losing the rounds already played.
 
-    The replanned rounds are optimized for fairness among themselves only; they
-    do not account for who already played together in the locked rounds, since
-    that would require the scheduler's fitness function to accept pre-existing
-    partner/opponent/game counts, which it does not currently support. Their
-    order does look back: it carries on from who sat out the locked rounds, so
-    a sit-out streak does not run on across the boundary unnecessarily.
+    The replanned rounds look back at the locked rounds in two ways, both about
+    who sat out. How many rounds each remaining player has sat out so far (while
+    on the roster) goes to the scheduler as baseline_games, as the attendance
+    planner does between its segments, so the range of everyone's sit-outs to
+    date is kept as low as the new rounds allow instead of the new sit-outs
+    piling onto the same players. That bounds the range; it does not promise
+    that every new sit-out goes to a player at the minimum, since when the
+    rounds kept were already uneven a player above it can still sit out while
+    one at it plays. A newcomer counts as having sat out none, so is among the
+    first to sit out. And the new rounds' order carries on from who sat out
+    each locked round, so a sit-out streak does not run on across the boundary
+    unnecessarily. They do not account for who already partnered or opposed
+    whom in the locked rounds: that would require the scheduler's fitness
+    function to accept pre-existing partner/opponent counts, which it does
+    not currently support (baseline_games offsets the games count only).
 
     A replan runs for up to max_time, the "Max generation time" the user set
     under Schedule Settings.
@@ -1909,9 +2205,11 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
         st_module.caption(
             "Regenerate the rounds that haven't been played yet - useful if a player "
             "leaves early or joins late. Rounds already played are never changed. The "
-            "replanned rounds are freshly fair among themselves, not aware of who "
-            "already played together in the rounds you keep. A replan takes up to the "
-            "'Max generation time' set under Schedule Settings above."
+            "replanned rounds are fair among themselves and even out how many rounds each "
+            "player has sat out so far, counting the rounds you keep (a newcomer starts at "
+            "none, so is among the first to sit out), but they are not aware of who already "
+            "partnered or opposed whom in those rounds. A replan takes up to the 'Max "
+            "generation time' set under Schedule Settings above."
         )
 
         # Each round's roster, once a replan has changed it. Who is playing
@@ -1920,7 +2218,9 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
         tracked_rosters = st_module.session_state.get("current_roster_by_round")
         if not tracked_rosters or len(tracked_rosters) != total_rounds:
             tracked_rosters = None
-        roster_text = "\n".join(tracked_rosters[-1] if tracked_rosters else players)
+        planned_around_attendance = bool(tracked_rosters and st_module.session_state.get(CURRENT_ATTENDANCE_KEY))
+        if planned_around_attendance:
+            st_module.caption(REPLAN_NOTE)
         current_courts = max(1, len(schedule_data[-1].get("games", [])))
         # Set the inputs up for each new schedule on screen (Generate, History
         # load), keeping in-progress edits otherwise. Keyed on the schedule
@@ -1935,7 +2235,23 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
         # Seeded, not assigned: an st.rerun() before they render (Quick Add,
         # say) drops their state, and this puts back what they showed.
         seed_widget_from_source(st_module.session_state, "replan_played_rounds", 0)
-        seed_widget_from_source(st_module.session_state, "replan_players_input", roster_text)
+        # Who starts the box depends on the rounds played for a plan with
+        # arrivals and departures, so it follows that input - carrying over
+        # names the user added or took out - until they type their own list.
+        roster_text = "\n".join(
+            replan_default_roster(
+                players,
+                tracked_rosters,
+                planned_around_attendance,
+                clamp_round(st_module.session_state.get("replan_played_rounds"), 0, total_rounds - 1, 0),
+            )
+        )
+        seed_widget_from_source(
+            st_module.session_state,
+            "replan_players_input",
+            roster_text,
+            rebase=rebase_line_edits if planned_around_attendance else None,
+        )
         seed_widget_from_source(st_module.session_state, "replan_courts", current_courts)
 
         # Set through session_state above, so none takes value= (see src/widget_state.py).
@@ -1949,10 +2265,13 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
             "Players for the remaining rounds (edit to reflect who's still here):",
             key="replan_players_input",
         )
+        # A schedule saved under the old, higher MAX_PLAYERS (loaded from History)
+        # can use more courts than the limit allows. Its own count stays in range:
+        # a box whose maximum is below its seeded value resets to 1.
         requested_courts = st_module.number_input(
             "Courts for remaining rounds:",
             min_value=1,
-            max_value=MAX_PLAYERS // 4,
+            max_value=max(MAX_PLAYERS // 4, current_courts),
             key="replan_courts",
             help=(
                 "The courts this schedule uses now. Raise it if late arrivals let you open another court - "
@@ -1999,10 +2318,13 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
             if schedule_id is not None and history_manager is not None:
                 scored_rounds = history_manager.rounds_with_results(schedule_id, played_rounds + 1)
                 if scored_rounds is None:
-                    st_module.error("❌ Could not check this schedule's recorded scores, so nothing was replanned.")
+                    recorded = "scores" if features.SCORE_TRACKING else "results"
+                    st_module.error(
+                        f"❌ Could not check this schedule's recorded {recorded}, so nothing was replanned."
+                    )
                     return
                 if scored_rounds:
-                    st_module.error(_scored_rounds_message(scored_rounds))
+                    st_module.error(_scored_rounds_message(scored_rounds, total_rounds))
                     return
 
             locked_rounds, remaining_round_count = split_schedule_at_round(schedule_data, played_rounds)
@@ -2038,7 +2360,7 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
                 run_marker = _start_scheduler_run(st_module.session_state, "replan")
                 with st_module.status("Replanning remaining rounds...", expanded=True) as status_box:
                     cancel_caption = st_module.empty()
-                    cancel_caption.caption(_RUN_CANCEL_CAPTION)
+                    cancel_caption.caption(_run_cancel_caption())
                     progress_bar = st_module.progress(0)
                     progress_text = st_module.empty()
 
@@ -2073,6 +2395,16 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
                         # in the first replanned round when another order of
                         # the new rounds avoids it (first-review finding 56).
                         scheduler.preceding_sit_outs = sit_outs_by_round(locked_rounds, locked_roster_by_round)
+                        # And how many each remaining player has sat out so
+                        # far while on the roster, so the range of everyone's
+                        # sit-outs to date is kept as low as the new rounds
+                        # allow rather than piling onto the same players (as
+                        # the attendance planner does between its segments).
+                        # Nothing is set when nobody has sat out, which
+                        # leaves the scheduler exactly as it was.
+                        baseline = sit_out_baseline(locked_rounds, locked_roster_by_round, remaining_players)
+                        if baseline:
+                            scheduler.baseline_games = baseline
                         with counted_generation(st_module):
                             result = scheduler.generate_schedule(max_time=max_time, progress_callback=_on_progress)
                     except Exception:
@@ -2119,7 +2451,7 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
                         schedule_id, schedule_data, replanned_schedule, all_players, played_rounds + 1, roster_by_round
                     )
                     if not saved.saved:
-                        st_module.error(_replan_not_saved_message(saved))
+                        st_module.error(_replan_not_saved_message(saved, total_rounds))
                         _end_scheduler_run(st_module.session_state, run_marker)
                         return
 
@@ -2127,6 +2459,9 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
                 st_module.session_state.current_roster_by_round = roster_by_round
                 st_module.session_state.current_schedule = replanned_schedule
                 st_module.session_state.current_players = all_players
+                # The arrivals and departures it was planned from no longer
+                # describe it: every remaining round now has the one roster.
+                st_module.session_state[CURRENT_ATTENDANCE_KEY] = None
                 # The metrics and seed shown belong to the pre-replan schedule;
                 # after splicing they no longer describe what's on screen. (The
                 # replan's own seed can't replay it either: the generator would
@@ -2142,6 +2477,7 @@ def _render_mid_session_replan(st_module, scheduler_cls, schedule_data, players,
                         roster_by_round=[list(roster) for roster in roster_by_round],
                         replanned_from_round=played_rounds + 1,
                     )
+                    settings.pop("attendance", None)
                     save_schedule_to_history(
                         st_module.session_state, replanned_schedule, all_players, settings, unsaved["algorithm"]
                     )
@@ -2169,7 +2505,10 @@ def _render_metric_summary(st_module, metrics, players):
         # Schedules loaded from history have no freshly computed metrics -
         # showing all-zero placeholders would read as a terrible schedule.
         return
-    col1, col2, col3, col4, col5 = st_module.columns(5)
+    most_partnered = _most_partnered(metrics)
+    # Metrics with no repeat count (from before it was measured) keep the
+    # five-metric row rather than show a placeholder.
+    col1, col2, col3, col4, col5, *repeat_column = st_module.columns(6 if most_partnered else 5)
     with col1:
         fairness_score = metrics.get("overall_fairness", 0)
         is_optimal = metrics.get("is_mathematically_optimal", False)
@@ -2187,27 +2526,66 @@ def _render_metric_summary(st_module, metrics, players):
         st_module.metric("Opponents Range", metrics.get("opponents_range", 0))
     with col5:
         st_module.metric("Courts Range", metrics.get("courts_range", 0))
+    if most_partnered and repeat_column:
+        with repeat_column[0]:
+            st_module.metric(
+                "Partner Repeats",
+                f"{most_partnered}x",
+                help=_partner_repeat_help(_partner_repeat_floor(metrics, players)),
+            )
+
+
+def _most_partnered(metrics) -> int | None:
+    """The most times any one pair partners, or None when the metrics don't
+    say (they predate the count, it is damaged, or no pair ever partnered)."""
+    value = metrics.get("most_partnered")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def _partner_repeat_floor(metrics, players) -> int | None:
+    """The fewest times the most-partnering pair can partner: a player's games
+    are spread over len(players) - 1 possible partners, so the player with the
+    most games must partner someone at least ceil(most games / (len(players)
+    - 1)) times; with nobody sitting out that is ceil(rounds / (len(players)
+    - 1)). None when the metrics don't say how many rounds were played."""
+    rounds = metrics.get("total_rounds")
+    if not rounds or len(players) < 2:
+        return None
+    games_played = [stats.get("games_played", 0) for stats in (metrics.get("player_stats") or {}).values()]
+    most_games = max(games_played, default=rounds)
+    return math.ceil(most_games / (len(players) - 1))
+
+
+def _partner_repeat_help(floor: int | None) -> str:
+    """The "Partner Repeats" tooltip: what the number is, why the ranges
+    beside it don't show it, and the fewest repeats the games played force."""
+    help_text = (
+        "The most times any one pair of players are partners. The Partners Range counts "
+        "different partners, not repeats, so a pair teaming up again and again doesn't show in it."
+    )
+    if floor is not None:
+        help_text += (
+            f" At least {floor}x is unavoidable here: the player with the most games must "
+            "partner someone that often."
+        )
+    return help_text
 
 
 def _partner_repeat_note(metrics, players) -> str:
-    """A factual aside for the "balanced" banners when some pair partners more
+    """A factual aside for the balance banners when some pair partners more
     often than an even spread would need: the ranges count each player's
     different partners, so a pair teaming up again and again doesn't show in
-    them. A player's games are spread over len(players) - 1 possible
-    partners, so the player with the most games must partner someone at
-    least ceil(most games / (len(players) - 1)) times; with nobody sitting
-    out that is ceil(rounds / (len(players) - 1))."""
-    most_partnered = metrics.get("most_partnered")
-    rounds = metrics.get("total_rounds")
-    if not most_partnered or not rounds or len(players) < 2:
-        return ""
-    games_played = [stats.get("games_played", 0) for stats in (metrics.get("player_stats") or {}).values()]
-    most_games = max(games_played, default=rounds)
-    if most_partnered <= math.ceil(most_games / (len(players) - 1)):
+    them. The floor is _partner_repeat_floor, the same one the "Partner
+    Repeats" metric states."""
+    most_partnered = _most_partnered(metrics)
+    floor = _partner_repeat_floor(metrics, players)
+    if most_partnered is None or floor is None or most_partnered <= floor:
         return ""
     return (
         " The balance counts different partners, not repeats: some pairs are partners "
-        f"{most_partnered} times in {rounds} rounds."
+        f"{most_partnered} times in {metrics['total_rounds']} rounds."
     )
 
 
@@ -2255,7 +2633,10 @@ def _render_optimality_status(st_module, metrics, players):
         bound = "Nothing rules out a perfectly fair schedule here, though one may not exist"
     else:
         bound = f"No schedule for this configuration can go below {floor}, though that may not be reachable"
-    st_module.info(f"Total range {total_range}. {bound} - generating again, or allowing more time, may improve it.")
+    st_module.info(
+        f"Total range {total_range}. {bound} - generating again, or allowing more time, may improve it."
+        + _partner_repeat_note(metrics, players)
+    )
 
 
 def _render_download_buttons(
@@ -2302,12 +2683,13 @@ def _render_download_buttons(
             "text/plain",
         )
     with col4:
-        # The results recorded so far for this schedule go in as a Scores sheet.
+        # With score tracking on, the results recorded so far for this schedule
+        # go in as a Scores sheet; off, the workbook has the schedule alone.
         schedule_id = st_module.session_state.get("current_schedule_id")
         history_manager = st_module.session_state.get("history_manager")
         scores = (
             history_manager.get_game_scores(schedule_id)
-            if schedule_id is not None and history_manager is not None
+            if features.SCORE_TRACKING and schedule_id is not None and history_manager is not None
             else None
         )
         xlsx_data = schedule_to_xlsx(

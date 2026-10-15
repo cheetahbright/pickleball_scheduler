@@ -568,7 +568,9 @@ class HistoryManager:
         attached to the teams that actually played them, and a later load
         from history shows the replanned rounds instead of the originals.
         The settings also record each round's roster, so "sitting out" stays
-        right after a reload.
+        right after a reload. A row planned around arrivals and departures
+        loses their record (settings["attendance"]), which the replan's
+        rosters supersede.
 
         Checked and written in one write-locked transaction, so nothing can
         change in between. The save is refused (nothing written) when:
@@ -626,6 +628,9 @@ class HistoryManager:
                 settings["players"] = list(players)
                 settings["roster_by_round"] = [list(roster) for roster in roster_by_round]
                 settings["replanned_from_round"] = replanned_from_round
+                # The arrivals and departures a plan was made from describe the
+                # plan, not the replan, whose remaining rounds share one roster.
+                settings.pop("attendance", None)
 
                 cursor.execute(
                     "UPDATE schedule_history SET num_players = ?, num_rounds = ?, fairness_score = ?, "

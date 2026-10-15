@@ -11,6 +11,11 @@ import time
 import streamlit as st
 
 try:
+    from src._compat import import_module_with_fallback
+except ImportError:
+    from _compat import import_module_with_fallback
+
+try:
     from streamlit.errors import StreamlitSecretNotFoundError
 except ImportError:  # pragma: no cover - defensive: some tests replace
     # sys.modules["streamlit"] with a bare stand-in lacking real submodules.
@@ -20,6 +25,9 @@ except ImportError:  # pragma: no cover - defensive: some tests replace
     class StreamlitSecretNotFoundError(Exception):  # type: ignore[no-redef]
         pass
 
+
+# Read as features.<FLAG> at call time, never copied, so a patched flag takes effect.
+features = import_module_with_fallback("features")
 
 PASSWORD_ENV_VAR = "PICKLEBALL_APP_PASSWORD"
 PASSWORD_SECRET_KEY = "app_password"
@@ -267,7 +275,8 @@ def _logout_confirmation() -> None:
     if not st.session_state.get(LOGOUT_PENDING_KEY, False):
         # A button below was pressed and its callback has acted: close the dialog.
         st.rerun()
-    st.write("Anything not saved yet will be lost: typed scores, replan changes and unsaved Configuration edits.")
+    unsaved = "typed scores, replan changes" if features.SCORE_TRACKING else "replan changes"
+    st.write(f"Anything not saved yet will be lost: {unsaved} and unsaved Configuration edits.")
     st.button("Log out", type="primary", on_click=_confirm_logout)
     st.button("Cancel", on_click=_cancel_logout)
 

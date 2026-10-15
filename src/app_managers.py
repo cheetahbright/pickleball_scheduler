@@ -2,7 +2,7 @@
 """Compatibility facade for the former monolithic app_managers.py.
 
 Manager logic now lives in focused modules under src/managers/ (history,
-config, skill_rating, elo_rating, player), split by concern the same way
+config, skill_rating, elo_rating), split by concern the same way
 main_app.py already documents its own facade role - but this module
 intentionally keeps the legacy app_managers import surface stable for
 main_app.py, app_scheduler_flow.py, app_tabs.py, and existing tests.
@@ -38,7 +38,6 @@ try:
     )
     from src.managers.elo_rating import EloRatingManager
     from src.managers.history import HistoryManager
-    from src.managers.player import PlayerManager
     from src.managers.skill_rating import SkillRatingManager
 except ImportError:
     from managers.config import (
@@ -58,7 +57,6 @@ except ImportError:
     )
     from managers.elo_rating import EloRatingManager
     from managers.history import HistoryManager
-    from managers.player import PlayerManager
     from managers.skill_rating import SkillRatingManager
 
 __all__ = [
@@ -69,7 +67,6 @@ __all__ = [
     "ConfigurationManager",
     "EloRatingManager",
     "HistoryManager",
-    "PlayerManager",
     "SkillRatingManager",
     "export_config_json",
     "import_config_json",

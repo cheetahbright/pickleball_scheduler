@@ -13,7 +13,7 @@ LOGGER_NAME = "pickleball_scheduler"
 # LOGGER_NAME, and the root logger has no handler and passes only warnings, so
 # each top-level name gets the console handler too. tests/unit/test_logging_config.py
 # checks that every module that logs is covered.
-APP_LOGGER_NAMES = ("src", "app_scheduler_flow", "app_tabs", "managers", "simple_auth")
+APP_LOGGER_NAMES = ("src", "app_remote_backup", "app_scheduler_flow", "app_tabs", "managers", "simple_auth")
 # Each Streamlit session runs main() in its own thread, so two sessions' first runs
 # could otherwise both find a logger without a handler and each add one.
 _HANDLER_LOCK = threading.Lock()

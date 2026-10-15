@@ -39,7 +39,6 @@ _app_managers = import_module_with_fallback("app_managers")
 ConfigurationManager = _app_managers.ConfigurationManager
 EloRatingManager = _app_managers.EloRatingManager
 HistoryManager = _app_managers.HistoryManager
-PlayerManager = _app_managers.PlayerManager
 SkillRatingManager = _app_managers.SkillRatingManager
 
 _app_schedule_helpers = import_module_with_fallback("app_schedule_helpers")
@@ -178,7 +177,7 @@ def configuration_tab():
 
 def player_management_tab():
     """Advanced player management tab"""
-    return _player_management_tab(st, PlayerManager)
+    return _player_management_tab(st)
 
 
 def stress_test_tab():
@@ -191,9 +190,9 @@ def leaderboard_tab():
     return _leaderboard_tab(st, pd)
 
 
-def validate_schedule_integrity(schedule, all_players=None):
+def validate_schedule_integrity(schedule, all_players=None, roster_by_round=None):
     """List what makes a schedule impossible to play (see app_schedule_helpers), or [] if nothing does."""
-    return _validate_schedule_integrity(schedule, all_players)
+    return _validate_schedule_integrity(schedule, all_players, roster_by_round)
 
 
 def display_enhanced_schedule(schedule, all_players=None, round_times=None, roster_by_round=None):
@@ -234,7 +233,6 @@ __all__ = [
     "ConfigurationManager",
     "EloRatingManager",
     "HistoryManager",
-    "PlayerManager",
     "ScheduleAnalytics",
     "SkillRatingManager",
     "analytics_tab",

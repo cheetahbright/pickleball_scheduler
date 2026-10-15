@@ -195,14 +195,21 @@ def partner_repeat_floor(num_players: int, num_partnerships: int) -> tuple[int, 
 def evaluate_metrics_from_arrangement_stats(
     round_stats: Sequence[Mapping[str, Any]],
     player_names: Sequence[str],
+    baseline_games: Mapping[str, int] | None = None,
 ) -> dict[str, int]:
     """Combine precomputed per-arrangement summaries into schedule metrics.
 
     Produces results identical to evaluate_schedule_metrics for any schedule
     decoded from the arrangement pool (locked in by the maintained equivalence
-    test in tests/unit/test_scheduler_metrics.py).
+    test in tests/unit/test_scheduler_metrics.py). baseline_games is added to
+    each player's games before the games range is taken (see
+    evaluate_schedule_metrics).
     """
-    games: dict[str, int] = {player: 0 for player in player_names}
+    games: dict[str, int] = (
+        {player: baseline_games.get(player, 0) for player in player_names}
+        if baseline_games
+        else {player: 0 for player in player_names}
+    )
     partners: dict[str, set[str]] = {player: set() for player in player_names}
     opponents: dict[str, set[str]] = {player: set() for player in player_names}
     courts: dict[str, set[int]] = {player: set() for player in player_names}
@@ -237,8 +244,16 @@ def evaluate_schedule_metrics(
     player_names: Sequence[str],
     do_not_pair_map: Mapping[str, set[str]],
     do_not_oppose_map: Mapping[str, set[str]],
+    baseline_games: Mapping[str, int] | None = None,
 ) -> dict[str, int]:
-    """Evaluate fairness metrics from raw or formatted schedules."""
+    """Evaluate fairness metrics from raw or formatted schedules.
+
+    baseline_games gives some players an offset added to their games before
+    the games range is taken (anyone not named has 0). A schedule that carries
+    on from earlier rounds passes minus each player's sit-outs so far, so the
+    range then measures everyone's sit-outs to date rather than only these
+    rounds'. The other ranges are not affected.
+    """
     raw_schedule = normalize_schedule(schedule)
 
     games_played: Counter[str] = Counter()
@@ -289,8 +304,9 @@ def evaluate_schedule_metrics(
                     opponents[a][b] += 1
                     opponents[b][a] += 1
 
+    offsets = baseline_games or {}
     return {
-        "games_range": _metric_range(games_played[player] for player in player_names),
+        "games_range": _metric_range(games_played[player] + offsets.get(player, 0) for player in player_names),
         "partners_range": _metric_range(len(partners[player]) for player in player_names),
         "opponents_range": _metric_range(len(opponents[player]) for player in player_names),
         "courts_range": _metric_range(

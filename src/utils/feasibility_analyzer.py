@@ -3,7 +3,51 @@
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Sequence, TypedDict
+
+
+def min_games_range_with_offsets(total_slots: int, num_rounds: int, offsets: Sequence[int], num_players: int) -> int:
+    """The lowest games range any schedule can have when each player's games get a fixed offset added.
+
+    offsets[i] is added to player i's games before the range is taken
+    (players past the end of offsets get 0). A mid-session plan passes minus
+    each player's sit-outs so far, so the range is then the range of
+    everyone's sit-outs to date.
+
+    Each player plays between 0 and num_rounds games, and together they fill
+    total_slots places. A range of at most `width` needs every player's games
+    plus offset to land in one window of that width; such a window is
+    possible when the fewest and the most games that keep every player inside
+    it bracket total_slots. The lowest width with a window is therefore a
+    proven lower bound. With no offsets it is the familiar 0 when total_slots
+    divides evenly among the players and 1 otherwise. With offsets it can be
+    lower (a player who sat out before plays more now) or higher (a player
+    who sat out far more than the rest cannot catch up in the rounds left).
+    """
+    if num_players <= 0:
+        return 0
+    if len(offsets) > num_players:
+        raise ValueError(f"{len(offsets)} offsets for {num_players} players")
+    shifts = [int(offset) for offset in offsets] + [0] * (num_players - len(offsets))
+    lowest_level, highest_level = min(shifts), max(shifts) + num_rounds
+    # Everyone's offset games add up to this, so equal values need it to divide evenly.
+    width = 0 if (total_slots + sum(shifts)) % num_players == 0 else 1
+    floor = width
+    while width <= highest_level - lowest_level:
+        for level in range(lowest_level, highest_level + 1):
+            fewest = most = 0
+            for shift in shifts:
+                low, high = max(level, shift), min(level + width, shift + num_rounds)
+                if low > high:
+                    break
+                fewest += low - shift
+                most += high - shift
+            else:
+                if fewest <= total_slots <= most:
+                    return width
+        width += 1
+    # No split fills every place (more courts than the players can fill): only the divisibility bound is proven.
+    return floor
 
 
 class FeasibilityMinimums(TypedDict):
@@ -43,7 +87,10 @@ class ScheduleFeasibilityAnalyzer:
 
     @staticmethod
     def calculate_theoretical_minimums(
-        num_players: int, num_courts: int | None = None, num_rounds: int = 8
+        num_players: int,
+        num_courts: int | None = None,
+        num_rounds: int = 8,
+        game_offsets: Sequence[int] = (),
     ) -> FeasibilityMinimums:
         """Proven lower bounds on each fairness range for this configuration.
 
@@ -55,6 +102,11 @@ class ScheduleFeasibilityAnalyzer:
         game has no partner, opponent or court, while everyone who plays has
         1 partner, 2 opponents and 1 court. Nothing else is ruled out, so
         range_0_possible means "not proven impossible", not "achievable".
+
+        game_offsets, when any is not 0, are added to each player's games
+        before the games range is taken (see min_games_range_with_offsets),
+        which changes only the games bound: it is then the bound for that
+        shifted range.
         """
 
         if num_courts is None:
@@ -68,6 +120,8 @@ class ScheduleFeasibilityAnalyzer:
 
         games_per_player: float = total_player_spots / num_players if num_players > 0 else float(num_rounds)
         min_games_range = 0 if num_players <= 0 or total_player_spots % num_players == 0 else 1
+        if any(game_offsets):
+            min_games_range = min_games_range_with_offsets(total_player_spots, num_rounds, game_offsets, num_players)
 
         # Fewer slots than players: someone gets no game at all.
         someone_cannot_play = 0 < total_player_spots < num_players
@@ -92,17 +146,25 @@ class ScheduleFeasibilityAnalyzer:
 
     @staticmethod
     def assess_quality_with_feasibility(
-        breakdown: dict[str, int], num_players: int, num_courts: int | None = None, num_rounds: int = 8
+        breakdown: dict[str, int],
+        num_players: int,
+        num_courts: int | None = None,
+        num_rounds: int = 8,
+        game_offsets: Sequence[int] = (),
     ) -> QualityAssessment:
         """Grade a schedule by how far its total range is above the proven lower bound.
 
         At the bound (gap 0) the schedule is proven optimal. Above it, the
         grade only says how far above: the bound is not always reachable, so
-        a gap does not prove the schedule could be better.
+        a gap does not prove the schedule could be better. game_offsets are
+        those the breakdown's games range was taken with (see
+        calculate_theoretical_minimums).
         """
 
         # Get the proven lower bounds
-        feasibility = ScheduleFeasibilityAnalyzer.calculate_theoretical_minimums(num_players, num_courts, num_rounds)
+        feasibility = ScheduleFeasibilityAnalyzer.calculate_theoretical_minimums(
+            num_players, num_courts, num_rounds, game_offsets
+        )
 
         # Calculate actual total range
         actual_total = (

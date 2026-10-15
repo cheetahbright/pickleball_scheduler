@@ -25,6 +25,23 @@ except ImportError:
     from app_schedule_helpers import escape_markdown, excel_safe, recorded_result, validate_schedule_integrity
 
 try:
+    from src.app_attendance import (
+        ATTENDANCE_ALGORITHM,
+        CURRENT_ATTENDANCE_KEY,
+        FAIRNESS_NOTE,
+        load_attendance_from_history_entry,
+        rosters_vary,
+    )
+except ImportError:
+    from app_attendance import (
+        ATTENDANCE_ALGORITHM,
+        CURRENT_ATTENDANCE_KEY,
+        FAIRNESS_NOTE,
+        load_attendance_from_history_entry,
+        rosters_vary,
+    )
+
+try:
     from src.managers.history import stored_time
 except ImportError:
     from managers.history import stored_time
@@ -94,6 +111,10 @@ export_config_json = _app_managers.export_config_json
 import_config_json = _app_managers.import_config_json
 CONFIG_REPAIR_MESSAGES_KEY = _app_managers.CONFIG_REPAIR_MESSAGES_KEY
 _backup = import_module_with_fallback("managers.backup")
+# Read as features.<FLAG> at call time, never copied, so a patched flag takes effect.
+features = import_module_with_fallback("features")
+_remote = import_module_with_fallback("managers.remote_backup")
+_remote_glue = import_module_with_fallback("app_remote_backup")
 
 logger = logging.getLogger(__name__)
 
@@ -312,6 +333,16 @@ def _update_elo_ratings(session_state, history_manager) -> None:
         queue_status_notice(session_state, "warning", _ELO_NOT_UPDATED_WARNING)
 
 
+def _update_elo_after_history_change(session_state, history_manager) -> None:
+    """_update_elo_ratings for the History tab's delete and restore, which change which scores count.
+
+    With score tracking off there are no ratings to keep in step, and the
+    ELO manager is left alone.
+    """
+    if features.SCORE_TRACKING:
+        _update_elo_ratings(session_state, history_manager)
+
+
 def _import_errors_markdown(errors: list[str]) -> str:
     """A CSV import's errors as one alert, a list of them if there are several, rather than a box per row."""
     if len(errors) == 1:
@@ -363,6 +394,10 @@ def render_history_tab(st_module, pd_module, json_module):
             selection_mode="single-row",
             key=table_key,
         )
+        if any(entry["algorithm"] == ATTENDANCE_ALGORITHM for entry in recent):
+            st_module.caption(
+                f"Algorithm '{ATTENDANCE_ALGORITHM}' means planned around arrivals and departures. {FAIRNESS_NOTE}"
+            )
         selected_index = _selected_history_row_index(selection_event, len(recent))
         selected_entry = recent[selected_index] if selected_index is not None else None
         if selected_entry is not None:
@@ -428,13 +463,18 @@ def render_history_tab(st_module, pd_module, json_module):
                     st_module.session_state.current_roster_by_round = load_roster_by_round_from_history_entry(
                         target_entry, json_module, len(schedule_data)
                     )
+                    # Likewise the arrivals and departures it was planned from,
+                    # which the Main tab shows as who was here when.
+                    st_module.session_state[CURRENT_ATTENDANCE_KEY] = load_attendance_from_history_entry(
+                        target_entry, json_module, len(schedule_data)
+                    )
                     _show_loaded_schedule_on_main_tab(st_module.session_state, players, len(schedule_data))
                     if schedule_errors:
                         st_module.session_state[_HISTORY_LOAD_WARNING_KEY] = (
                             f"⚠️ Schedule loaded, but it isn't valid: {len(schedule_errors)} problem(s), such as "
                             "a player in two places in the same round (listed on the Main Scheduler tab). It was "
-                            "probably made by an older version of the app. Don't play or score it - generate a "
-                            "new schedule instead."
+                            "probably made by an older version of the app. Don't play "
+                            f"{'or score ' if features.SCORE_TRACKING else ''}it - generate a new schedule instead."
                         )
                     else:
                         st_module.session_state.global_status_message = "✅ Schedule loaded!"
@@ -452,7 +492,7 @@ def render_history_tab(st_module, pd_module, json_module):
         with col2:
             if selected_entry is not None and st_module.button("🗑️ Delete Selected Schedule"):
                 if history_manager.delete_schedule(selected_entry["id"]):
-                    _update_elo_ratings(st_module.session_state, history_manager)
+                    _update_elo_after_history_change(st_module.session_state, history_manager)
                     st_module.session_state.last_deleted_id = selected_entry["id"]
                     st_module.session_state.global_status_message = "🗑️ Schedule deleted."
                     # This session changed the list itself: no "list changed" note.
@@ -476,7 +516,7 @@ def render_history_tab(st_module, pd_module, json_module):
             st_module.warning(load_warning)
         if last_deleted is not None and st_module.button("↩️ Undo Delete"):
             if history_manager.restore_schedule(last_deleted_id):
-                _update_elo_ratings(st_module.session_state, history_manager)
+                _update_elo_after_history_change(st_module.session_state, history_manager)
                 st_module.session_state.last_deleted_id = None
                 st_module.session_state.global_status_message = "↩️ Schedule restored."
                 st_module.session_state.pop(_HISTORY_TICKED_TABLE_KEY, None)
@@ -500,7 +540,7 @@ def render_history_tab(st_module, pd_module, json_module):
                 with col2:
                     if st_module.button("↩️ Restore", key=f"restore_{entry['id']}"):
                         if history_manager.restore_schedule(entry["id"]):
-                            _update_elo_ratings(st_module.session_state, history_manager)
+                            _update_elo_after_history_change(st_module.session_state, history_manager)
                             st_module.session_state.global_status_message = "↩️ Schedule restored."
                             st_module.session_state.pop(_HISTORY_TICKED_TABLE_KEY, None)
                             st_module.rerun()
@@ -682,6 +722,8 @@ def render_analytics_tab(st_module, pd_module, schedule_analytics_cls, has_plotl
     with col4:
         total_games = sum(len(round_data.get("games", [])) for round_data in schedule)
         st_module.metric("Total Games", total_games)
+    if rosters_vary(st_module.session_state.get("current_roster_by_round")):
+        st_module.caption(FAIRNESS_NOTE)
 
     if has_plotly:
         st_module.markdown("### 🎯 Fairness Analysis")
@@ -768,6 +810,9 @@ def _render_skill_balance(st_module, pd_module, schedule):
         )
 
 
+# Objective Weights slider keys, drawn only while features.OBJECTIVE_WEIGHTS_UI is on.
+_OBJECTIVE_WEIGHT_KEY_PREFIX = "weight_"
+
 _CONFIG_WIDGET_KEYS = (
     "do_not_pair_input",
     "do_not_oppose_input",
@@ -785,11 +830,10 @@ def _reset_config_widgets_to_saved(session_state) -> None:
     seed_widget_from_source reassign it from the saved config - an assignment
     a real browser applies, unlike deleting the widget's key.
     """
-    keys = [
-        key
-        for key in list(session_state.keys())
-        if isinstance(key, str) and (key.startswith("weight_") or key.startswith(_PRESET_WIDGET_KEY_PREFIX))
-    ]
+    prefixes: tuple[str, ...] = (_PRESET_WIDGET_KEY_PREFIX,)
+    if features.OBJECTIVE_WEIGHTS_UI:
+        prefixes += (_OBJECTIVE_WEIGHT_KEY_PREFIX,)
+    keys = [key for key in list(session_state.keys()) if isinstance(key, str) and key.startswith(prefixes)]
     for key in keys + list(_CONFIG_WIDGET_KEYS):
         forget_widget_state(session_state, key)
 
@@ -810,6 +854,37 @@ def _rebase_constraint_edits(previous_source: str, edited: str, new_source: str)
     return rebase_line_edits(previous_source, edited, new_source, line_key=_constraint_line_key)
 
 
+def _render_objective_weights(st_module, config, edited) -> None:
+    """Draw the Objective Weights sliders, copying each shown weight into ``edited``.
+
+    Only while features.OBJECTIVE_WEIGHTS_UI is on. With it off nothing here
+    runs and ``edited`` keeps the saved objectives as they are, so Save
+    Configuration writes back whatever weights are stored.
+    """
+    st_module.markdown("### 🎚️ Objective Weights")
+    st_module.info("Saved with the configuration; schedule generation doesn't use these weights yet.")
+
+    for obj_name, obj_data in config["objectives"].items():
+        col1, col2 = st_module.columns([3, 1])
+
+        with col1:
+            slider_key = f"{_OBJECTIVE_WEIGHT_KEY_PREFIX}{obj_name}"
+            # Track the saved weight (an import, another tab's save) without
+            # discarding an edit in progress on unrelated reruns.
+            seed_widget_from_source(st_module.session_state, slider_key, obj_data["weight"])
+            new_weight = st_module.slider(
+                obj_name.replace("_", " ").title(),
+                min_value=obj_data["min"],
+                max_value=obj_data["max"],
+                step=100,
+                key=slider_key,
+            )
+            edited["objectives"][obj_name]["weight"] = new_weight
+
+        with col2:
+            st_module.metric("Current", new_weight)
+
+
 def render_configuration_tab(st_module):
     """Render the configuration and constraints tab.
 
@@ -825,28 +900,8 @@ def render_configuration_tab(st_module):
     st_module.session_state.app_config = config
     edited = deepcopy(config)
 
-    st_module.markdown("### 🎚️ Objective Weights")
-    st_module.info("Saved with the configuration; schedule generation doesn't use these weights yet.")
-
-    for obj_name, obj_data in config["objectives"].items():
-        col1, col2 = st_module.columns([3, 1])
-
-        with col1:
-            slider_key = f"weight_{obj_name}"
-            # Track the saved weight (an import, another tab's save) without
-            # discarding an edit in progress on unrelated reruns.
-            seed_widget_from_source(st_module.session_state, slider_key, obj_data["weight"])
-            new_weight = st_module.slider(
-                obj_name.replace("_", " ").title(),
-                min_value=obj_data["min"],
-                max_value=obj_data["max"],
-                step=100,
-                key=slider_key,
-            )
-            edited["objectives"][obj_name]["weight"] = new_weight
-
-        with col2:
-            st_module.metric("Current", new_weight)
+    if features.OBJECTIVE_WEIGHTS_UI:
+        _render_objective_weights(st_module, config, edited)
 
     st_module.markdown("### 🎯 Player Constraints")
 
@@ -994,6 +1049,7 @@ def render_configuration_tab(st_module):
             st_module.error("❌ Failed to save imported configuration.")
 
     _render_full_backup(st_module, export_config)
+    _render_cloud_backup(st_module)
 
 
 def _adopt_replacing_config(session_state, config) -> None:
@@ -1058,16 +1114,23 @@ def _render_full_backup(st_module, export_config) -> None:
         st_module.caption("Full backup and restore aren't available while the schedule history can't be opened.")
         return
     data_paths = _full_backup_data_paths(st_module.session_state)
-    default_config = st_module.session_state.config_manager.default_config
+    config_manager = st_module.session_state.config_manager
+    default_config = config_manager.default_config
+    saved_data = (
+        "schedule history and scores, configuration, skill ratings and ELO ratings"
+        if features.SCORE_TRACKING
+        else "schedule history, configuration and skill ratings"
+    )
     st_module.caption(
-        "One file with everything the app saves: schedule history and scores, configuration, skill ratings and "
-        "ELO ratings. Rebooting the hosted app deletes all of it, so download a full backup before a reboot and "
-        "restore it afterwards."
+        f"One file with everything the app saves: {saved_data}. Rebooting the hosted app deletes all of it, so "
+        "download a full backup before a reboot and restore it afterwards."
     )
     st_module.download_button(
         "⬇️ Download full backup",
         # Built when clicked (in another thread), from the saved data as it is then.
-        data=lambda: _backup.make_full_backup(history_manager, data_paths, export_config(), default_config),
+        data=lambda: _backup.make_full_backup(
+            history_manager, data_paths, export_config(), default_config, score_tracking=features.SCORE_TRACKING
+        ),
         file_name=f"pickleball_full_backup_{datetime.now():%Y-%m-%d}.zip",
         mime="application/zip",
     )
@@ -1091,7 +1154,9 @@ def _render_full_backup(st_module, export_config) -> None:
     if not check or check["file_id"] != uploaded.file_id:
         # Once per file, not on every rerun: every tab renders on every run.
         try:
-            lines = _backup.read_full_backup(uploaded.getvalue(), default_config).describe()
+            lines = _backup.read_full_backup(uploaded.getvalue(), default_config).describe(
+                score_tracking=features.SCORE_TRACKING
+            )
             check = {"file_id": uploaded.file_id, "lines": lines}
         except _backup.BackupError as exc:
             check = {"file_id": uploaded.file_id, "problem": str(exc)}
@@ -1101,8 +1166,9 @@ def _render_full_backup(st_module, export_config) -> None:
         return
 
     st_module.markdown("\n".join(f"- {escape_markdown(line)}" for line in check["lines"]))
+    replaced_data = "history, scores, configuration" if features.SCORE_TRACKING else "history, configuration"
     st_module.warning(
-        "⚠️ Restoring replaces the saved schedule history, scores, configuration and ratings with this "
+        f"⚠️ Restoring replaces the saved schedule {replaced_data} and ratings with this "
         "backup's, for everyone using the app. A copy of the current data is kept first."
     )
     confirmed = st_module.checkbox(
@@ -1112,7 +1178,9 @@ def _render_full_backup(st_module, export_config) -> None:
         try:
             # Checked again, as restored: the earlier check only describes the file.
             backup = _backup.read_full_backup(uploaded.getvalue(), default_config)
-            kept = _backup.restore_full_backup(backup, history_manager, data_paths)
+            kept = _backup.restore_full_backup(
+                backup, history_manager, data_paths, config_manager, score_tracking=features.SCORE_TRACKING
+            )
         except _backup.BackupError as exc:
             st_module.error(f"❌ {escape_markdown(str(exc))}")
             return
@@ -1123,11 +1191,101 @@ def _render_full_backup(st_module, export_config) -> None:
             f"✅ Full backup restored. The data it replaced is kept as {escape_markdown(kept.name)}."
         )
         if schedule_let_go:
+            let_go_cause = (
+                ", so its scores can't be entered"
+                if features.SCORE_TRACKING
+                else ", so a replan of it won't be saved to history"
+            )
             st_module.session_state.global_status_message += (
-                " The schedule on screen isn't in the restored history, so its scores can't be entered: load a "
+                f" The schedule on screen isn't in the restored history{let_go_cause}: load a "
                 "schedule from History, or generate a new one."
             )
         st_module.rerun()
+
+
+_CLOUD_RESTORE_VERSION_KEY = "_cloud_restore_version"
+
+
+def _render_cloud_backup(st_module) -> None:
+    """The cloud backup block, which can never break the Configuration tab: a failure drawing it is one warning.
+
+    (Streamlit's rerun and stop signals are not Exceptions, so they pass through.)
+    """
+    try:
+        _render_cloud_backup_block(st_module)
+    except Exception as exc:
+        logger.exception("Cloud backup: drawing its block failed")
+        st_module.warning(
+            f"⚠️ The cloud backup block couldn't be shown ({type(exc).__name__}). The rest of the app is not affected."
+        )
+
+
+def _render_cloud_backup_block(st_module) -> None:
+    """The encrypted cloud copy of the full backup (docs/REMOTE_BACKUP.md): its status, "Back up now", and a restore.
+
+    Drawing asks the cloud nothing, since every tab draws on every run: only the two buttons do.
+    """
+    st_module.markdown("#### ☁️ Cloud backup")
+    view = _remote_glue.cloud_backup(st_module)
+    if view.sync is None:
+        if view.problem:
+            st_module.warning(f"⚠️ Cloud backup can't run. {escape_markdown(view.problem)}")
+        else:
+            st_module.caption(
+                "Not set up. Cloud backup keeps an encrypted copy of the full backup in a free cloud database and "
+                "restores it by itself after a reboot. Setup takes about 15 minutes: see docs/REMOTE_BACKUP.md in the "
+                "pickleball_scheduler_v2 source repository (the deployed app doesn't include the docs folder)."
+            )
+        return
+    sync = view.sync
+    session_state = st_module.session_state
+    time_zone = _viewer_time_zone(st_module)
+    st_module.caption(
+        "An encrypted copy of the full backup is kept in the cloud and updated shortly after the saved data changes; "
+        "after a reboot the app restores the newest copy by itself. Only this app's encryption key can read it, and "
+        "if that key is lost the cloud copies can't be read, so also download a full backup now and then."
+    )
+    status_slot = st_module.empty()
+    if st_module.button("☁️ Back up to the cloud now"):
+        pushed = sync.push_now()
+        message = escape_markdown(pushed.message)
+        if pushed.ok:
+            st_module.success(f"✅ {message}")
+        elif pushed.skipped:
+            st_module.info(message)
+        else:
+            st_module.error(f"❌ {message}")
+    st_module.caption(
+        "⚠️ Restoring replaces the saved schedule history, scores, configuration and ratings with the newest cloud "
+        "copy's, for everyone using the app. A copy of the current data is kept first."
+    )
+    version = int(session_state.get(_CLOUD_RESTORE_VERSION_KEY, 0))
+    confirmed = st_module.checkbox(
+        "Replace the current data with the latest cloud backup", key=f"cloud_restore_confirm_{version}"
+    )
+    if st_module.button("♻️ Restore the latest cloud backup", disabled=not confirmed, type="primary"):
+        try:
+            restored = sync.restore_latest()
+        except Exception as exc:  # a RemoteBackupError says why in one line; nothing else should reach here
+            reason = (
+                str(exc) if isinstance(exc, _remote.RemoteBackupError) else f"Unexpected error ({type(exc).__name__})."
+            )
+            st_module.error(f"❌ {escape_markdown(reason)} Nothing was changed.")
+        else:
+            schedule_let_go = _adopt_restored_data(session_state)
+            session_state[_CLOUD_RESTORE_VERSION_KEY] = version + 1
+            session_state[_remote_glue.ADOPTED_GENERATION_KEY] = sync.restore_generation
+            session_state.global_status_message = (
+                f"✅ {_remote.restore_message(restored.snapshot, time_zone, restored.made_at)} "
+                f"The data it replaced is kept as {escape_markdown(restored.kept_copy.name)}."
+            )
+            if schedule_let_go:
+                session_state.global_status_message += (
+                    " The schedule on screen isn't in the restored history, so its scores can't be entered: load a "
+                    "schedule from History, or generate a new one."
+                )
+            st_module.rerun()
+    status_slot.caption(escape_markdown(sync.status().summary(time_zone)))
 
 
 # A skill rating choice that saves nothing, so a player nobody rated stays unrated.
@@ -1195,33 +1353,13 @@ def preset_saved_elsewhere(st_module, name) -> bool:
     return saved is not None and name in saved.get("player_presets", {})
 
 
-def render_player_management_tab(st_module, player_manager_cls):
+def render_player_management_tab(st_module):
     """Render the advanced player management tab."""
     # Values queued by this tab's button handlers on the previous run, applied
     # before the widgets they target are instantiated.
     apply_deferred_widget_values(st_module.session_state)
 
     st_module.subheader("👥 Advanced Player Management")
-
-    substitution_enabled = st_module.checkbox(
-        "Enable player substitutions",
-        value=st_module.session_state.get("substitution_enabled", False),
-    )
-
-    if substitution_enabled:
-        player_manager_cls.create_substitution_interface(st_module)
-
-        st_module.markdown("### ℹ️ How Substitutions Work")
-        substitution_round = st_module.session_state.get("substitution_round", 4)
-        st_module.info(
-            "\n".join(
-                [
-                    f"- **First Half Players**: Available for rounds 1-{substitution_round}",
-                    f"- **Second Half Players**: Available for rounds {substitution_round + 1}-end",
-                    "- **Overlap**: Players in both lists can play throughout",
-                ]
-            )
-        )
 
     st_module.markdown("### 📋 Player Preset Management")
 

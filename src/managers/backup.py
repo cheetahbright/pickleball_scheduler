@@ -15,7 +15,11 @@ data survives. One ZIP file holds:
 
 Restoring makes the saved data exactly what the backup holds, so it also
 removes a config or rating file the backup has none of. The copy of the
-current data that a restore keeps first holds whatever it replaced.
+current data that a restore keeps first holds whatever it replaced, and is
+the way to undo the restore, so its JSON files go in as a restore accepts
+them (the config as the app loads it, when the saved file wouldn't be
+accepted as it is), and a restore whose copy couldn't hold one of them that
+way is refused before it replaces anything.
 """
 
 from __future__ import annotations
@@ -37,11 +41,11 @@ from typing import Any, Dict, Mapping
 
 try:
     from src.managers._paths import _REPLACE_RETRY_DELAYS_SECONDS, _read_bytes_with_retry, _replace_with_retry
-    from src.managers.config import MAX_CONFIG_UPLOAD_BYTES, import_config_json
+    from src.managers.config import MAX_CONFIG_UPLOAD_BYTES, export_config_json, import_config_json
     from src.managers.history import describe_history_db
 except ImportError:
     from managers._paths import _REPLACE_RETRY_DELAYS_SECONDS, _read_bytes_with_retry, _replace_with_retry
-    from managers.config import MAX_CONFIG_UPLOAD_BYTES, import_config_json
+    from managers.config import MAX_CONFIG_UPLOAD_BYTES, export_config_json, import_config_json
     from managers.history import describe_history_db
 
 logger = logging.getLogger(__name__)
@@ -70,6 +74,7 @@ _RESTORE_LOCK = threading.Lock()
 
 # How to rewrite a saved file that a backup can't include as it is.
 _REWRITE_HINTS = {
+    CONFIG_NAME: "Saving the configuration on the Configuration tab rewrites it.",
     SKILLS_NAME: "Saving the skill ratings in Player Management rewrites it.",
     ELO_NAME: "Recomputing the ELO ratings on the Leaderboard tab rewrites it.",
 }
@@ -92,11 +97,17 @@ class FullBackup:
     skill_ratings: int | None
     elo_ratings: int | None
 
-    def describe(self) -> list[str]:
-        """One line per part of the backup, saying what restoring it brings back."""
-        return [
+    def describe(self, score_tracking: bool = True) -> list[str]:
+        """One line per part of the backup, saying what restoring it brings back.
+
+        With ``score_tracking`` False (the app has the feature off) the lines
+        about recorded game scores and ELO ratings are left out. Restoring
+        brings them back all the same.
+        """
+        history = f"Schedule history: {self.schedules} schedule(s)"
+        lines = [
             f"Made {self.created_at[:16].replace('T', ' ')}",
-            f"Schedule history: {self.schedules} schedule(s), {self.scores} recorded game score(s)",
+            f"{history}, {self.scores} recorded game score(s)" if score_tracking else history,
             (
                 f"Configuration, with {self.presets} player preset(s)"
                 if self.presets is not None
@@ -107,12 +118,14 @@ class FullBackup:
                 if self.skill_ratings is not None
                 else "Skill ratings: none saved"
             ),
-            (
+        ]
+        if score_tracking:
+            lines.append(
                 f"ELO ratings for {self.elo_ratings} player(s)"
                 if self.elo_ratings is not None
                 else "ELO ratings: none saved"
-            ),
-        ]
+            )
+        return lines
 
 
 def _sha256(data: bytes) -> str:
@@ -162,7 +175,11 @@ def build_full_backup(history_db: bytes, json_files: Mapping[str, bytes], create
 
 
 def make_full_backup(
-    history_manager, data_paths: Mapping[str, Path], config_json: str, default_config: Dict[str, Any]
+    history_manager,
+    data_paths: Mapping[str, Path],
+    config_json: str,
+    default_config: Dict[str, Any],
+    score_tracking: bool = True,
 ) -> bytes:
     """The "Download full backup" file: a history snapshot, ``config_json``, and the saved rating files.
 
@@ -170,7 +187,9 @@ def make_full_backup(
     ``data_paths`` maps SKILLS_NAME and ELO_NAME to where those files are
     saved; one that doesn't exist yet is left out. One that exists but can't
     be read as JSON stops the backup with a BackupError, rather than leaving
-    it out unnoticed or making a backup that restore would refuse.
+    it out unnoticed or making a backup that restore would refuse. The one
+    exception is a damaged ELO file with ``score_tracking`` False: nothing in
+    the app can rewrite it then, so it is left out (and restoring removes it).
 
     The finished file goes through read_full_backup (with ``default_config``)
     before it is returned, so a backup that restore would refuse (a damaged
@@ -185,6 +204,11 @@ def make_full_backup(
         try:
             _json_object(name, data)
         except BackupError as exc:
+            if name == ELO_NAME and not score_tracking:
+                # Nothing in the app rewrites the file with score tracking off (the Leaderboard's recompute is
+                # hidden), and the ratings are worked out again from the recorded scores, which the history
+                # holds. So it is left out, not allowed to stop every backup; restoring removes the damaged file.
+                continue
             raise BackupError(f"No full backup was made: the saved {exc} {_REWRITE_HINTS[name]}") from exc
         json_files[name] = data
     history_db = history_manager.export_db_bytes()
@@ -367,35 +391,124 @@ def _unlink_with_retry(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
-def restore_full_backup(backup: FullBackup, history_manager, data_paths: Mapping[str, Path]) -> Path:
+def restore_full_backup(
+    backup: FullBackup,
+    history_manager,
+    data_paths: Mapping[str, Path],
+    config_manager,
+    score_tracking: bool = True,
+) -> Path:
     """Replace the saved data with ``backup``'s, keeping a copy of the current data first.
 
-    ``data_paths`` maps each of JSON_FILE_NAMES to where it is saved. The copy
-    is a full backup of the files as they are now, saved next to the history
-    database, so restoring it undoes this restore; its path is returned. The
-    history database is copied in within one transaction, each JSON file is
-    swapped in whole, and one the backup has none of is removed. If any step
-    fails, everything already replaced is put back and BackupError says what
-    happened. A restore started while another is running is refused.
+    ``data_paths`` maps each of JSON_FILE_NAMES to where it is saved, and
+    ``config_manager`` is the app's ConfigurationManager (its default config,
+    and the saved config as the app loads it). The copy is a full backup of
+    the data as it is now, saved next to the history database, so restoring
+    it undoes this restore; its path is returned. Its JSON files go in as a
+    restore accepts them (see _restorable_kept_files): a saved file that
+    can't be kept that way refuses the restore before anything is replaced,
+    and the message names it and how to rewrite it. The history database is
+    copied in within one transaction, each JSON file is swapped in whole, and
+    one the backup has none of is removed. If any step fails, everything
+    already replaced is put back and BackupError says what happened. A
+    restore started while another is running is refused.
     """
     if not _RESTORE_LOCK.acquire(blocking=False):
         raise BackupError(
             "Another full restore is running right now, so nothing was restored. Try again when it has finished."
         )
     try:
-        return _restore(backup, history_manager, data_paths)
+        return _restore(backup, history_manager, data_paths, config_manager, score_tracking)
     finally:
         _RESTORE_LOCK.release()
 
 
-def _restore(backup: FullBackup, history_manager, data_paths: Mapping[str, Path]) -> Path:
+_COPY_NOT_RESTORABLE = (
+    "A restore keeps a copy of the current data so it can be undone, and this file would make that copy "
+    "one the app couldn't restore."
+)
+
+
+def _refused(problem: str, hint: str | None = None) -> BackupError:
+    """The refusal of a restore whose kept copy couldn't hold a saved file restorably; ``problem`` names the file."""
+    message = f"Nothing was restored: the saved {problem} {_COPY_NOT_RESTORABLE}"
+    return BackupError(f"{message} {hint} Then restore again." if hint else message)
+
+
+def _restorable_kept_files(
+    saved_files: Mapping[str, bytes | None], config_manager, score_tracking: bool = True
+) -> Dict[str, bytes]:
+    """The JSON files of the kept copy: each saved one, as a restore of that copy accepts it. Raises BackupError.
+
+    The app loads a hand-edited app_config.json by merging it into the
+    defaults and repairing it in memory, and a rating file it can't read by
+    falling back, never rewriting the file; a restore accepts a config only
+    as an import does, and a rating file only as a JSON object within the
+    size limit. So the saved config goes in as it is when a restore accepts
+    that, else as the app loads it (what "Download full backup" exports), and
+    a saved file that can't go in restorably at all refuses the restore,
+    naming the file and, where a save rewrites it, how. The history database
+    isn't checked: one that fails SQLite's integrity check but still opens is
+    what a restore replaces, and nothing in the app could rewrite it first.
+    """
+    kept: Dict[str, bytes] = {}
+    for name, data in saved_files.items():
+        if data is None:
+            continue
+        if name == CONFIG_NAME:
+            kept[name] = _restorable_config(data, config_manager)
+            continue
+        problem = None
+        if len(data) > MAX_BACKUP_JSON_BYTES:
+            problem = f"{name} is larger than a restore accepts ({MAX_BACKUP_JSON_BYTES} bytes)."
+        else:
+            try:
+                _json_object(name, data)
+            except BackupError as exc:
+                problem = str(exc)
+        if problem:
+            if name == ELO_NAME and not score_tracking:
+                # Nothing in the app rewrites the file with score tracking off (the Leaderboard's recompute is
+                # hidden), and the ratings are worked out again from the recorded scores, which the history
+                # holds - the same exception make_full_backup makes. So it is left out of the kept copy rather
+                # than stopping the restore; the restore replaces the damaged file either way.
+                continue
+            raise _refused(problem, _REWRITE_HINTS[name])
+        kept[name] = data
+    return kept
+
+
+def _restorable_config(saved: bytes, config_manager) -> bytes:
+    """The saved app_config.json for the kept copy: as it is if a restore accepts it, else as the app loads it."""
+    default_config = config_manager.default_config
+    if not import_config_json(saved, default_config)[1]:
+        return saved
+    try:
+        _json_object(CONFIG_NAME, saved)
+    except BackupError as exc:  # unreadable: the app runs on the defaults until a save replaces the file
+        raise _refused(str(exc), _REWRITE_HINTS[CONFIG_NAME]) from exc
+    as_loaded = config_manager.read_saved_config()
+    if as_loaded is None:
+        raise _refused(f"{CONFIG_NAME} couldn't be read as a configuration.", _REWRITE_HINTS[CONFIG_NAME])
+    exported = export_config_json(as_loaded).encode("utf-8")
+    problems = import_config_json(exported, default_config)[1]
+    if problems:  # too large, or nested too deep: a save would write it the same way
+        reason = " ".join(problems).rstrip(".")
+        raise _refused(f"{CONFIG_NAME} isn't one a restore accepts, even as the app loads it ({reason}).")
+    return exported
+
+
+def _restore(
+    backup: FullBackup, history_manager, data_paths: Mapping[str, Path], config_manager, score_tracking: bool = True
+) -> Path:
     try:
         previous_db = history_manager.export_db_bytes()
         previous_files = {name: _read_saved_file(data_paths[name]) for name in JSON_FILE_NAMES}
-        kept = _keep_copy(
-            history_manager.db_path.parent,
-            build_full_backup(previous_db, {name: data for name, data in previous_files.items() if data is not None}),
-        )
+        copy = build_full_backup(previous_db, _restorable_kept_files(previous_files, config_manager, score_tracking))
+        kept = _keep_copy(history_manager.db_path.parent, copy)
+    except BackupError as exc:
+        logger.warning("Full restore refused before replacing anything: %s", exc)
+        raise
     except Exception as exc:
         logger.exception("Full restore: could not keep a copy of the current data")
         raise BackupError(f"Couldn't keep a copy of the current data ({exc}), so nothing was restored.") from exc

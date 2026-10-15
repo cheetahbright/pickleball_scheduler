@@ -5,14 +5,16 @@ from __future__ import annotations
 import random
 import time
 from collections import Counter, defaultdict
-from typing import Callable, Collection, Sequence, cast
+from typing import Callable, Collection, Mapping, Sequence, cast
 
 try:
     from src.algorithms.scheduler_metrics import GameTuple, round_signature
     from src.algorithms.scheduler_reporting import sum_range_metrics
+    from src.utils.feasibility_analyzer import min_games_range_with_offsets
 except ImportError:
     from algorithms.scheduler_metrics import GameTuple, round_signature
     from algorithms.scheduler_reporting import sum_range_metrics
+    from utils.feasibility_analyzer import min_games_range_with_offsets
 
 ScheduleMetricsEvaluator = Callable[[list[list[GameTuple]]], dict[str, int]]
 RepairPrinter = Callable[[str], None]
@@ -20,9 +22,18 @@ RepairPrinter = Callable[[str], None]
 PairingTallies = tuple[defaultdict[str, dict[object, int]], ...]
 
 
-def games_range_floor(schedule: Sequence[Sequence[GameTuple]], num_players: int) -> int:
-    """The smallest games range possible: 0 if the game slots divide evenly among the players, else 1."""
+def games_range_floor(
+    schedule: Sequence[Sequence[GameTuple]], num_players: int, game_offsets: Sequence[int] = ()
+) -> int:
+    """The smallest games range possible: 0 if the game slots divide evenly among the players, else 1.
+
+    game_offsets, if any is not 0, are added to each player's games before
+    the range is taken (see min_games_range_with_offsets), which moves the
+    floor either way: it is then the exact bound for that shifted range.
+    """
     slots = sum(len(round_games) * 4 for round_games in schedule)
+    if any(game_offsets):
+        return min_games_range_with_offsets(slots, len(schedule), game_offsets, num_players)
     return 0 if num_players and slots % num_players == 0 else 1
 
 
@@ -53,6 +64,7 @@ def repair_games_balance(
     evaluate_metrics: ScheduleMetricsEvaluator,
     printer: RepairPrinter,
     clock: Callable[[], float] | None = None,
+    baseline_games: Mapping[str, int] | None = None,
 ) -> list[list[GameTuple]]:
     """Move games from the most- to the least-played players until the games range hits its floor.
 
@@ -71,12 +83,18 @@ def repair_games_balance(
     or more moves, and full re-evaluations ran out of time after a few.
     Violations are counted per round - every violation term is within one
     round - and only for the moves actually considered.
+
+    baseline_games gives some players a fixed offset added to their games
+    (see evaluate_schedule_metrics): "most" and "least" played then mean most
+    and least once the offsets are in, and the floor is the one for that
+    shifted range.
     """
     now = clock if clock is not None else time.time
     start_time = now()
     current = [list(round_games) for round_games in schedule]
-    floor = games_range_floor(current, len(players))
-    counts = Counter({str(player): 0 for player in players})
+    offsets = [baseline_games.get(str(player), 0) for player in players] if baseline_games else [0] * len(players)
+    floor = games_range_floor(current, len(players), offsets)
+    counts = Counter({str(player): offset for player, offset in zip(players, offsets)})
     counts.update(str(player) for round_games in current for game in round_games for player in game)
     if max(counts.values()) - min(counts.values()) <= floor:
         return current
@@ -399,6 +417,7 @@ def apply_targeted_repairs(
     games_repair: Callable[[list[list[GameTuple]], float], list[list[GameTuple]]] | None = None,
     num_players: int | None = None,
     games_max_time: float | None = None,
+    game_offsets: Sequence[int] = (),
 ) -> list[list[GameTuple]] | None:
     """Apply targeted local repairs and report the resulting fairness ranges.
 
@@ -406,6 +425,8 @@ def apply_targeted_repairs(
     partner/opponent swaps that follow preserve game counts). It gets
     games_max_time (default: half of max_time), and the swaps' max_time
     starts once it is done, so a long games repair cannot starve them.
+    game_offsets are the per-player offsets the games range was taken with
+    (see games_range_floor); games_repair must be balancing the same ones.
     """
     now = clock if clock is not None else time.time
     start_time = now()
@@ -424,7 +445,7 @@ def apply_targeted_repairs(
     if (
         games_repair is not None
         and num_players
-        and current_metrics["games_range"] > games_range_floor(current_schedule, num_players)
+        and current_metrics["games_range"] > games_range_floor(current_schedule, num_players, game_offsets)
     ):
         current_schedule = games_repair(current_schedule, max_time * 0.5 if games_max_time is None else games_max_time)
         current_metrics = evaluate_metrics(current_schedule)
